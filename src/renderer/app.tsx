@@ -3,8 +3,8 @@ import {
   ArrowDown, ArrowRight, ArrowUpRight, Box, Check, ChevronDown, CircleAlert, CircleDot, Crosshair,
   GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, Pencil, Plus, RefreshCw, Trash2, X,
 } from 'lucide-react';
-import type { JiraConnection, JiraCredentials, JiraEdge, JiraEdition, JiraGraph, JiraIssue, JiraIssueInput, JiraLinkInput } from '../shared/contracts';
-import { errorMessage, IssueCreationUnconfirmed, openIssue, request, RequestError } from './api';
+import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
+import { errorMessage, IssueCreationUnconfirmed, openIssue, request, RequestError, restoreDesktopConnection } from './api';
 import { makeDemoGraph } from './demo';
 import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
 import { emptyGraphFilters, filterGraph } from './filter-model';
@@ -48,6 +48,7 @@ export function App() {
   const [selectedEdge, setSelectedEdge] = useState<string>();
   const [layoutGeneration, setLayoutGeneration] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [restoring, setRestoring] = useState(Boolean(window.jiraDag));
   const [notice, setNotice] = useState<Notice>();
   const [modal, setModal] = useState<Modal>();
   const [noteFocus, setNoteFocus] = useState<string>();
@@ -75,6 +76,26 @@ export function App() {
   useEffect(() => {
     if (!connection) setFilters(emptyGraphFilters);
   }, [connection, language]);
+  useEffect(() => {
+    if (!window.jiraDag) return;
+    let mounted = true;
+    void restoreDesktopConnection().then((restored) => {
+      if (!mounted || !restored) return;
+      setConnection(restored.connection);
+      setEdition(restored.edition);
+      setJql('');
+      setSelectedKey(undefined);
+    }).catch((cause: unknown) => {
+      if (!mounted) return;
+      const text = cause instanceof RequestError && cause.status === 401
+        ? 'Jira rejected the saved login. Sign in again.'
+        : 'Could not restore the saved Jira connection.';
+      setNotice({ text, error: true });
+    }).finally(() => {
+      if (mounted) setRestoring(false);
+    });
+    return () => { mounted = false; };
+  }, []);
 
   function selectIssue(key?: string) {
     if (key && !filtered.issues.some((issue) => issue.key === key)) setFilters(emptyGraphFilters);
@@ -98,7 +119,7 @@ export function App() {
     setLayoutGeneration((previous) => previous + 1);
   }
 
-  async function connect(credentials: JiraCredentials) {
+  async function connect(credentials: JiraLogin) {
     const result = await request('connect', credentials);
     setConnection(result);
     setEdition(credentials.edition);
@@ -112,7 +133,9 @@ export function App() {
     resetFilters();
     selectIssue();
     setLayoutGeneration((previous) => previous + 1);
-    setNotice({ text: t(`Подключено как ${result.displayName}. Введи JQL или ключ задачи.`, `Connected as ${result.displayName}. Enter JQL or an issue key.`) });
+    setNotice(result.rememberFailed
+      ? { text: 'Connected. Could not update the saved Jira connection.', error: true }
+      : { text: t(`Подключено как ${result.displayName}. Введи JQL или ключ задачи.`, `Connected as ${result.displayName}. Enter JQL or an issue key.`) });
   }
   async function disconnect() {
     setBusy(true);
@@ -246,6 +269,7 @@ export function App() {
     setModal({ kind: 'edit', issue });
   }
   function addTask(source?: JiraIssue) {
+    if (restoring) return;
     setModal(connection ? { kind: 'create', source } : { kind: 'connection' });
   }
   function launchIssue(issue: JiraIssue) {
@@ -263,11 +287,16 @@ export function App() {
           <PreferenceControls />
           {connection ? <>
             <span className="connection-state" title={connection.url}><i />{connection.displayName}</span>
-            <button className="icon-button" title={t('Отключить Jira', 'Disconnect Jira')} aria-label={t('Отключить Jira', 'Disconnect Jira')} disabled={busy}
+            <button className="icon-button" title={window.jiraDag
+              ? t('Отключить Jira и удалить сохранённый вход', 'Disconnect Jira and clear saved sign-in')
+              : t('Отключить Jira', 'Disconnect Jira')} aria-label={t('Отключить Jira', 'Disconnect Jira')} disabled={busy}
               onClick={() => void disconnect()}><LogOut size={17} /></button>
           </> : <>
             <span className="demo-pill"><span /> {t('Демо', 'Demo')}</span>
-            <button className="button secondary" onClick={() => setModal({ kind: 'connection' })}><Link2 size={16} /> {t('Подключить Jira', 'Connect Jira')}</button>
+            <button className="button secondary" disabled={restoring} onClick={() => setModal({ kind: 'connection' })}>
+              {restoring ? <LoaderCircle className="spin" size={16} /> : <Link2 size={16} />}
+              {restoring ? t('Восстановление входа', 'Restoring sign-in') : t('Подключить Jira', 'Connect Jira')}
+            </button>
           </>}
         </div>
       </header>
@@ -293,7 +322,7 @@ export function App() {
                   {graph.storyPointsFields.map(({ id, name }) => <option value={id} key={id}>{name} ({id})</option>)}
                 </select>
               </label>}
-              <button type={connection ? 'submit' : 'button'} className="button primary full" disabled={busy || (Boolean(connection) && !jql.trim())}
+              <button type={connection ? 'submit' : 'button'} className="button primary full" disabled={busy || restoring || (Boolean(connection) && !jql.trim())}
                 onClick={connection ? undefined : () => setModal({ kind: 'connection' })}>
                 {busy ? <LoaderCircle size={15} className="spin" /> : <GitBranch size={15} />}
                 {connection ? t('Загрузить граф', 'Load graph') : t('Подключить для загрузки', 'Connect to load')}
@@ -325,7 +354,7 @@ export function App() {
               </button>
               <button className="icon-button outline" title={t('Обновить граф', 'Reload graph')} aria-label={t('Обновить граф', 'Reload graph')}
                 disabled={!connection || busy || !jql.trim()} onClick={() => void load()}><RefreshCw size={17} /></button>
-              <button className="button primary" disabled={busy} onClick={() => addTask()}><Plus size={18} /> {t('Новая задача', 'New issue')}</button>
+              <button className="button primary" disabled={busy || restoring} onClick={() => addTask()}><Plus size={18} /> {t('Новая задача', 'New issue')}</button>
             </div>
           </div>
           <GraphViewControls groupMode={groupMode} onGroupMode={(mode) => {

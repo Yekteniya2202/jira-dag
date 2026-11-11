@@ -1,4 +1,4 @@
-import type { ApiRequest, ApiResponse, JiraEdition } from '../shared/contracts.js';
+import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition } from '../shared/contracts.js';
 import { connectJira, JiraError, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
@@ -78,6 +78,29 @@ function customFields(value: unknown): Record<string, unknown> | undefined {
   return fields;
 }
 
+export function parseJiraCredentials(value: unknown): JiraCredentials {
+  const input = object(value, 'Input');
+  const { edition, scopedToken } = input;
+  if (edition !== 'cloud' && edition !== 'data-center') {
+    throw new RequestError('Select Jira Cloud or Data Center.');
+  }
+  if (scopedToken !== undefined && typeof scopedToken !== 'boolean') {
+    throw new RequestError('Invalid token type.');
+  }
+  const email = text(input.email, 'Email', 254, edition === 'data-center').trim();
+  if (edition === 'cloud' && !/^[^\s@]+@[^\s@]+$/.test(email)) {
+    throw new RequestError('Enter the email for your Jira Cloud account.');
+  }
+  return {
+    edition,
+    url: text(input.url, 'Jira URL', 2_048).trim(),
+    username: text(input.username, 'Username', 256, true).trim(),
+    email,
+    token: text(input.token, 'Token', 8_192).trim(),
+    scopedToken,
+  };
+}
+
 function parseRequest(value: unknown): ApiRequest {
   const { method, input: raw } = object(value, 'Request');
   if (method === 'disconnect' && raw === null) return { method, input: null };
@@ -85,28 +108,11 @@ function parseRequest(value: unknown): ApiRequest {
   const input = object(raw, 'Input');
   switch (method) {
     case 'connect': {
-      const { edition, scopedToken } = input;
-      if (edition !== 'cloud' && edition !== 'data-center') {
-        throw new RequestError('Select Jira Cloud or Data Center.');
+      const { remember } = input;
+      if (remember !== undefined && typeof remember !== 'boolean') {
+        throw new RequestError('Invalid remember connection option.');
       }
-      if (scopedToken !== undefined && typeof scopedToken !== 'boolean') {
-        throw new RequestError('Invalid token type.');
-      }
-      const email = text(input.email, 'Email', 254, edition === 'data-center').trim();
-      if (edition === 'cloud' && !/^[^\s@]+@[^\s@]+$/.test(email)) {
-        throw new RequestError('Enter the email for your Jira Cloud account.');
-      }
-      return {
-        method,
-        input: {
-          edition,
-          url: text(input.url, 'Jira URL', 2_048).trim(),
-          username: text(input.username, 'Username', 256, true).trim(),
-          email,
-          token: text(input.token, 'Token', 8_192).trim(),
-          scopedToken,
-        },
-      };
+      return { method, input: { ...parseJiraCredentials(input), remember } };
     }
     case 'loadGraph': {
       const { depth } = input;

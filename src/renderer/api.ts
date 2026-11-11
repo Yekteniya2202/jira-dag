@@ -1,9 +1,10 @@
-import type { ApiMethod, ApiMethods, ApiRequest, ApiResponse, JiraIssue } from '../shared/contracts';
+import type { ApiMethod, ApiMethods, ApiRequest, ApiResponse, JiraIssue, RestoredJiraConnection } from '../shared/contracts';
 
 declare global {
   interface Window {
     jiraDag?: {
       invoke(request: ApiRequest): Promise<ApiResponse>;
+      restoreConnection(): Promise<ApiResponse<RestoredJiraConnection | null>>;
       openIssue(key: string): Promise<void>;
     };
   }
@@ -47,6 +48,13 @@ export async function openIssue(issue: JiraIssue): Promise<void> {
   if (url.protocol === 'http:' || url.protocol === 'https:') {
     window.open(url.href, '_blank', 'noopener,noreferrer');
   }
+}
+
+export async function restoreDesktopConnection(): Promise<RestoredJiraConnection | null> {
+  const response = await window.jiraDag?.restoreConnection();
+  if (!response) return null;
+  if (!response.ok) throw new RequestError(response.error, response.status);
+  return response.data;
 }
 
 export function errorMessage(error: unknown): string {

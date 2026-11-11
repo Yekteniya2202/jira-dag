@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ArrowRight, CircleHelp, GitBranch, LoaderCircle, LockKeyhole, X } from 'lucide-react';
 import type {
-  JiraCreateField, JiraCreateOptions, JiraCredentials, JiraEdition, JiraIssue, JiraIssueInput, JiraLinkType,
+  JiraCreateField, JiraCreateOptions, JiraEdition, JiraIssue, JiraIssueInput, JiraLinkType, JiraLogin,
 } from '../shared/contracts';
 import { errorMessage, IssueCreationUnconfirmed, request } from './api';
 import { isBlockingType } from './graph-model';
@@ -31,12 +31,14 @@ export function Dialog({ title, children, onClose, busy }: DialogProps) {
 }
 
 export function ConnectionDialog({ onConnect, onClose }: {
-  onConnect(credentials: JiraCredentials): Promise<void>;
+  onConnect(credentials: JiraLogin): Promise<void>;
   onClose(): void;
 }) {
   const { t, language } = usePreferences();
   const [edition, setEdition] = useState<JiraEdition>('cloud');
   const [scopedToken, setScopedToken] = useState(false);
+  const [remember, setRemember] = useState(true);
+  const desktop = Boolean(window.jiraDag);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -49,6 +51,7 @@ export function ConnectionDialog({ onConnect, onClose }: {
       await onConnect({
         edition, scopedToken: edition === 'cloud' && scopedToken,
         url: value('url'), username: value('username'), email: value('email'), token: value('token'),
+        remember: desktop ? remember : undefined,
       });
     } catch (cause) {
       setError(errorMessage(cause));
@@ -83,7 +86,13 @@ export function ConnectionDialog({ onConnect, onClose }: {
             <input type="checkbox" checked={scopedToken} onChange={(event) => setScopedToken(event.target.checked)} />
             {t('Токен с заданными разрешениями (scoped)', 'Scoped API token')}
           </label>}
-          <p className="form-hint"><LockKeyhole size={14} /> {t('Токен хранится в памяти до завершения сессии.', 'The token stays in memory for the session.')}</p>
+          {desktop && <label className="checkbox">
+            <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
+            {t('Запомнить подключение', 'Remember this connection')}
+          </label>}
+          <p className="form-hint"><LockKeyhole size={14} /> {desktop && remember
+            ? t('Данные подключения шифруются средствами системы.', 'Connection details are encrypted using system storage.')
+            : t('Токен хранится в памяти до завершения сессии.', 'The token stays in memory for the session.')}</p>
         </fieldset>
         {error && <p className="form-error" role="alert">{localizeMessage(error, language)}</p>}
         <div className="dialog-actions">

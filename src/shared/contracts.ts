@@ -12,6 +12,14 @@ export interface JiraCredentials {
 export interface JiraConnection {
   url: string;
   displayName: string;
+  rememberFailed?: true;
+}
+
+export type JiraLogin = JiraCredentials & { remember?: boolean };
+
+export interface RestoredJiraConnection {
+  connection: JiraConnection;
+  edition: JiraEdition;
 }
 
 export interface GraphQuery {
@@ -116,7 +124,7 @@ export interface JiraLinkInput {
 }
 
 export interface ApiMethods {
-  connect: { input: JiraCredentials; output: JiraConnection };
+  connect: { input: JiraLogin; output: JiraConnection };
   disconnect: { input: null; output: null };
   loadGraph: { input: GraphQuery; output: JiraGraph };
   getCreateOptions: { input: { projectKey: string; issueTypeId?: string }; output: JiraCreateOptions };

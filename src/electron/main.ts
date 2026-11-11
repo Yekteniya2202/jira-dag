@@ -1,10 +1,10 @@
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  app, BrowserWindow, ipcMain, net, protocol, session, shell,
+  app, BrowserWindow, ipcMain, net, protocol, safeStorage, session, shell,
   type IpcMainInvokeEvent,
 } from 'electron';
-import { createApiSession } from '../server/session.js';
+import { createDesktopConnection, requireProtectedCiphertext } from './connection.js';
 
 const rendererDirectory = resolve(import.meta.dirname, '../../renderer');
 const productionUrl = 'jira-dag://app/';
@@ -12,6 +12,8 @@ const rendererUrl = !app.isPackaged && process.argv.includes('--dev')
   ? 'http://127.0.0.1:5173/'
   : productionUrl;
 const smokeTest = process.argv.includes('--smoke-test');
+const ownsProfile = smokeTest || app.requestSingleInstanceLock();
+if (!ownsProfile) app.quit();
 const contentSecurityPolicy = [
   "default-src 'self'",
   "script-src 'self'",
@@ -29,7 +31,7 @@ protocol.registerSchemesAsPrivileged([{
   privileges: { standard: true, secure: true, supportFetchAPI: true },
 }]);
 
-let currentWindow: { browser: BrowserWindow; jira: ReturnType<typeof createApiSession> } | undefined;
+let currentWindow: { browser: BrowserWindow; jira: ReturnType<typeof createDesktopConnection> } | undefined;
 
 async function serveRenderer(request: Request): Promise<Response> {
   const url = new URL(request.url);
@@ -83,7 +85,10 @@ async function createWindow(): Promise<BrowserWindow> {
       sandbox: true,
     },
   });
-  const jira = createApiSession();
+  const jira = createDesktopConnection(join(app.getPath('userData'), 'jira-dag-data', 'connection.v1.bin'), {
+    encrypt: async (value) => requireProtectedCiphertext(await safeStorage.encryptStringAsync(value)),
+    decrypt: async (value) => (await safeStorage.decryptStringAsync(requireProtectedCiphertext(value))).result,
+  });
   currentWindow = { browser, jira };
 
   browser.webContents.on('will-frame-navigate', event => event.preventDefault());
@@ -91,7 +96,7 @@ async function createWindow(): Promise<BrowserWindow> {
   browser.webContents.on('will-attach-webview', event => event.preventDefault());
   browser.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   browser.on('closed', () => {
-    jira.disconnect();
+    jira.close();
     if (currentWindow?.browser === browser) currentWindow = undefined;
   });
   if (!smokeTest) browser.once('ready-to-show', () => browser.show());
@@ -104,7 +109,8 @@ async function verifyRenderer(browser: BrowserWindow): Promise<void> {
   const loaded = await browser.webContents.executeJavaScript(`
     new Promise(resolve => {
       const ready = () => document.getElementById('root')?.firstElementChild &&
-        typeof window.jiraDag?.invoke === 'function' && typeof window.jiraDag?.openIssue === 'function';
+        typeof window.jiraDag?.invoke === 'function' && typeof window.jiraDag?.openIssue === 'function' &&
+        typeof window.jiraDag?.restoreConnection === 'function';
       if (ready()) return resolve(true);
       const observer = new MutationObserver(() => {
         if (ready()) {
@@ -118,16 +124,22 @@ async function verifyRenderer(browser: BrowserWindow): Promise<void> {
   `);
   if (!loaded) throw new Error('Jira DAG renderer or preload failed to initialize');
   const responds = await browser.webContents.executeJavaScript(
-    'window.jiraDag.invoke(null).then(response => response.ok === false)',
+    'Promise.all([window.jiraDag.invoke(null), window.jiraDag.restoreConnection()])' +
+      '.then(([invalid, restored]) => invalid.ok === false && restored.ok && restored.data === null)',
   );
   if (!responds) throw new Error('Jira DAG IPC validation failed');
 }
 
 app.whenReady().then(async () => {
+  if (!ownsProfile) return;
   protocol.handle('jira-dag', serveRenderer);
   session.defaultSession.setPermissionCheckHandler(() => false);
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   ipcMain.handle('jira-dag:invoke', (event, request: unknown) => getJiraSession(event).invoke(request));
+  ipcMain.handle('jira-dag:restore-connection', (event) => {
+    const jira = getJiraSession(event);
+    return smokeTest ? { ok: true, data: null } : jira.restore();
+  });
   ipcMain.handle('jira-dag:open-issue', async (event, key: unknown) => {
     const url = new URL(getJiraSession(event).getIssueUrl(key));
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) {
@@ -149,6 +161,13 @@ app.whenReady().then(async () => {
     }
   });
 }).catch(exitOnError);
+
+app.on('second-instance', () => {
+  const browser = currentWindow?.browser;
+  if (!browser) return;
+  if (browser.isMinimized()) browser.restore();
+  browser.focus();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

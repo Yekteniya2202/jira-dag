@@ -68,6 +68,10 @@ export function PreferenceControls() {
 const applicationMessages: [ru: string, en: string][] = [
   ['Сервер Jira DAG недоступен.', 'The Jira DAG server is unavailable.'],
   ['Не удалось выполнить запрос.', 'The request could not be completed.'],
+  ['Не удалось восстановить сохранённое подключение Jira.', 'Could not restore the saved Jira connection.'],
+  ['Jira отклонила сохранённый вход. Подключись заново.', 'Jira rejected the saved login. Sign in again.'],
+  ['Подключено. Не удалось обновить сохранённый вход.', 'Connected. Could not update the saved Jira connection.'],
+  ['Не удалось удалить сохранённое подключение Jira.', 'Could not remove the saved Jira connection.'],
   ['Подключись к Jira.', 'Connect to Jira first.'],
   ['Укажи полный адрес Jira.', 'Enter the full Jira URL.'],
   ['Укажи HTTPS-адрес Jira без учётных данных, параметров и фрагмента.', 'Enter a Jira HTTPS URL without credentials, query parameters or a fragment.'],
