@@ -108,6 +108,7 @@ button.analysis-issue-key:hover { background: var(--surface-hover); }
 .sprint-plan-fields label, .analysis-team label { display: grid; min-width: 0; gap: 4px; font-size: 12px; color: var(--muted); }
 .sprint-plan-fields :is(input, select), .analysis-team :is(input, select) { min-width: 0; width: 100%; font-size: 12px; }
 .analysis-team { margin-top: 3px; }
+.analysis-add-self { display: inline-flex; align-items: center; gap: 4px; justify-self: start; text-align: left; }
 .analysis-team-list > li {
   min-width: 0; display: grid; align-items: center; gap: 5px;
   grid-template-columns: minmax(0, 1fr) minmax(65px, 90px) auto; font-size: 12px;

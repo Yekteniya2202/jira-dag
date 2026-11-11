@@ -10,8 +10,9 @@ import {
 } from 'lucide-react';
 import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
 import { downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
-import { assigneeInitials, blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
+import { blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
+import { PersonAvatar } from './project-team';
 import './graph-canvas.css';
 
 export interface CardFields {
@@ -31,7 +32,10 @@ type Card = Node<{
   analysisMatch?: boolean;
   fields: CardFields;
   noteCount?: number;
+  avatar?: string;
+  epic?: { key: string; summary?: string };
   onOpen?: (issue: JiraIssue) => void;
+  onOpenEpic?: (key: string, summary?: string) => void;
   onNote?: (key: string, focusInput: boolean) => void;
   onCreateRelated?: (issue: JiraIssue) => void;
 }, 'issue'>;
@@ -40,6 +44,7 @@ type Zone = Node<{
   epic?: JiraIssue;
   onSelect?: (key: string) => void;
   onOpen?: (issue: JiraIssue) => void;
+  onOpenEpic?: (key: string, summary?: string) => void;
   onCreateRelated?: (issue: JiraIssue) => void;
   selected: boolean;
   analysisMatch?: boolean;
@@ -56,7 +61,7 @@ type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: b
 
 function IssueCard({ data, selected }: NodeProps<Card>) {
   const { language, t } = usePreferences();
-  const { issue, direction, muted, highlighted, analysisMatch, fields, onOpen, onNote, noteCount, onCreateRelated } = data;
+  const { issue, direction, muted, highlighted, analysisMatch, fields, onOpen, onNote, noteCount, onCreateRelated, avatar, epic, onOpenEpic } = data;
   const across = direction === 'LR';
   const hours = issue.remainingEstimateSeconds ?? issue.originalEstimateSeconds;
   const assignee = fields.assignee && issue.assignee?.trim();
@@ -83,12 +88,18 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
         {onCreateRelated && <RelatedIssueButton issue={issue} onCreate={onCreateRelated} />}
       </div>
       <div className="issue-card-title" title={issue.summary}>{issue.summary}</div>
+      {epic && onOpenEpic && <button type="button" className="issue-card-epic nodrag nopan"
+        aria-label={t(`Открыть граф эпика ${epic.key}`, `Open epic graph ${epic.key}`)}
+        title={epic.summary ? `${epic.key} · ${epic.summary}` : epic.key}
+        onClick={(event) => { event.stopPropagation(); onOpenEpic(epic.key, epic.summary); }}>
+        <Layers3 size={11} aria-hidden="true" /><span>{epic.summary ?? epic.key}</span>
+      </button>}
       <div className="issue-card-meta">
         <span className={`status ${statusTone(issue)}`} title={issue.status}><CircleDot size={11} /> {issue.status}</span>
         {fields.points && issue.storyPoints !== undefined && <span className="points" title="Story points">{issue.storyPoints} SP</span>}
       </div>
       {assignee && <div className="issue-card-assignee" title={`${t('Исполнитель', 'Assignee')}: ${assignee}`}>
-        <span className="issue-card-avatar" aria-hidden="true">{assigneeInitials(assignee)}</span><span>{assignee}</span>
+        <PersonAvatar name={assignee} src={avatar} /><span>{assignee}</span>
       </div>}
       {details && <div className="issue-card-details" title={details}>{details}</div>}
       <Handle type="source" position={across ? Position.Right : Position.Bottom} aria-label={t('Исходящая зависимость', 'Outgoing dependency')} />
@@ -108,10 +119,12 @@ const groupIcons = {
   level: ListTree, 'open-level': ListTree, 'sprint-unscheduled': CalendarX2, 'sprint-external': Link2,
 };
 
-function GroupZone({ data: { zone, epic, onSelect, onOpen, onCreateRelated, selected, analysisMatch } }: NodeProps<Zone>) {
+function GroupZone({ data: { zone, epic, onSelect, onOpen, onOpenEpic, onCreateRelated, selected, analysisMatch } }: NodeProps<Zone>) {
   const { t } = usePreferences();
   const GroupIcon = zone.appearance ? groupIcons[zone.appearance.variant] : zone.kind === 'nested' ? ClipboardList : Layers3;
   const title = <><GroupIcon size={15} aria-hidden="true" /><span>{zone.title}</span></>;
+  const key = zone.epicKey;
+  const openEpic = key && onOpenEpic ? () => onOpenEpic(key, epic?.summary ?? (zone.title.slice(key.length + 3) || undefined)) : undefined;
   return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`} data-export-zone={zone.id}
     data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color} data-analysis-match={analysisMatch}>
     <div className="graph-zone-heading">
@@ -119,7 +132,11 @@ function GroupZone({ data: { zone, epic, onSelect, onOpen, onCreateRelated, sele
         ? <button type="button" className="graph-zone-title graph-zone-action nodrag nopan" title={zone.title}
           aria-label={`${t('Открыть сведения об эпике', 'View epic details')} ${zone.title}`}
           onClick={(event) => { event.stopPropagation(); onSelect(epic.key); }}>{title}</button>
-        : <div className="graph-zone-title" title={zone.title}>{title}</div>}
+        : openEpic && key
+          ? <button type="button" className="graph-zone-title graph-zone-action nodrag nopan" title={zone.title}
+            aria-label={t(`Открыть граф эпика ${key}`, `Open epic graph ${key}`)}
+            onClick={(event) => { event.stopPropagation(); openEpic(); }}>{title}</button>
+          : <div className="graph-zone-title" title={zone.title}>{title}</div>}
       {epic?.url && onOpen && <button type="button" className="graph-zone-open graph-zone-action nodrag nopan" data-export-ignore
         title={t('Открыть в Jira', 'Open in Jira')} aria-label={`${t('Открыть в Jira', 'Open in Jira')} ${epic.key}`}
         onClick={(event) => { event.stopPropagation(); onOpen(epic); }}><ArrowUpRight size={15} /></button>}
@@ -212,10 +229,12 @@ interface Props {
   highlightedKeys?: ReadonlySet<string>;
   analysisKeys?: ReadonlySet<string>;
   analysisNavigation?: readonly string[];
+  avatars?: Readonly<Record<string, string>>;
   preferredSprintIds?: readonly string[];
   onSelectIssue(key?: string): void;
   onSelectEdge(id: string): void;
   onOpenIssue(issue: JiraIssue): void;
+  onOpenEpic?(key: string, summary?: string): void;
   onNoteIssue(key: string, focusInput: boolean): void;
   onCreateRelated?(issue: JiraIssue): void;
   onManualPositionsChange(positions: Record<string, GraphPosition>): void;
@@ -225,14 +244,16 @@ interface Props {
 }
 
 export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
-  notesByIssue, manualPositions, viewport, highlightedKeys, analysisKeys, analysisNavigation, preferredSprintIds,
-  onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated, onManualPositionsChange,
+  notesByIssue, manualPositions, viewport, highlightedKeys, analysisKeys, analysisNavigation, preferredSprintIds, avatars,
+  onSelectIssue, onSelectEdge, onOpenIssue, onOpenEpic, onNoteIssue, onCreateRelated, onManualPositionsChange,
   onViewportChange, onAnalysisNavigationEnd, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
   const [dragPositions, setDragPositions] = useState<Record<string, GraphPosition>>({});
   const userMovedViewport = useRef(false);
-  const cardHeight = CARD_HEIGHT + (fields.assignee ? 22 : 0) + (fields.priority || fields.labels || fields.dueDate || fields.estimate ? 19 : 0);
+  const showEpicBadges = groupMode !== 'hierarchy' && Boolean(onOpenEpic);
+  const cardHeight = CARD_HEIGHT + (fields.assignee ? 22 : 0) + (fields.priority || fields.labels || fields.dueDate || fields.estimate ? 19 : 0)
+    + (showEpicBadges && layoutGraph.issues.some(({ key, epicKey }) => epicKey && epicKey !== key) ? 24 : 0);
   const across = direction === 'LR';
   // The cards have fixed dimensions. Keep edge anchors available even before the DOM observer runs.
   const handles: NodeHandle[] = [
@@ -282,6 +303,8 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
   const cards: Card[] = graph.issues.flatMap((issue) => {
     const position = layout.positions.get(issue.key);
     if (!position) return [];
+    const epic = showEpicBadges && issue.epicKey && issue.epicKey !== issue.key
+      ? { key: issue.epicKey, summary: issue.epicSummary ?? basisIssues.get(issue.epicKey)?.summary } : undefined;
     return [{
       id: issue.key, type: 'issue',
       position: (groupMode === 'none' ? dragPositions[issue.key] ?? manualPositions[issue.key] : undefined) ?? position,
@@ -291,6 +314,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
       ariaLabel: `${issue.key} ${issue.summary}`,
       data: {
         issue, direction, fields, noteCount: notesByIssue[issue.key]?.length, highlighted: highlightedKeys?.has(issue.key),
+        avatar: avatars?.[issue.key], epic, onOpenEpic,
         analysisMatch: analysisKeys?.has(issue.key),
         onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined, onCreateRelated,
         muted: !highlightedKeys?.has(issue.key) && Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
@@ -302,6 +326,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     data: {
       zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
       selected: Boolean(zone.epicKey && zone.epicKey === selectedKey), onSelect: onSelectIssue,
+      onOpenEpic,
       analysisMatch: zone.epicKey ? analysisKeys?.has(zone.epicKey) : undefined,
       onOpen: connected ? onOpenIssue : undefined, onCreateRelated,
     },

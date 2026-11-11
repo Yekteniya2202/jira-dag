@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { ChevronDown, Filter, LoaderCircle, Search } from 'lucide-react';
 import type { JiraEdition, JiraGraph, JiraIssue, JiraProject, JiraProjectFilterOptions, JiraSavedFilter } from '../shared/contracts';
 import { request } from './api';
@@ -17,7 +17,7 @@ type ProjectOptionsState = { project: string; options?: JiraProjectFilterOptions
 const noIssues: readonly JiraIssue[] = [];
 
 export function GraphProjectFilters({
-  connected, edition, projectKey, onProjectChange, graph, queryIssueKeys, storyField, selected, onChange, onApply,
+  connected, edition, projectKey, onProjectChange, graph, queryIssueKeys, storyField, selected, onChange, onApply, projectDetails,
 }: {
   connected: boolean;
   edition: JiraEdition;
@@ -29,6 +29,7 @@ export function GraphProjectFilters({
   selected: GraphFilters['facets'];
   onChange(selected: GraphFilters['facets']): void;
   onApply?(jql: string): void;
+  projectDetails?: ReactNode;
 }) {
   const { t, language } = usePreferences();
   const [projects, setProjects] = useState<ListState<JiraProject>>({ kind: 'loading' });
@@ -125,6 +126,7 @@ export function GraphProjectFilters({
       {projects.kind === 'failed' && <button type="button" className="text-button project-filter-retry"
         onClick={() => setProjectRetry((previous) => previous + 1)}>{t('Обновить список проектов', 'Retry project list')}</button>}
     </>}
+    {projectDetails}
     {projectKey && !projectMetadata && <p className="form-hint" role="status">
       <LoaderCircle size={13} className="spin" aria-hidden="true" /> {t('Загрузка значений проекта…', 'Loading project values…')}
     </p>}

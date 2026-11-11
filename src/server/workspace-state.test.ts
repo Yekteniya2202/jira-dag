@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  clearWorkspace, readSavedFilters, readWorkspace, saveFilters, saveWorkspace, workspaceScope,
-  type LocalStore, type QueryDraft, type TabSnapshot,
+  clearWorkspace, moveWorkspaceTab, readSavedFilters, readWorkspace, saveFilters, saveWorkspace, setWorkspaceTabPinned, workspaceScope,
+  type LocalStore, type QueryDraft, type TabSnapshot, type WorkspaceTab,
 } from '../renderer/workspace-state.js';
 
 function memoryStore() {
@@ -63,4 +63,40 @@ test('invalid local storage falls back to an empty workspace', () => {
   assert.ok(saveWorkspace(store, 'demo', { activeTab: 2, tabs: [{ id: 2 }] }));
   for (const key of values.keys()) store.setItem(key, '{');
   assert.deepEqual(readWorkspace(store, 'demo'), { activeTab: 1, tabs: [{ id: 1 }] });
+});
+
+test('pinning and moving tabs keeps the pinned group first and preserves snapshots', () => {
+  const tab: WorkspaceTab = { id: 4, epicKey: 'APP-12', epicTitle: 'Release', state: { draft } };
+  const initial: WorkspaceTab[] = [{ id: 1, pinned: true }, { id: 2 }, { id: 3 }, tab];
+  const pinned = setWorkspaceTabPinned(initial, 4, true);
+  assert.deepEqual(pinned.map(({ id }) => id), [1, 4, 2, 3]);
+  assert.equal(pinned[1].state, tab.state);
+  assert.equal(pinned[1].epicKey, 'APP-12');
+  assert.equal(moveWorkspaceTab(pinned, 3, 1, 'before'), pinned);
+  assert.deepEqual(moveWorkspaceTab(pinned, 1, 4, 'after').map(({ id }) => id), [4, 1, 2, 3]);
+  const unpinned = setWorkspaceTabPinned(pinned, 1, false);
+  assert.deepEqual(unpinned.map(({ id }) => id), [4, 1, 2, 3]);
+  assert.deepEqual(moveWorkspaceTab(unpinned, 3, 1, 'before').map(({ id }) => id), [4, 3, 1, 2]);
+});
+
+test('restoring tabs preserves order within pinned and unpinned groups and restores epic scope', () => {
+  const { store } = memoryStore();
+  const scope = workspaceScope(connection, 'cloud');
+  const jql = 'key = "APP-12" OR parent = "APP-12"';
+  const tabs: WorkspaceTab[] = [
+    { id: 3 },
+    { id: 1, pinned: true },
+    { id: 4, pinned: true, epicKey: 'APP-12', epicTitle: 'Release', state: {
+      draft: { ...draft, baseJql: jql },
+      applied: { jql, depth: 0, storyField: '', sprintIds: [], epicKey: 'APP-12' },
+    } },
+    { id: 2 },
+  ];
+  assert.ok(saveWorkspace(store, scope, { activeTab: 4, tabs }));
+  const restored = readWorkspace(store, scope);
+  assert.deepEqual(restored.tabs.map(({ id, pinned }) => [id, Boolean(pinned)]), [[1, true], [4, true], [3, false], [2, false]]);
+  assert.equal(restored.activeTab, 4);
+  assert.equal(restored.tabs[1].epicKey, 'APP-12');
+  assert.equal(restored.tabs[1].epicTitle, 'Release');
+  assert.equal(restored.tabs[1].state?.applied?.epicKey, 'APP-12');
 });

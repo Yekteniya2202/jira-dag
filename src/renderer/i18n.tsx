@@ -97,6 +97,8 @@ const applicationMessages: [ru: string, en: string][] = [
   ['Настройки полей Jira недоступны.', 'Jira field settings are unavailable.'],
   ['Настройки типов связей Jira недоступны.', 'Jira link type settings are unavailable.'],
   ['Часть связанных задач недоступна для этой учётной записи.', 'Some linked issues are unavailable to this account.'],
+  ['Названия части родительских задач недоступны.', 'Some parent issue titles are unavailable.'],
+  ['Часть подзадач эпика недоступна.', 'Some epic subtasks are unavailable.'],
   ['Jira вернула слишком много страниц комментариев или некорректную пагинацию.', 'Jira returned too many comment pages or invalid pagination.'],
   ['Jira не подтвердила создание заметки. Обнови заметки перед повторной отправкой.', 'Jira did not confirm creation. Refresh notes before submitting again.'],
   ['Jira не подтвердила изменение заметки. Обнови заметки перед повторной попыткой.', 'Jira did not confirm the edit. Refresh notes before trying again.'],

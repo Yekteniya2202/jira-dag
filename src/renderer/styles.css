@@ -174,16 +174,22 @@ button svg { flex: none; }
 .workspace-tabs > button { flex: none; }
 .workspace-tablist { display: flex; gap: 3px; min-width: 0; overflow-x: auto; padding: 2px; }
 .workspace-tablist button {
-  flex: none; max-width: 200px; padding: 6px 11px; border: 1px solid transparent; border-radius: 6px;
+  display: flex; align-items: center; gap: 5px; flex: none; max-width: 200px;
+  padding: 6px 11px; border: 1px solid transparent; border-radius: 6px;
   color: var(--muted); background: transparent; font-size: 12px; font-weight: 600;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.workspace-tablist button > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.workspace-tablist button[data-pinned='true'] > svg { color: var(--accent); }
+.workspace-tablist button[data-pinned='true'] + button:not([data-pinned]) { margin-inline-start: 5px; }
+.workspace-tablist button[draggable='true'] { cursor: grab; }
+.workspace-tablist button[data-drop='before'] { box-shadow: inset 2px 0 var(--accent); }
+.workspace-tablist button[data-drop='after'] { box-shadow: inset -2px 0 var(--accent); }
 .workspace-tablist button:hover { background: var(--surface-raised); color: var(--text); }
 .workspace-tablist button[aria-selected="true"] {
   color: var(--accent-ink); background: var(--accent-surface); border-color: var(--accent-border);
 }
 .workspace-deck { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
-.workspace.workspace-inactive { position: absolute; inset: 0; visibility: hidden; pointer-events: none; overflow: hidden; }
+.workspace[hidden] { display: none; }
 .applied-jql { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 11px; }
 .applied-jql code { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
 .inspector-assignee { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 12px; }
@@ -388,10 +394,6 @@ select { padding-right: 6px; }
   font-size: 10.5px; line-height: 1.3;
 }
 .issue-card-assignee > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.issue-card-avatar {
-  display: inline-grid; place-items: center; flex: none; width: 17px; height: 17px; border-radius: 50%;
-  background: var(--accent-surface); color: var(--accent-ink); font-size: 8px; font-weight: 700;
-}
 .issue-card-meta, .inspector-metadata { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .issue-card-meta { margin-top: auto; }
 .status, .points {

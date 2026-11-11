@@ -2,7 +2,7 @@ import { Fragment, useId, useMemo, useState, type ReactNode } from 'react';
 import {
   ArrowRight, CalendarRange, ChevronDown, CircleAlert, Crosshair, GitBranch, Layers3, Plus, Trash2, Users,
 } from 'lucide-react';
-import type { JiraGraph, JiraIssue } from '../shared/contracts';
+import type { JiraGraph, JiraIssue, JiraTeamMember } from '../shared/contracts';
 import type { AnalysisSettings } from './analysis-settings';
 import { analyzeDependencies, type DependencyAnalysis } from './dependency-analysis';
 import { Dialog } from './dialogs';
@@ -51,9 +51,11 @@ function duplicateAssigneeNames(people: readonly { name?: string }[]): Set<strin
   return duplicates;
 }
 
-export function AnalysisPanel({ graph, settings, onSettingsChange, onClose, onFocusIssue, onHighlight }: {
+export function AnalysisPanel({ graph, settings, projectTeam, currentUser, onSettingsChange, onClose, onFocusIssue, onHighlight }: {
   graph: JiraGraph;
   settings: AnalysisSettings;
+  projectTeam?: readonly JiraTeamMember[];
+  currentUser?: JiraTeamMember;
   onSettingsChange(settings: AnalysisSettings): void;
   onClose(): void;
   onFocusIssue: IssueAction;
@@ -98,7 +100,8 @@ export function AnalysisPanel({ graph, settings, onSettingsChange, onClose, onFo
         </details>
       </div>}
       {view === 'dependencies' ? <DependenciesView analysis={analysis} graph={graph} points={points} focus={focus} highlight={highlight} t={t} />
-        : <SprintView analysis={analysis} roster={roster} settings={settings} onChange={onSettingsChange}
+        : <SprintView analysis={analysis} roster={roster} projectTeam={projectTeam} currentUser={currentUser}
+          settings={settings} onChange={onSettingsChange}
           points={points} focus={focus} highlight={highlight} t={t} />}
     </div>
   </Dialog>;
@@ -206,8 +209,9 @@ function DependenciesView({ analysis, graph, points, focus, highlight, t }: {
   </>;
 }
 
-function SprintView({ analysis, roster, settings, onChange, points, focus, highlight, t }: {
+function SprintView({ analysis, roster, projectTeam, currentUser, settings, onChange, points, focus, highlight, t }: {
   analysis: DependencyAnalysis; roster: Assignee[]; settings: AnalysisSettings; onChange(settings: AnalysisSettings): void;
+  projectTeam?: readonly JiraTeamMember[]; currentUser?: JiraTeamMember;
   points: FormatPoints; focus: IssueAction; highlight?: HighlightAction; t: Translate;
 }) {
   const capacity = parseCapacity(settings.capacity);
@@ -236,7 +240,8 @@ function SprintView({ analysis, roster, settings, onChange, points, focus, highl
       {(invalidCapacity || invalidPeople) && <p className="analysis-field-error" role="status">{t(
         'Введи неотрицательные лимиты в Story Points.', 'Enter non-negative capacities in Story Points.',
       )}</p>}
-      <TeamSettings roster={roster} people={settings.people} t={t} onChange={(people) => onChange({ ...settings, people })} />
+      <TeamSettings roster={roster} projectTeam={projectTeam} currentUser={currentUser}
+        people={settings.people} t={t} onChange={(people) => onChange({ ...settings, people })} />
       <p className="analysis-caption">{t(
         'Лимиты используются для примерного плана. SP — оценка объёма работы. Предложения по распределению остаются в приложении.',
         'Capacity is used for a draft plan. SP measure estimated effort. Assignment suggestions stay in the app.',
@@ -254,20 +259,25 @@ function SprintView({ analysis, roster, settings, onChange, points, focus, highl
   </div>;
 }
 
-function TeamSettings({ roster, people, onChange, t }: {
+function TeamSettings({ roster, projectTeam, currentUser, people, onChange, t }: {
   roster: Assignee[]; people: TeamMember[]; onChange(people: TeamMember[]): void; t: Translate;
+  projectTeam?: readonly JiraTeamMember[]; currentUser?: JiraTeamMember;
 }) {
   const selectId = useId();
   const manualId = useId();
   const [chosen, setChosen] = useState('');
   const [manual, setManual] = useState('');
   const selectedIds = new Set(people.map(({ id }) => id));
-  const available = roster.filter(({ id }) => !selectedIds.has(id));
+  const graphIds = new Set(roster.map(({ id }) => id));
+  const projectPeople = projectTeam?.filter(({ id }) => !graphIds.has(id)) ?? [];
+  const availableGraph = roster.filter(({ id }) => !selectedIds.has(id));
+  const availableProject = projectPeople.filter(({ id }) => !selectedIds.has(id));
+  const available = [...availableGraph, ...availableProject];
   const selected = available.find(({ id }) => id === chosen);
-  const rosterNames = new Set([...roster, ...people].map(({ name }) => name.trim().toLowerCase()));
+  const rosterNames = new Set([...roster, ...projectPeople, ...people].map(({ name }) => name.trim().toLowerCase()));
   const manualName = manual.trim();
   const manualValid = manualName !== '' && !rosterNames.has(manualName.toLowerCase());
-  const duplicateNames = duplicateAssigneeNames(roster);
+  const duplicateNames = duplicateAssigneeNames([...roster, ...projectPeople]);
   function addPeople(members: Assignee[]) {
     onChange([...people, ...members.map((person) => ({ ...person, capacity: '' }))]);
   }
@@ -286,6 +296,10 @@ function TeamSettings({ roster, people, onChange, t }: {
       'Для задач без исполнителя план предлагает участника команды. Лимит участника можно оставить пустым.',
       'The plan suggests a team member for unassigned issues. Individual capacity can be left blank.',
     )}</p>
+    {currentUser && !selectedIds.has(currentUser.id) && <button type="button" className="text-button analysis-add-self"
+      title={currentUser.name} onClick={() => addPeople([currentUser])}>
+      <Plus size={13} aria-hidden="true" /> {t('Добавить меня', 'Add myself')} · {currentUser.name}
+    </button>}
     {people.length > 0 && <ul className="analysis-team-list">
       {people.map((person) => <li key={person.id}>
         <span title={memberName(person)}>{memberName(person)}</span>
@@ -298,17 +312,25 @@ function TeamSettings({ roster, people, onChange, t }: {
       </li>)}
     </ul>}
     {available.length > 0 && <div className="analysis-team-select">
-      <label htmlFor={selectId}>{t('Исполнитель из графа', 'Assignee from graph')}</label>
+      <label htmlFor={selectId}>{availableProject.length ? t('Исполнитель из Jira', 'Assignee from Jira')
+        : t('Исполнитель из графа', 'Assignee from graph')}</label>
       <div className="analysis-add-person">
         <select id={selectId} value={selected?.id ?? ''} onChange={(event) => setChosen(event.target.value)}>
           <option value="">{t('Выбрать исполнителя', 'Choose assignee')}</option>
-          {available.map((person) => <option key={person.id} value={person.id}>{memberName(person)}</option>)}
+          {availableProject.length > 0 ? <>
+            {availableGraph.length > 0 && <optgroup label={t('Исполнители на графе', 'Graph assignees')}>
+              {availableGraph.map((person) => <option key={person.id} value={person.id}>{memberName(person)}</option>)}
+            </optgroup>}
+            <optgroup label={t('Команда проекта', 'Project team')}>
+              {availableProject.map((person) => <option key={person.id} value={person.id}>{memberName(person)}</option>)}
+            </optgroup>
+          </> : availableGraph.map((person) => <option key={person.id} value={person.id}>{memberName(person)}</option>)}
         </select>
         <button type="button" className="icon-button outline" aria-label={t('Добавить исполнителя', 'Add assignee')}
           disabled={!selected} onClick={() => { if (selected) addPeople([selected]); setChosen(''); }}><Plus size={16} /></button>
       </div>
-      {available.length > 1 && <button type="button" className="text-button" onClick={() => {
-        addPeople(available);
+      {availableGraph.length > 1 && <button type="button" className="text-button" onClick={() => {
+        addPeople(availableGraph);
         setChosen('');
       }}>{t('Добавить всех исполнителей графа', 'Add all assignees from graph')}</button>}
     </div>}
@@ -342,6 +364,8 @@ function PlanResults({ plan, points, focus, t }: { plan: SprintPlan; points: For
     </div>
     {plan.loads.length > 0 && <details className="analysis-details" open>
       <summary><Users size={15} /> {t('Загрузка команды', 'Team workload')} <ChevronDown size={14} /></summary>
+      <p className="analysis-caption">{t('Здесь участники сценария и исполнители задач, попавших в предложенный план.',
+        'This shows scenario members and assignees of issues in the proposed plan.')}</p>
       <ul className="analysis-loads">
         {plan.loads.map(({ id, name, points: allocated, count, capacity }) => <li key={id ?? 'unassigned'}>
           <span title={name}>{name ? assigneeLabel(name, id) : t('Без исполнителя', 'Unassigned')}</span>

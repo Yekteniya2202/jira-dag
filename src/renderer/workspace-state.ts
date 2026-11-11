@@ -21,6 +21,7 @@ export interface AppliedQuery {
   depth: number;
   storyField: string;
   sprintIds: string[];
+  epicKey?: string;
 }
 
 export interface TabSnapshot {
@@ -47,7 +48,15 @@ export interface TabSnapshot {
   analysisHighlight?: string[];
 }
 
-export type WorkspaceTab = { id: number; query?: string; project?: string; state?: Partial<TabSnapshot> };
+export type WorkspaceTab = {
+  id: number;
+  query?: string;
+  project?: string;
+  pinned?: boolean;
+  epicKey?: string;
+  epicTitle?: string;
+  state?: Partial<TabSnapshot>;
+};
 export type SavedFilter = { id: string; name: string; draft: QueryDraft };
 export type StoredWorkspace = { activeTab: number; tabs: WorkspaceTab[] };
 export type LocalStore = { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
@@ -58,6 +67,23 @@ const issueKey = /^[A-Z][A-Z0-9_]*-\d+$/i;
 
 export function workspaceScope(connection: JiraConnection | undefined, edition: JiraEdition): string {
   return connection ? JSON.stringify([edition, connection.url, connection.profileId ?? connection.displayName]) : 'demo';
+}
+
+export function setWorkspaceTabPinned(tabs: WorkspaceTab[], id: number, pinned: boolean): WorkspaceTab[] {
+  const tab = tabs.find((item) => item.id === id);
+  if (!tab || Boolean(tab.pinned) === pinned) return tabs;
+  const remaining = tabs.filter((item) => item.id !== id);
+  const firstUnpinned = remaining.findIndex((item) => !item.pinned);
+  return remaining.toSpliced(firstUnpinned < 0 ? remaining.length : firstUnpinned, 0, { ...tab, pinned });
+}
+
+export function moveWorkspaceTab(tabs: WorkspaceTab[], id: number, target: number, side: 'before' | 'after'): WorkspaceTab[] {
+  const tab = tabs.find((item) => item.id === id);
+  const destination = tabs.find((item) => item.id === target);
+  if (!tab || !destination || tab === destination || Boolean(tab.pinned) !== Boolean(destination.pinned)) return tabs;
+  const remaining = tabs.filter((item) => item.id !== id);
+  const index = remaining.indexOf(destination) + Number(side === 'after');
+  return index === tabs.indexOf(tab) ? tabs : remaining.toSpliced(index, 0, tab);
 }
 
 function storageKey(kind: 'workspace' | 'filters', scope: string): string {
@@ -106,9 +132,11 @@ function appliedQuery(value: unknown): AppliedQuery | undefined {
   const data = record(value);
   const jql = text(data.jql);
   if (!jql?.trim()) return undefined;
+  const epicKey = text(data.epicKey, 128);
   return {
     jql, depth: integer(data.depth, 0, 3) ?? 0, storyField: text(data.storyField, 128) ?? '',
     sprintIds: texts(data.sprintIds).filter((id) => /^\d+$/.test(id)),
+    ...(epicKey && issueKey.test(epicKey) ? { epicKey } : {}),
   };
 }
 
@@ -195,11 +223,17 @@ export function readWorkspace(store: LocalStore, scope: string): StoredWorkspace
     const id = integer(tab.id, 1, 1_000_000);
     if (!id || seen.has(id)) return [];
     seen.add(id);
-    return [{ id, query: text(tab.query), project: text(tab.project, 128), state: tabSnapshot(tab.state) }];
+    const epicKey = text(tab.epicKey, 128);
+    return [{
+      id, query: text(tab.query), project: text(tab.project, 128), state: tabSnapshot(tab.state),
+      ...(tab.pinned === true ? { pinned: true } : {}),
+      ...(epicKey && issueKey.test(epicKey) ? { epicKey, epicTitle: text(tab.epicTitle, 255) } : {}),
+    }];
   });
   if (!tabs.length) return { activeTab: 1, tabs: [{ id: 1 }] };
   const activeTab = integer(data.activeTab, 1, 1_000_000);
-  return { tabs, activeTab: activeTab && seen.has(activeTab) ? activeTab : tabs[0].id };
+  const ordered = [...tabs.filter(({ pinned }) => pinned), ...tabs.filter(({ pinned }) => !pinned)];
+  return { tabs: ordered, activeTab: activeTab && seen.has(activeTab) ? activeTab : ordered[0].id };
 }
 
 export function readSavedFilters(store: LocalStore, scope: string): SavedFilter[] {

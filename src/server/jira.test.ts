@@ -68,6 +68,11 @@ test('Cloud search preserves link direction, convergent links, hierarchy, zero p
       case '/rest/api/3/issueLinkType': return json({ issueLinkTypes: [blocks, reviews] });
       case '/rest/api/3/search/jql': {
         const query = JSON.parse(String(init.body)) as { jql: string; nextPageToken?: string; fields: string[] };
+        if (query.jql === 'key in ("APP-4")') {
+          assert.deepEqual(query.fields, ['summary', 'issuetype', 'parent']);
+          externalJql.push(query.jql);
+          return json({ isLast: true, issues: [rawIssue('APP-4', { summary: 'Prepare migration' })] });
+        }
         assert.ok(query.fields.includes('customfield_14000'));
         if (query.jql === 'project = APP') {
           searchTokens.push(query.nextPageToken);
@@ -117,8 +122,9 @@ test('Cloud search preserves link direction, convergent links, hierarchy, zero p
     { key: 'APP-1', external: false }, { key: 'APP-2', external: false },
   ]);
   assert.deepEqual(selection.edges.map(({ id }) => id), ['200']);
+  assert.equal(selection.issues[1]?.parentSummary, 'Prepare migration');
   assert.deepEqual(selection.issues[1]?.unloadedBlockerKeys, ['EXT-3']);
-  assert.deepEqual(externalJql, ['key in ("EXT-3", "APP-4")']);
+  assert.deepEqual(externalJql, ['key in ("EXT-3", "APP-4")', 'key in ("APP-4")']);
 });
 
 test('query-only graph records open inward blockers without adding their cards or arrows', async (t) => {
@@ -382,6 +388,139 @@ test('Cloud search supplies filters and finds the epic of a nested subtask', asy
   assert.equal(task?.remainingEstimateSeconds, 0);
   assert.equal(epic?.isEpic, true);
   assert.equal(epic?.epicKey, 'APP-1');
+});
+
+test('Cloud query-only graph resolves shared subtask parents and epic titles outside the selection', async (t) => {
+  const lookups: string[] = [];
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/rest/api/3/myself': return profile();
+      case '/rest/api/3/field': return json([]);
+      case '/rest/api/3/issueLinkType': return json({ issueLinkTypes: [] });
+      case '/rest/api/3/search/jql': {
+        const { jql, fields } = JSON.parse(String(init.body)) as { jql: string; fields: string[] };
+        if (jql === 'issuetype = Subtask') {
+          return json({ isLast: true, issues: ['APP-3', 'APP-4'].map((key) => rawIssue(key, {
+            issuetype: { hierarchyLevel: -1 }, parent: { key: 'APP-2' },
+          })) });
+        }
+        lookups.push(jql);
+        assert.deepEqual(fields, ['summary', 'issuetype', 'parent']);
+        assert.equal(jql, 'key in ("APP-2")');
+        return json({ isLast: true, issues: [rawIssue('APP-2', {
+          summary: 'Prepare migration',
+          parent: rawIssue('APP-1', { summary: 'Storage evolution', issuetype: { hierarchyLevel: 1, name: 'Initiative slice' } }),
+        })] });
+      }
+      default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+    }
+  });
+  const { client } = await connectJira(cloud, () => {});
+  const graph = await client.loadGraph({ jql: 'issuetype = Subtask', depth: 0 });
+  assert.deepEqual(lookups, ['key in ("APP-2")']);
+  assert.deepEqual(graph.issues.map(({ key, parentKey, parentSummary, epicKey, epicSummary }) =>
+    ({ key, parentKey, parentSummary, epicKey, epicSummary })), ['APP-3', 'APP-4'].map((key) => ({
+    key, parentKey: 'APP-2', parentSummary: 'Prepare migration', epicKey: 'APP-1', epicSummary: 'Storage evolution',
+  })));
+  assert.deepEqual(graph.edges, []);
+  assert.deepEqual(graph.warnings, []);
+});
+
+test('Data Center resolves renamed Epic Link and Parent Link and retains an inaccessible ancestor key', async (t) => {
+  let canReadEpic = true;
+  const lookups: string[] = [];
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/jira/rest/api/2/myself': return json({ displayName: 'Jira User', key: 'JIRAUSER1' });
+      case '/jira/rest/api/2/field': return json([
+        { id: 'customfield_10012', name: 'Связь с эпиком', schema: { custom: 'com.pyxis.greenhopper.jira:gh-epic-link' } },
+        { id: 'customfield_10013', name: 'Родитель', schema: { custom: 'com.atlassian.jpo:jpo-custom-field-parent' } },
+      ]);
+      case '/jira/rest/api/2/issueLinkType': return json({ issueLinkTypes: [] });
+      case '/jira/rest/api/2/search': {
+        const { jql, fields } = JSON.parse(String(init.body)) as { jql: string; fields: string[] };
+        assert.ok(fields.includes('customfield_10012'));
+        assert.ok(fields.includes('customfield_10013'));
+        if (jql === 'key = APP-2') return json({ total: 1, issues: [rawIssue('APP-2', {
+          customfield_10012: 'APP-1',
+          customfield_10013: { data: { key: 'PORT-9', summary: 'Program milestone' } },
+        })] });
+        lookups.push(jql);
+        assert.equal(jql, 'key in ("APP-1")');
+        return canReadEpic
+          ? json({ total: 1, issues: [rawIssue('APP-1', { summary: 'Storage evolution' })] })
+          : json({ errorMessages: ['Issue is not visible'] }, 403);
+      }
+      default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+    }
+  });
+  const { client } = await connectJira({ ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' }, () => {});
+  const { issues, edges, warnings } = await client.loadGraph({ jql: 'key = APP-2', depth: 0 });
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0]?.parentSummary, 'Program milestone');
+  assert.equal(issues[0]?.epicSummary, 'Storage evolution');
+  assert.deepEqual(edges, []);
+  assert.deepEqual(warnings, []);
+  canReadEpic = false;
+  const restricted = await client.loadGraph({ jql: 'key = APP-2', depth: 0 });
+  assert.equal(restricted.issues[0]?.epicKey, 'APP-1');
+  assert.equal(restricted.issues[0]?.epicSummary, undefined);
+  assert.deepEqual(restricted.warnings, ['Названия части родительских задач недоступны.']);
+  assert.deepEqual(lookups, ['key in ("APP-1")', 'key in ("APP-1")']);
+});
+
+test('epic graph adds accessible nested subtasks at depth zero on Cloud and Data Center', async (t) => {
+  for (const edition of ['cloud', 'data-center'] as const) {
+    await t.test(edition, async (t) => {
+      const cloudEdition = edition === 'cloud';
+      const rest = cloudEdition ? '/rest/api/3' : '/jira/rest/api/2';
+      const search = cloudEdition ? '/search/jql' : '/search';
+      const jql = cloudEdition ? 'key = "APP-1" OR parent = "APP-1"' : 'key = "APP-1" OR "Epic Link" = "APP-1"';
+      const resolvedJql = cloudEdition ? jql : 'key = "APP-1" OR cf[10012] = "APP-1"';
+      const seen: string[] = [];
+      const page = (issues: unknown[]) => json({ isLast: true, total: issues.length, issues });
+      mockFetch(t, (url, init) => {
+        switch (url.pathname) {
+          case `${rest}/myself`: return profile();
+          case `${rest}/field`: return json(cloudEdition ? [] : [
+            { id: 'customfield_10012', name: 'Связь с эпиком', schema: { custom: 'com.pyxis.greenhopper.jira:gh-epic-link' } },
+          ]);
+          case `${rest}/issueLinkType`: return json({ issueLinkTypes: [blocks] });
+          case `${rest}${search}`: {
+            const { jql: query, fields } = JSON.parse(String(init.body)) as { jql: string; fields: string[] };
+            seen.push(query);
+            assert.ok(fields.includes('subtasks'));
+            if (!cloudEdition && query === jql) return json({ errorMessages: ['Field "Epic Link" does not exist'] }, 400);
+            if (query === resolvedJql) return page([
+              rawIssue('APP-1', { summary: 'Storage evolution', issuetype: { name: 'Epic' } }),
+              rawIssue('APP-2', {
+                ...(cloudEdition ? { parent: { key: 'APP-1' } } : { customfield_10012: 'APP-1' }),
+                summary: 'Prepare migration',
+                subtasks: [{ key: 'APP-3' }, { key: 'APP-4' }],
+              }),
+            ]);
+            assert.equal(query, 'key in ("APP-3", "APP-4")');
+            return page([rawIssue('APP-3', {
+              parent: { key: 'APP-2' }, issuetype: { subtask: true },
+              issuelinks: [{ id: '210', type: blocks, inwardIssue: { key: 'EXT-1' } }],
+            })]);
+          }
+          default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+        }
+      });
+      const { client } = await connectJira({ ...cloud, edition, ...(cloudEdition ? {} : { url: 'https://jira.example.com/jira' }) }, () => {});
+      const graph = await client.loadGraph({ jql, epicKey: 'APP-1', depth: 0 });
+      assert.deepEqual(seen, [...new Set([jql, resolvedJql]), 'key in ("APP-3", "APP-4")']);
+      assert.deepEqual(graph.issues.map(({ key, external, epicKey }) => [key, external, epicKey]), [
+        ['APP-1', false, 'APP-1'], ['APP-2', false, 'APP-1'], ['APP-3', false, 'APP-1'],
+      ]);
+      assert.deepEqual(graph.edges.map(({ id }) => id), ['parent:APP-1:APP-2', 'parent:APP-2:APP-3']);
+      assert.equal(graph.issues[2]?.parentSummary, 'Prepare migration');
+      assert.equal(graph.issues[2]?.epicSummary, 'Storage evolution');
+      assert.deepEqual(graph.issues[2]?.unloadedBlockerKeys, ['EXT-1']);
+      assert.deepEqual(graph.warnings, ['Часть подзадач эпика недоступна.']);
+    });
+  }
 });
 
 test('Cloud project listing pages on the authenticated gateway and ignores malformed records', async (t) => {

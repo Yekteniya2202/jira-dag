@@ -1,5 +1,5 @@
 import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition, RestoredJiraConnection } from '../shared/contracts.js';
-import { connectJira, JiraError, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
+import { connectJira, JiraError, MAX_AVATAR_BATCH, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
 
@@ -121,12 +121,15 @@ function parseRequest(value: unknown): ApiRequest {
       if (typeof depth !== 'number' || !Number.isInteger(depth) || depth < 0 || depth > 3) {
         throw new RequestError('Link depth must be an integer from 0 to 3.');
       }
+      const epicKey = optionalIdentifier(input.epicKey, 'Epic');
+      if (epicKey && !/^[A-Z][A-Z0-9_]*-\d+$/i.test(epicKey)) throw new RequestError('Invalid epic key.');
       return {
         method,
         input: {
           jql: text(input.jql, 'JQL', 8_192).trim(),
           depth,
           storyPointsField: optionalIdentifier(input.storyPointsField, 'Story points field'),
+          ...(epicKey ? { epicKey: epicKey.toUpperCase() } : {}),
         },
       };
     }
@@ -137,6 +140,8 @@ function parseRequest(value: unknown): ApiRequest {
       } };
     case 'getProjectFilterOptions':
       return { method, input: { project: identifier(input.project, 'Project') } };
+    case 'listProjectTeam':
+      return { method, input: { project: identifier(input.project, 'Project'), query: optionalText(input.query, 'Team search', 120)?.trim() } };
     case 'createIssue':
       return { method, input: {
         projectKey: identifier(input.projectKey, 'Project'),
@@ -164,6 +169,18 @@ function parseRequest(value: unknown): ApiRequest {
     case 'getAssigneeAvatar':
     case 'listNotes':
       return { method, input: { key: identifier(input.key, 'Issue key') } };
+    case 'getAvatars': {
+      const { issueKeys = [], memberIds = [], includeCurrentUser } = input;
+      const project = optionalIdentifier(input.project, 'Project');
+      if (!Array.isArray(issueKeys) || !Array.isArray(memberIds) || issueKeys.length + memberIds.length > MAX_AVATAR_BATCH ||
+          (memberIds.length > 0 && !project) || (includeCurrentUser !== undefined && typeof includeCurrentUser !== 'boolean')) {
+        throw new RequestError('Invalid avatar batch.');
+      }
+      return { method, input: {
+        issueKeys: issueKeys.map((key) => identifier(key, 'Issue key')), project, includeCurrentUser,
+        memberIds: memberIds.map((id) => text(id, 'Team member ID', 320)),
+      } };
+    }
     case 'suggestIssues':
       return { method, input: { query: text(input.query, 'Issue search', 120, true).trim() } };
     case 'listGraphNotes': {
@@ -216,9 +233,11 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'updateIssue': return client.updateIssue(request.input);
     case 'createLink': return client.createLink(request.input);
     case 'listProjects': return client.listProjects();
+    case 'listProjectTeam': return client.listProjectTeam(request.input.project, request.input.query);
     case 'getProjectFilterOptions': return client.getProjectFilterOptions(request.input.project);
     case 'suggestIssues': return client.suggestIssues(request.input.query);
     case 'getAssigneeAvatar': return client.getAssigneeAvatar(request.input.key);
+    case 'getAvatars': return client.getAvatars(request.input);
     case 'listSavedFilters': return client.listSavedFilters();
     case 'listGraphNotes': return client.listGraphNotes(request.input.keys);
     case 'listNotes': return client.listNotes(request.input.key);

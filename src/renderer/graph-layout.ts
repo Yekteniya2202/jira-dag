@@ -139,12 +139,15 @@ export function cyclicBlockingEdges(graph: JiraGraph): Set<string> {
 
 function hierarchyGroups(graph: JiraGraph): Map<string, GroupName[]> {
   const byKey = new Map(graph.issues.map((issue) => [issue.key, issue]));
+  const summaries = new Map<string, string>();
   const parents = new Map(graph.edges.filter(({ kind }) => kind === 'parent').map(({ source, target }) => [target, source]));
   const epics = new Set<string>();
   for (const issue of graph.issues) {
     if (issue.isEpic || /^(epic|эпик)$/i.test(issue.issueType ?? '')) epics.add(issue.key);
     if (issue.epicKey) epics.add(issue.epicKey);
     if (issue.parentKey) parents.set(issue.key, issue.parentKey);
+    if (issue.epicKey && issue.epicSummary) summaries.set(issue.epicKey, issue.epicSummary);
+    if (issue.parentKey && issue.parentSummary) summaries.set(issue.parentKey, issue.parentSummary);
   }
   const parentZones = new Set<string>();
   for (const issue of graph.issues) {
@@ -154,7 +157,8 @@ function hierarchyGroups(graph: JiraGraph): Map<string, GroupName[]> {
     }
   }
   const title = (key: string) => {
-    const summary = byKey.get(key)?.summary;
+    const own = byKey.get(key)?.summary;
+    const summary = own && own !== key ? own : summaries.get(key);
     return summary && summary !== key ? `${key} · ${summary}` : key;
   };
   return new Map(graph.issues.map((issue) => {

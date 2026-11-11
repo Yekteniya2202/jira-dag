@@ -122,6 +122,17 @@ test('an isolated epic has a selectable zone with finite dimensions', () => {
   }
 });
 
+test('epic and subtask zones use hierarchy titles from outside the query without adding cards', () => {
+  const data = graph([issue('APP-3', {
+    epicKey: 'APP-1', epicSummary: 'Migration',
+    parentKey: 'APP-2', parentSummary: 'Prepare fallback', isSubtask: true,
+  })], []);
+  const layout = layoutWorkspace(data, 'LR', 'hierarchy', labels, CARD_HEIGHT);
+  assert.deepEqual(layout.zones.map(({ title }) => title), ['APP-1 · Migration', 'APP-2 · Prepare fallback']);
+  assert.deepEqual([...layout.positions.keys()], ['APP-3']);
+  assert.deepEqual(layout.zones.map(({ issues }) => issues), [1, 1]);
+});
+
 test('a filter can leave only children of a known epic without adding its card or counting it in the zone', () => {
   const child = issue('APP-2', { epicKey: 'APP-1', storyPoints: 3 });
   const basis = graph([issue('APP-1', { summary: 'Migration', external: true }), child], [parent('APP-1', 'APP-2')]);

@@ -27,6 +27,7 @@ export interface GraphQuery {
   jql: string;
   depth: number;
   storyPointsField?: string;
+  epicKey?: string;
 }
 
 export interface JiraSprint {
@@ -54,7 +55,9 @@ export interface JiraIssue {
   unloadedBlockerKeys?: string[];
   labels?: string[];
   parentKey?: string;
+  parentSummary?: string;
   epicKey?: string;
+  epicSummary?: string;
   isEpic?: boolean;
   isSubtask?: boolean;
   priority?: string;
@@ -76,6 +79,29 @@ export interface JiraProject {
   id: string;
   key: string;
   name: string;
+}
+
+export interface JiraTeamMember {
+  id: string;
+  name: string;
+}
+
+export interface JiraProjectTeam {
+  members: JiraTeamMember[];
+  limited?: true;
+}
+
+export interface JiraAvatarQuery {
+  issueKeys?: string[];
+  project?: string;
+  memberIds?: string[];
+  includeCurrentUser?: boolean;
+}
+
+export interface JiraAvatars {
+  issues: Record<string, string>;
+  members: Record<string, string>;
+  currentUser?: string;
 }
 
 export interface JiraIssueSuggestion {
@@ -169,9 +195,11 @@ export interface ApiMethods {
   createLink: { input: JiraLinkInput; output: JiraEdge | null };
   deleteLink: { input: { id: string }; output: null };
   listProjects: { input: null; output: JiraProject[] };
+  listProjectTeam: { input: { project: string; query?: string }; output: JiraProjectTeam };
   getProjectFilterOptions: { input: { project: string }; output: JiraProjectFilterOptions };
   suggestIssues: { input: { query: string }; output: JiraIssueSuggestion[] };
   getAssigneeAvatar: { input: { key: string }; output: string | null };
+  getAvatars: { input: JiraAvatarQuery; output: JiraAvatars };
   listSavedFilters: { input: null; output: JiraSavedFilter[] };
   listGraphNotes: { input: { keys: string[] }; output: Record<string, JiraGraphNote[]> };
   listNotes: { input: { key: string }; output: JiraGraphNote[] };

@@ -1,6 +1,8 @@
 import type {
   ApiMethods,
   GraphQuery,
+  JiraAvatarQuery,
+  JiraAvatars,
   JiraConnection,
   JiraCreateField,
   JiraCreateOptions,
@@ -17,8 +19,10 @@ import type {
   JiraOption,
   JiraProject,
   JiraProjectFilterOptions,
+  JiraProjectTeam,
   JiraSavedFilter,
   JiraSprint,
+  JiraTeamMember,
 } from '../shared/contracts.js';
 import { isBlockingType } from '../shared/jira-links.js';
 
@@ -35,8 +39,14 @@ const SEARCH_PAGE_SIZE = 100;
 export const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
+const MAX_HIERARCHY_LEVELS = 8;
 const TIMEOUT_MS = 15_000;
 const MAX_AVATAR_BYTES = 128 * 1024;
+export const MAX_AVATAR_BATCH = 40;
+const TEAM_PAGE_SIZE = 100;
+const CLOUD_TEAM_SCAN_LIMIT = 1_000;
+const AVATAR_SOURCE_LIMIT = MAX_GRAPH_ISSUES * 4;
+const MAX_PROJECT_AVATAR_SOURCES = 24;
 const AVATAR_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const NOTE_MARKER = 'Jira DAG note v1';
 const ISSUE_KEY = /^[a-z][a-z\d_]*-\d+$/i;
@@ -75,7 +85,7 @@ export async function connectJira(
   const client = new JiraClient(site, apiSite, edition, authorization, token);
   const profile = await client.profile();
   const displayName = string(profile.displayName) ?? string(profile.name) ?? credentials.username.trim();
-  const profileId = edition === 'cloud' ? string(profile.accountId) : string(profile.key) ?? string(profile.name);
+  const profileId = userIdentity(profile, edition);
   return { connection: { url: site.href.replace(/\/$/, ''), displayName, ...(profileId ? { profileId } : {}) }, client };
 }
 
@@ -119,6 +129,11 @@ export class JiraClient {
   private readonly adfFieldIds = new Set(['environment']);
   private readonly editableReporter = new Set<string>();
   private currentReporter?: { id: string } | { name: string } | { key: string };
+  private currentProfileId?: string;
+  private profileAvatarSource?: string;
+  private readonly issueAvatarSources = new Map<string, string>();
+  private readonly projectAvatarSources = new Map<string, Map<string, string>>();
+  private readonly pendingAvatars = new Map<string, Promise<string | null>>();
 
   constructor(
     private readonly site: URL,
@@ -142,6 +157,8 @@ export class JiraClient {
     this.currentReporter = this.edition === 'cloud'
       ? (accountId ? { id: accountId } : undefined)
       : (name ? { name } : key ? { key } : undefined);
+    this.currentProfileId = userIdentity(profile, this.edition);
+    this.profileAvatarSource = avatarSource(profile);
     return profile;
   }
 
@@ -153,6 +170,9 @@ export class JiraClient {
     const jql = query.jql.trim();
     if (!jql || !Number.isInteger(query.depth) || query.depth < 0 || query.depth > 3) {
       throw new JiraError('Введи JQL и выбери глубину связей от 0 до 3.', 400);
+    }
+    if (query.epicKey && !ISSUE_KEY.test(query.epicKey)) {
+      throw new JiraError('Укажи корректный ключ задачи Jira.', 400);
     }
 
     const warnings = new Set<string>();
@@ -168,7 +188,9 @@ export class JiraClient {
     }
     const storyFields = selectedStoryPoints ? [selectedStoryPoints] : storyPointsFields.map((field) => field.id);
     for (const field of storyFields) this.knownStoryFields.add(field);
-    const hierarchyFields = fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id);
+    const hierarchyFields = Array.isArray(fieldCatalog)
+      ? fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id)
+      : [...this.knownHierarchyFields];
     const epicFields = fields.filter(isEpicLinkField).flatMap(fieldOption).map((field) => field.id);
     const sprintFields = Array.isArray(fieldCatalog)
       ? fields.filter(isSprintField).flatMap(fieldOption).map((field) => field.id)
@@ -177,7 +199,8 @@ export class JiraClient {
     for (const field of epicFields) this.knownEpicFields.add(field);
     for (const field of sprintFields) this.knownSprintFields.add(field);
     const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...hierarchyFields, ...sprintFields])];
-    const initial = await this.search(jql, requestedFields, MAX_SEARCH_ISSUES);
+    const initial = await this.searchGraphRoots(jql, requestedFields, query.epicKey, epicFields[0]);
+    if (query.epicKey) await this.expandEpicSubtasks(initial, requestedFields, warnings);
     if (initial.truncated) warnings.add(`Показаны первые ${MAX_SEARCH_ISSUES} задач. Уточни JQL для полной выборки.`);
 
     const roots = new Set(initial.issues.map((issue) => issue.key));
@@ -224,7 +247,7 @@ export class JiraClient {
           linkTypes.set(link.type.id, link.type);
           edges.set(link.id, toEdge(issue.key, other.key, link));
         }
-        for (const parent of [issue.fields?.parent, ...hierarchyFields.map((field) => issue.fields?.[field])].flatMap(toRef)) {
+        for (const parent of [issue.fields?.parent, ...hierarchyFields.map((field) => issue.fields?.[field])].flatMap(toHierarchyRef)) {
           if (remember(parent)) addParent(edges, parent.key, issue.key);
         }
         for (const child of list(issue.fields?.subtasks).flatMap(toRef)) {
@@ -241,7 +264,7 @@ export class JiraClient {
       frontier = [];
       for (let index = 0; index < keys.length; index += 50) {
         const batch = keys.slice(index, index + 50);
-        const result = await this.search(`key in (${batch.map((key) => JSON.stringify(key)).join(', ')})`, requestedFields, batch.length)
+        const result = await this.search(issueKeysJql(batch), requestedFields, batch.length)
           .catch((error: unknown) => {
             if (error instanceof JiraError && [400, 403, 404].includes(error.status ?? 0)) return { issues: [] };
             throw error;
@@ -256,13 +279,15 @@ export class JiraClient {
       if (frontier.length < keys.length) warnings.add('Часть связанных задач недоступна для этой учётной записи.');
     }
 
+    const hierarchy = await this.loadHierarchyRefs(issues, hydrated, hierarchyFields, warnings);
     const graphEdges = [...edges.values()];
     const graphIssues = [...issues.values()].map((issue) => {
-      const data = this.toIssue(issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key));
+      const data = this.toIssue(hierarchy.get(issue.key) ?? issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key));
       const keys = unloadedBlockers.get(issue.key);
       return keys ? { ...data, unloadedBlockerKeys: [...keys] } : data;
     });
-    addIssueHierarchy(graphIssues, graphEdges);
+    const outsideHierarchy = [...hierarchy.values()].filter(({ key }) => !issues.has(key)).map((ref) => this.toIssue(ref, []));
+    addIssueHierarchy(graphIssues, graphEdges, outsideHierarchy);
     return {
       issues: graphIssues,
       edges: graphEdges,
@@ -483,22 +508,122 @@ export class JiraClient {
 
   async getAssigneeAvatar(key: string): Promise<string | null> {
     const issue = await this.readIssue(key, ['assignee']);
-    const urls = record(record(issue.fields?.assignee).avatarUrls);
-    const source = string(urls['48x48']) ?? string(urls['32x32']) ?? string(urls['24x24']) ?? string(urls['16x16']);
-    if (!source) return null;
+    return this.loadAvatar(avatarSource(record(issue.fields?.assignee)));
+  }
 
+  async listProjectTeam(project: string, query = ''): Promise<JiraProjectTeam> {
+    const projectId = project.trim().toUpperCase();
+    const projectKey = /^\d+$/.test(projectId)
+      ? toProject(await this.call('GET', `/project/${projectId}`))[0]?.key : projectId;
+    if (!projectKey || !/^[A-Z][A-Z0-9_]{0,127}$/.test(projectKey)) {
+      throw new JiraError('Укажи ключ проекта Jira.', 400);
+    }
+    const term = query.trim();
+    const cloud = this.edition === 'cloud';
+    const path = cloud ? '/user/assignable/multiProjectSearch' : '/user/assignable/search';
+    const parameters = new URLSearchParams(cloud
+      ? { projectKeys: projectKey, maxResults: String(TEAM_PAGE_SIZE), ...(term ? { query: term } : {}) }
+      : { project: projectKey, maxResults: String(TEAM_PAGE_SIZE), username: term });
+    const byId = new Map<string, { member: JiraTeamMember; avatar?: string }>();
+    const collect = (rows: unknown[], exactId?: string) => {
+      for (const row of rows) {
+        const user = record(row);
+        const id = userIdentity(user, this.edition);
+        const name = string(user.displayName)?.trim();
+        if (!id || id.length > 320 || !name || user.active === false || user.deleted === true || user.accountType === 'app' ||
+            (exactId !== undefined && id !== exactId)) continue;
+        byId.set(id, { member: { id, name }, avatar: avatarSource(user) });
+      }
+    };
+    const read = async (params: URLSearchParams) => {
+      const response = await this.call('GET', `${path}?${params}`);
+      if (!Array.isArray(response)) throw new JiraError('Jira вернула некорректный список исполнителей.');
+      return response.slice(0, TEAM_PAGE_SIZE);
+    };
+    if (cloud) parameters.set('startAt', '0');
+    const firstPage = await read(parameters);
+    collect(firstPage);
+    if (cloud) {
+      // Jira paginates the directory before filtering on project, so a page can be empty in the middle of the scan.
+      const offsets = Array.from({ length: CLOUD_TEAM_SCAN_LIMIT / TEAM_PAGE_SIZE - 1 }, (_, index) => (index + 1) * TEAM_PAGE_SIZE);
+      for (let index = 0; index < offsets.length; index += 3) {
+        const pages = await Promise.allSettled(offsets.slice(index, index + 3).map((startAt) => {
+          const next = new URLSearchParams(parameters);
+          next.set('startAt', String(startAt));
+          return read(next);
+        }));
+        for (const page of pages) if (page.status === 'fulfilled') collect(page.value);
+        if (pages.some((page) => page.status === 'rejected')) break;
+      }
+    }
+    const reporter = this.currentReporter;
+    const currentId = this.currentProfileId;
+    if (!term && currentId && reporter && !byId.has(currentId)) {
+      const exact = new URLSearchParams(parameters);
+      if ('id' in reporter) exact.set('accountId', reporter.id);
+      else if ('name' in reporter) exact.set('username', reporter.name);
+      if (exact.toString() !== parameters.toString()) {
+        await read(exact).then((rows) => collect(rows, currentId)).catch(() => undefined);
+      }
+    }
+    const sources = this.projectAvatarSources.get(projectId) ?? new Map<string, string>();
+    for (const [id, { avatar }] of byId) {
+      sources.delete(id);
+      if (avatar) sources.set(id, avatar);
+    }
+    trimMap(sources, CLOUD_TEAM_SCAN_LIMIT + TEAM_PAGE_SIZE);
+    this.projectAvatarSources.delete(projectId);
+    this.projectAvatarSources.set(projectId, sources);
+    trimMap(this.projectAvatarSources, MAX_PROJECT_AVATAR_SOURCES);
+    const members = [...byId.values()].map(({ member }) => member)
+      .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+    return { members, ...(cloud || firstPage.length >= TEAM_PAGE_SIZE ? { limited: true } : {}) };
+  }
+
+  async getAvatars({ issueKeys = [], project, memberIds = [], includeCurrentUser }: JiraAvatarQuery): Promise<JiraAvatars> {
+    if (issueKeys.length + memberIds.length > MAX_AVATAR_BATCH || issueKeys.some((key) => !ISSUE_KEY.test(key))) {
+      throw new JiraError('Неверный список аватаров Jira.', 400);
+    }
+    const teamSources = project ? this.projectAvatarSources.get(project.trim().toUpperCase()) : undefined;
+    const tasks = [
+      ...[...new Set(issueKeys)].map((id) => ({ kind: 'issues' as const, id, source: this.issueAvatarSources.get(id.toUpperCase()) })),
+      ...[...new Set(memberIds)].map((id) => ({ kind: 'members' as const, id, source: teamSources?.get(id) })),
+    ];
+    const issues = new Map<string, string>();
+    const members = new Map<string, string>();
+    const loaded = new Map<string, Promise<string | null>>();
+    const load = (source?: string) => {
+      if (!source) return Promise.resolve(null);
+      const result = loaded.get(source) ?? this.loadAvatar(source);
+      loaded.set(source, result);
+      return result;
+    };
+    const current = includeCurrentUser ? load(this.profileAvatarSource) : undefined;
+    for (let index = 0; index < tasks.length; index += 8) {
+      await Promise.all(tasks.slice(index, index + 8).map(async ({ kind, id, source }) => {
+        const avatar = await load(source);
+        if (avatar) (kind === 'issues' ? issues : members).set(id, avatar);
+      }));
+    }
+    const currentUser = await current;
+    return { issues: Object.fromEntries(issues), members: Object.fromEntries(members), ...(currentUser ? { currentUser } : {}) };
+  }
+
+  private loadAvatar(source?: string): Promise<string | null> {
+    if (!source) return Promise.resolve(null);
     const base = `${this.site.href.replace(/\/$/, '')}/`;
     const url = URL.parse(source, base);
-    if (!url || url.username || url.password || url.hash) return null;
-    if (url.origin === this.site.origin && url.pathname === new URL('secure/useravatar', base).pathname) {
-      const authorization = this.apiSite.origin === this.site.origin ? this.authorization : undefined;
-      return fetchAvatar(url, authorization);
-    }
-    if (this.edition === 'cloud' && url.protocol === 'https:' && !url.port &&
-        /^avatar-management--avatars\.[a-z0-9-]+\.prod\.public\.atl-paas\.net$/.test(url.hostname)) {
-      return fetchAvatar(url);
-    }
-    return null;
+    if (!url || url.username || url.password || url.hash) return Promise.resolve(null);
+    const local = url.origin === this.site.origin && url.pathname === new URL('secure/useravatar', base).pathname;
+    const cloudCdn = this.edition === 'cloud' && url.protocol === 'https:' && !url.port &&
+      /^avatar-management--avatars\.[a-z0-9-]+\.prod\.public\.atl-paas\.net$/.test(url.hostname);
+    if (!local && !cloudCdn) return Promise.resolve(null);
+    const pending = this.pendingAvatars.get(url.href);
+    if (pending) return pending;
+    const authorization = local && this.apiSite.origin === this.site.origin ? this.authorization : undefined;
+    const result = fetchAvatar(url, authorization).finally(() => this.pendingAvatars.delete(url.href));
+    this.pendingAvatars.set(url.href, result);
+    return result;
   }
 
   async listSavedFilters(): Promise<JiraSavedFilter[]> {
@@ -606,6 +731,19 @@ export class JiraClient {
     return note;
   }
 
+  private async searchGraphRoots(jql: string, fields: string[], epicKey?: string, epicField?: string) {
+    try {
+      return await this.search(jql, fields, MAX_SEARCH_ISSUES);
+    } catch (error) {
+      if (this.edition !== 'data-center' || !(error instanceof JiraError) || error.status !== 400 || !epicKey || !epicField) {
+        throw error;
+      }
+      const key = JSON.stringify(epicKey);
+      if (jql !== `key = ${key} OR "Epic Link" = ${key}`) throw error;
+      return this.search(`key = ${key} OR cf[${epicField.slice('customfield_'.length)}] = ${key}`, fields, MAX_SEARCH_ISSUES);
+    }
+  }
+
   private async search(jql: string, fields: string[], limit: number): Promise<{ issues: IssueRef[]; truncated: boolean }> {
     const cloud = this.edition === 'cloud';
     const issues = new Map<string, IssueRef>();
@@ -639,6 +777,97 @@ export class JiraClient {
       }
     }
     return { issues: [...issues.values()], truncated: hasMore };
+  }
+
+  private async searchIssueBatches(keys: string[], fields: string[], warning: string, warnings: Set<string>): Promise<IssueRef[]> {
+    const batches: string[][] = [];
+    for (let index = 0; index < keys.length; index += 50) batches.push(keys.slice(index, index + 50));
+    const issues: IssueRef[] = [];
+    for (let index = 0; index < batches.length; index += 4) {
+      const results = await Promise.all(batches.slice(index, index + 4).map(async (batch) => {
+        try {
+          const expected = new Set(batch);
+          const result = await this.search(issueKeysJql(batch), fields, batch.length);
+          return result.issues.filter(({ key }) => expected.has(key));
+        } catch (error) {
+          if (!(error instanceof JiraError) || error.status === 401) throw error;
+          return [];
+        }
+      }));
+      issues.push(...results.flat());
+    }
+    if (issues.length < keys.length) warnings.add(warning);
+    return issues;
+  }
+
+  private async expandEpicSubtasks(
+    result: { issues: IssueRef[]; truncated: boolean }, fields: string[], warnings: Set<string>,
+  ): Promise<void> {
+    const seen = new Set(result.issues.map(({ key }) => key));
+    let frontier = result.issues;
+    for (let depth = 0; frontier.length && depth < MAX_HIERARCHY_LEVELS; depth++) {
+      const keys = [...new Set(frontier.flatMap(({ fields: data }) =>
+        list(data?.subtasks).flatMap(toRef).map(({ key }) => key)).filter((key) => !seen.has(key)))];
+      const available = MAX_SEARCH_ISSUES - result.issues.length;
+      if (keys.length > available) result.truncated = true;
+      const batch = keys.slice(0, available);
+      if (!batch.length) return;
+      for (const key of batch) seen.add(key);
+      frontier = await this.searchIssueBatches(batch, fields, 'Часть подзадач эпика недоступна.', warnings);
+      result.issues.push(...frontier);
+    }
+    if (frontier.length) warnings.add('Часть подзадач эпика недоступна.');
+  }
+
+  private hierarchyLinks(fields: JsonObject): { parent?: IssueRef; epic?: IssueRef } {
+    const directEpic = [...this.knownEpicFields].flatMap((field) => toHierarchyRef(fields[field]))[0];
+    const parent = toHierarchyRef(fields.parent)[0] ??
+      [...this.knownHierarchyFields].filter((field) => !this.knownEpicFields.has(field))
+        .flatMap((field) => toHierarchyRef(fields[field]))[0] ?? directEpic;
+    const epic = directEpic ?? (parent && isEpicType(parent.fields?.issuetype) ? parent : undefined);
+    return { parent, epic };
+  }
+
+  private async loadHierarchyRefs(
+    issues: ReadonlyMap<string, IssueRef>, hydrated: ReadonlySet<string>, hierarchyFields: string[], warnings: Set<string>,
+  ): Promise<Map<string, IssueRef>> {
+    const warning = 'Названия части родительских задач недоступны.';
+    const fields = ['summary', 'issuetype', 'parent', ...hierarchyFields];
+    const refs = new Map(issues);
+    const searched = new Set(hydrated);
+    const scanned = new Set<string>();
+    let frontier = [...issues.keys()];
+    let remaining = MAX_GRAPH_ISSUES;
+    for (let depth = 0; frontier.length && depth < MAX_HIERARCHY_LEVELS; depth++) {
+      const next = new Set<string>();
+      const missing = new Set<string>();
+      for (const key of frontier) {
+        scanned.add(key);
+        const { parent, epic } = this.hierarchyLinks(refs.get(key)?.fields ?? {});
+        for (const ref of [parent, epic]) {
+          if (!ref || ref.key === key) continue;
+          const current = refs.get(ref.key);
+          if (!searched.has(ref.key)) {
+            const merged = { key: ref.key, fields: { ...ref.fields, ...current?.fields } };
+            refs.set(ref.key, merged);
+            if (!string(merged.fields.summary) || (!epic && !isEpicType(merged.fields.issuetype))) missing.add(ref.key);
+          }
+          next.add(ref.key);
+        }
+      }
+      const keys = [...missing].slice(0, remaining);
+      if (keys.length < missing.size) warnings.add(warning);
+      remaining -= keys.length;
+      for (const key of keys) searched.add(key);
+      for (const ref of await this.searchIssueBatches(keys, fields, warning, warnings)) {
+        const metadata = Object.fromEntries(fields.flatMap((field) =>
+          ref.fields && Object.hasOwn(ref.fields, field) ? [[field, ref.fields[field]]] : []));
+        refs.set(ref.key, { key: ref.key, fields: { ...refs.get(ref.key)?.fields, ...metadata } });
+        scanned.delete(ref.key);
+      }
+      frontier = [...next].filter((key) => !scanned.has(key));
+    }
+    return refs;
   }
 
   private async metadata(path: string, cloudKey: string): Promise<unknown[]> {
@@ -701,11 +930,16 @@ export class JiraClient {
     const status = record(fields.status);
     const issueType = record(fields.issuetype);
     const assignee = record(fields.assignee);
-    const assigneeId = this.edition === 'cloud' ? string(assignee.accountId) : string(assignee.key) ?? string(assignee.name);
-    const epic = issueType.hierarchyLevel === 1 || ['epic', 'эпик'].includes(string(issueType.name)?.toLowerCase() ?? '');
-    const parent = toRef(fields.parent)[0] ??
-      [...this.knownHierarchyFields].flatMap((field) => toRef(fields[field]))[0];
-    const directEpic = [...this.knownEpicFields].flatMap((field) => toRef(fields[field]))[0];
+    const assigneeId = userIdentity(assignee, this.edition);
+    if (!stub) {
+      const key = issue.key.toUpperCase();
+      const source = avatarSource(assignee);
+      this.issueAvatarSources.delete(key);
+      if (source) this.issueAvatarSources.set(key, source);
+      trimMap(this.issueAvatarSources, AVATAR_SOURCE_LIMIT);
+    }
+    const epic = isEpicType(issueType);
+    const { parent, epic: directEpic } = this.hierarchyLinks(fields);
     const sprintValues = [...new Set([...this.knownSprintFields, 'sprint', 'closedSprints'])].flatMap((field) => {
       const value = fields[field];
       return (Array.isArray(value) ? value : [value]).flatMap(toSprint);
@@ -736,7 +970,9 @@ export class JiraClient {
       external,
       labels: [...new Set(list(fields.labels).map(string).filter(isPresent))],
       parentKey: parent?.key,
+      ...(string(parent?.fields?.summary) ? { parentSummary: string(parent?.fields?.summary) } : {}),
       epicKey: epic ? issue.key : directEpic?.key,
+      ...(string(directEpic?.fields?.summary) ? { epicSummary: string(directEpic?.fields?.summary) } : {}),
       isEpic: epic,
       isSubtask: issueType.subtask === true || issueType.hierarchyLevel === -1,
       priority: string(record(fields.priority).name),
@@ -781,6 +1017,19 @@ function toRef(value: unknown): IssueRef[] {
   return key && ISSUE_KEY.test(key) ? [{ key, fields: record(row.fields) }] : [];
 }
 
+function toHierarchyRef(value: unknown): IssueRef[] {
+  const row = record(value);
+  const data = record(row.data);
+  const ref = toRef(value)[0] ?? toRef(data)[0];
+  if (!ref) return [];
+  const summary = string(ref.fields?.summary) ?? string(row.summary) ?? string(data.summary);
+  return [{ ...ref, fields: { ...ref.fields, ...(summary ? { summary } : {}) } }];
+}
+
+function issueKeysJql(keys: string[]): string {
+  return `key in (${keys.map((key) => JSON.stringify(key)).join(', ')})`;
+}
+
 function createOptionsKey(project: string, type: string): string {
   return `${project.trim().toUpperCase()}/${type}`;
 }
@@ -810,15 +1059,16 @@ function addParent(edges: Map<string, JiraEdge>, parent: string, child: string) 
   edges.set(id, { id, source: parent, target: child, label: 'Родительская задача', kind: 'parent' });
 }
 
-function addIssueHierarchy(issues: JiraIssue[], edges: JiraEdge[]): void {
-  const byKey = new Map(issues.map((issue) => [issue.key, issue]));
+function addIssueHierarchy(issues: JiraIssue[], edges: JiraEdge[], outsideHierarchy: JiraIssue[]): void {
+  const hierarchy = [...issues, ...outsideHierarchy];
+  const byKey = new Map(hierarchy.map((issue) => [issue.key, issue]));
   for (const edge of edges) {
     if (edge.kind !== 'parent') continue;
     const child = byKey.get(edge.target);
     if (child) child.parentKey ??= edge.source;
   }
 
-  for (const issue of issues) {
+  for (const issue of hierarchy) {
     if (!issue.epicKey) continue;
     const epic = byKey.get(issue.epicKey);
     if (epic) {
@@ -843,6 +1093,18 @@ function addIssueHierarchy(issues: JiraIssue[], edges: JiraEdge[]): void {
     for (const key of path) ancestors.set(key, epicKey);
     issue.epicKey = epicKey;
   }
+
+  for (const issue of issues) {
+    const parent = issue.parentKey ? byKey.get(issue.parentKey) : undefined;
+    const epic = issue.epicKey ? byKey.get(issue.epicKey) : undefined;
+    if (parent && parent.summary !== parent.key) issue.parentSummary = parent.summary;
+    if (epic && epic.summary !== epic.key) issue.epicSummary = epic.summary;
+  }
+}
+
+function isEpicType(value: unknown): boolean {
+  const type = record(value);
+  return type.hierarchyLevel === 1 || ['epic', 'эпик'].includes(string(type.name)?.toLowerCase() ?? '');
 }
 
 function isStoryPointsField(field: JsonObject): boolean {
@@ -853,7 +1115,8 @@ function isStoryPointsField(field: JsonObject): boolean {
 }
 
 function isHierarchyField(field: JsonObject): boolean {
-  return isEpicLinkField(field) || string(field.name)?.trim().toLowerCase() === 'parent link';
+  return isEpicLinkField(field) || record(field.schema).custom === 'com.atlassian.jpo:jpo-custom-field-parent' ||
+    string(field.name)?.trim().toLowerCase() === 'parent link';
 }
 
 function isEpicLinkField(field: JsonObject): boolean {
@@ -1134,6 +1397,24 @@ function toProject(value: unknown): JiraProject[] {
   const key = string(project.key);
   const name = string(project.name)?.trim();
   return id && key && /^[A-Z][A-Z0-9_]{0,127}$/.test(key) && name ? [{ id, key, name }] : [];
+}
+
+function userIdentity(user: JsonObject, edition: JiraEdition): string | undefined {
+  return edition === 'cloud' ? string(user.accountId) : string(user.key) ?? string(user.name);
+}
+
+function avatarSource(user: JsonObject): string | undefined {
+  const urls = record(user.avatarUrls);
+  return ['48x48', '32x32', '24x24', '16x16'].map((size) => string(urls[size]))
+    .find((url) => url && url.length <= 4_096);
+}
+
+function trimMap<Key, Value>(map: Map<Key, Value>, limit: number): void {
+  while (map.size > limit) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
 }
 
 async function fetchAvatar(url: URL, authorization?: string): Promise<string | null> {

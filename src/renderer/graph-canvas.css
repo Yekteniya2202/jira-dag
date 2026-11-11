@@ -31,6 +31,16 @@
 .issue-card[data-analysis-match='true'], .graph-zone[data-analysis-match='true'] {
   opacity: 1; outline: 2px solid var(--green); outline-offset: 3px;
 }
+.issue-card-epic {
+  display: flex; align-items: center; gap: 4px; align-self: flex-start; min-width: 0; max-width: 100%;
+  padding: 2px 5px; border: 1px solid var(--accent-border); border-radius: 4px; background: var(--accent-surface);
+  color: var(--accent-ink); cursor: pointer; font-size: 10px; line-height: 1.2;
+}
+.issue-card-epic:hover { background: var(--surface-hover); }
+.issue-card-epic svg { flex: none; }
+.issue-card-epic span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.issue-card-assignee .person-avatar { width: 16px; height: 16px; font-size: 8px; }
+.graph-zone-title[title] { pointer-events: auto; }
 
 .issue-card-create {
   display: inline-grid;
