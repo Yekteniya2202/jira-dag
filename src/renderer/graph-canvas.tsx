@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MarkerType, MiniMap,
+  Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MiniMap,
   Position, ReactFlow, useReactFlow,
   type Edge, type EdgeProps, type Node, type NodeHandle, type NodeProps, type OnConnect, type OnNodesChange, type Viewport,
 } from '@xyflow/react';
@@ -9,6 +9,7 @@ import {
   FolderKanban, GitBranch, Layers3, Link2, ListTree, MessageSquarePlus, Package, Plus, StickyNote, UserRound,
 } from 'lucide-react';
 import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
+import { routeEdges, type RoutedEdge, type RouteObstacle } from './edge-routing';
 import { downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
 import { blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
@@ -57,7 +58,36 @@ type Sticky = Node<{
   onOpen(key: string, focusInput: boolean): void;
 }, 'note'>;
 type CanvasNode = Card | Zone | Sticky;
-type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: boolean; cycle: boolean; analysisMatch?: boolean; points?: number }, 'jiraLink'>;
+type Link = Edge<{
+  route?: RoutedEdge;
+  labelWidth: number;
+  hierarchy: boolean;
+  active: boolean;
+  muted: boolean;
+  cycle: boolean;
+  analysisMatch?: boolean;
+  points?: number;
+  onSelect(id: string): void;
+}, 'jiraLink'>;
+
+const maximumLabelWidth = 184;
+const labelHeight = 23;
+const pointsLabelHeight = 37;
+
+function arrowhead(route: RoutedEdge): string | undefined {
+  const { arrowTip: tip, points } = route;
+  const previous = points.at(-2);
+  if (!previous) return undefined;
+  const length = Math.hypot(tip.x - previous.x, tip.y - previous.y);
+  if (!length) return undefined;
+  const dx = (tip.x - previous.x) / length;
+  const dy = (tip.y - previous.y) / length;
+  const headLength = Math.min(11, length);
+  const halfWidth = Math.min(5, headLength / 2);
+  const x = tip.x - headLength * dx;
+  const y = tip.y - headLength * dy;
+  return `M ${tip.x} ${tip.y} L ${x + halfWidth * dy} ${y - halfWidth * dx} L ${x - halfWidth * dy} ${y + halfWidth * dx} Z`;
+}
 
 function IssueCard({ data, selected }: NodeProps<Card>) {
   const { language, t } = usePreferences();
@@ -161,46 +191,41 @@ function NoteSticker({ data: { issueKey, note, count, direction, onOpen } }: Nod
   </button>;
 }
 
-function JiraLink({ id, source, target, data, sourceX, sourceY, targetX, targetY, sourcePosition, markerEnd, label, selected }: EdgeProps<Link>) {
+function JiraLink({ id, data, label, selected }: EdgeProps<Link>) {
   const { t } = usePreferences();
-  const across = sourcePosition === Position.Right;
-  const offset = data?.offset ?? 0;
-  const horizontal = across ? Math.max(42, Math.abs(targetX - sourceX) * 0.48) : 0;
-  const vertical = across ? 0 : Math.max(42, Math.abs(targetY - sourceY) * 0.48);
-  const dx = across ? 0 : offset;
-  const dy = across ? offset : 0;
-  const self = source === target;
-  const returnsLeft = across && !self && sourceX > targetX;
-  const returnY = Math.min(sourceY, targetY) - 128 + offset * 0.55;
-  const path = self
-    ? across
-      ? `M ${sourceX},${sourceY} C ${sourceX + 95},${sourceY - 165} ${targetX - 95},${targetY - 165} ${targetX},${targetY}`
-      : `M ${sourceX},${sourceY} C ${sourceX - 200},${sourceY + 70} ${targetX - 200},${targetY - 70} ${targetX},${targetY}`
-    : returnsLeft
-      ? `M ${sourceX},${sourceY} C ${sourceX + 28},${sourceY} ${sourceX + 28},${returnY} ${sourceX},${returnY} L ${targetX},${returnY} C ${targetX - 28},${returnY} ${targetX - 28},${targetY} ${targetX},${targetY}`
-      : `M ${sourceX},${sourceY} C ${sourceX + horizontal + dx},${sourceY + vertical + dy} ${targetX - horizontal + dx},${targetY - vertical + dy} ${targetX},${targetY}`;
-  const labelX = (sourceX + targetX) / 2 + (self && !across ? -150 : dx * 0.75);
-  const labelY = returnsLeft ? returnY : (sourceY + targetY) / 2 + (self && across ? -124 : dy * 0.75);
-  const active = selected || data?.active;
-  const muted = data?.muted && !selected;
+  if (!data?.route?.path) return null;
+  const { route, cycle, hierarchy, analysisMatch, points } = data;
+  const active = selected || data.active;
+  const muted = data.muted && !selected;
+  const color = cycle ? 'var(--edge-cycle)' : analysisMatch ? 'var(--green)'
+    : active ? 'var(--edge-active)' : hierarchy ? 'var(--edge-hierarchy)' : 'var(--edge-default)';
+  const opacity = muted ? 0.45 : 1;
+  const tip = arrowhead(route);
+  const title = `${cycle ? '↻ ' : ''}${String(label ?? '')}`;
   return (
     <>
+      <title>{title}</title>
       <BaseEdge
-        id={id} path={path} markerEnd={markerEnd}
+        id={id} path={route.path} interactionWidth={16}
         style={{
-          stroke: data?.cycle ? 'var(--edge-cycle)' : data?.analysisMatch ? 'var(--green)' : active ? 'var(--edge-active)' : data?.hierarchy ? 'var(--edge-hierarchy)' : 'var(--edge-default)',
-          strokeWidth: active || data?.analysisMatch ? 2.3 : 1.6,
-          strokeDasharray: data?.hierarchy || data?.cycle ? '6 5' : undefined,
-          opacity: muted ? 0.28 : 1,
+          stroke: color, strokeWidth: active || analysisMatch ? 2.6 : 1.9, strokeLinejoin: 'round',
+          strokeDasharray: hierarchy || cycle ? '6 5' : undefined, opacity,
         }}
       />
-      <EdgeLabelRenderer>
-        <div className={`edge-label ${active ? 'is-active' : ''} ${muted ? 'is-muted' : ''} ${data?.cycle ? 'is-cycle' : ''}`}
-          style={{ transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)` }}>
-          {data?.cycle && '↻ '}{data?.hierarchy ? t('Родительская задача', 'Parent issue') : label}
-          {data?.points !== undefined && <small className="graph-points-edge" title={t('Сумма SP по дальнейшей цепочке блокировок', 'Story points downstream of this blocker')}>{data.points} SP</small>}
-        </div>
-      </EdgeLabelRenderer>
+      {tip && <path className="graph-edge-arrow" d={tip} style={{ fill: color, opacity }} />}
+      {route.label && route.labelLeader && <line className="graph-edge-label-leader"
+        x1={route.label.x} y1={route.label.y} x2={route.labelLeader.x} y2={route.labelLeader.y}
+        style={{ stroke: color, opacity }} />}
+      {route.label && <EdgeLabelRenderer>
+        <button type="button" tabIndex={-1} title={title}
+          className={`edge-label nodrag nopan ${active ? 'is-active' : ''} ${muted ? 'is-muted' : ''} ${cycle ? 'is-cycle' : ''}`}
+          style={{ left: route.label.x, top: route.label.y, width: data.labelWidth }}
+          onClick={(event) => { event.stopPropagation(); data.onSelect(id); }}>
+          <span>{title}</span>
+          {points !== undefined && <small className="graph-points-edge"
+            title={t('Сумма SP по дальнейшей цепочке блокировок', 'Story points downstream of this blocker')}>{points} SP</small>}
+        </button>
+      </EdgeLabelRenderer>}
     </>
   );
 }
@@ -247,10 +272,21 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
   notesByIssue, manualPositions, viewport, highlightedKeys, analysisKeys, analysisNavigation, preferredSprintIds, avatars,
   onSelectIssue, onSelectEdge, onOpenIssue, onOpenEpic, onNoteIssue, onCreateRelated, onManualPositionsChange,
   onViewportChange, onAnalysisNavigationEnd, onConnect }: Props) {
-  const { theme, t } = usePreferences();
+  const { theme, graphFont, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
   const [dragPositions, setDragPositions] = useState<Record<string, GraphPosition>>({});
+  const [fontRevision, setFontRevision] = useState(0);
+  const dragFrame = useRef<number | undefined>(undefined);
+  const pendingDrag = useRef<Record<string, GraphPosition>>({});
   const userMovedViewport = useRef(false);
+  useEffect(() => {
+    const update = () => setFontRevision((revision) => revision + 1);
+    document.fonts.addEventListener('loadingdone', update);
+    return () => document.fonts.removeEventListener('loadingdone', update);
+  }, []);
+  useEffect(() => () => {
+    if (dragFrame.current !== undefined) cancelAnimationFrame(dragFrame.current);
+  }, []);
   const showEpicBadges = groupMode !== 'hierarchy' && Boolean(onOpenEpic);
   const cardHeight = CARD_HEIGHT + (fields.assignee ? 22 : 0) + (fields.priority || fields.labels || fields.dueDate || fields.estimate ? 19 : 0)
     + (showEpicBadges && layoutGraph.issues.some(({ key, epicKey }) => epicKey && epicKey !== key) ? 24 : 0);
@@ -292,7 +328,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
       groups.set(key, ids);
     }
     for (const ids of groups.values()) {
-      ids.forEach((id, index) => offsets.set(id, (index - (ids.length - 1) / 2) * 28));
+      ids.forEach((id, index) => offsets.set(id, index - (ids.length - 1) / 2));
     }
     return offsets;
   }, [layout.visibleEdges]);
@@ -300,15 +336,65 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     upstream: tracePath(graph.edges, selectedKey, 'up'),
     downstream: tracePath(graph.edges, selectedKey, 'down'),
   } : undefined, [graph.edges, selectedKey]);
+  const cardPositions = useMemo(() => {
+    if (groupMode !== 'none') return layout.positions;
+    return new Map([...layout.positions].map(([key, position]) => [key, dragPositions[key] ?? manualPositions[key] ?? position]));
+  }, [dragPositions, groupMode, layout.positions, manualPositions]);
+  const notePlacements = useMemo(() => [
+    ...[...cardPositions].flatMap(([key, position]) => noteKeys.has(key)
+      ? [{ key, position: notePosition({ ...position, width: CARD_WIDTH, height: cardHeight }, direction), direction }] : []),
+    ...layout.zones.flatMap((zone) => zone.epicKey && noteKeys.has(zone.epicKey)
+      ? [{ key: zone.epicKey, position: notePosition(zone, 'TB'), direction: 'TB' as const }] : []),
+  ], [cardHeight, cardPositions, direction, layout.zones, noteKeys]);
+  const edgeLabels = useMemo(() => {
+    const measure = showLinks && displayedEdges.length ? document.createElement('canvas').getContext('2d') : null;
+    return new Map(displayedEdges.map((edge) => {
+      const label = edge.kind === 'parent' ? t('Родительская задача', 'Parent issue') : edge.label;
+      const caption = cycleIds.has(edge.id) ? `↻ ${label}` : label;
+      const points = estimates?.get(edge.id);
+      const estimate = points === undefined ? '' : `${points} SP`;
+      let textWidth = Math.max(caption.length, estimate.length) * 11;
+      if (measure) {
+        measure.font = `600 11px ${graphFont}`;
+        textWidth = measure.measureText(caption).width;
+        measure.font = `650 10px ${graphFont}`;
+        textWidth = Math.max(textWidth, measure.measureText(estimate).width);
+      }
+      return [edge.id, {
+        label, width: Math.min(maximumLabelWidth, Math.ceil(textWidth + 18)),
+        height: points === undefined ? labelHeight : pointsLabelHeight,
+      }];
+    }));
+  }, [cycleIds, displayedEdges, estimates, fontRevision, graphFont, showLinks, t]);
+  const routes = useMemo(() => {
+    if (!showLinks || !displayedEdges.length) return undefined;
+    const obstacles: RouteObstacle[] = [
+      ...[...cardPositions].map(([id, position]) => ({ id, ...position, width: CARD_WIDTH, height: cardHeight })),
+      ...notePlacements.map(({ key, position }) => ({ id: `note:${key}`, ...position, width: NOTE_WIDTH, height: NOTE_HEIGHT })),
+      ...layout.zones.map(({ id, x, y, width }) => ({ id: `heading:${id}`, x, y, width, height: 36, labelOnly: true })),
+    ];
+    return routeEdges(direction, obstacles, displayedEdges.flatMap(({ id, source, target }) => {
+      const from = cardPositions.get(source);
+      const to = cardPositions.get(target);
+      if (!from || !to) return [];
+      const label = edgeLabels.get(id);
+      return [{
+        id, source, target, lane: lanes.get(id),
+        sourcePoint: { x: from.x + (across ? CARD_WIDTH : CARD_WIDTH / 2), y: from.y + (across ? cardHeight / 2 : cardHeight) },
+        targetPoint: { x: to.x + (across ? 0 : CARD_WIDTH / 2), y: to.y + (across ? cardHeight / 2 : 0) },
+        labelWidth: label?.width ?? maximumLabelWidth, labelHeight: label?.height ?? labelHeight,
+      }];
+    }));
+  }, [across, cardHeight, cardPositions, direction, displayedEdges, edgeLabels, lanes, layout.zones, notePlacements, showLinks]);
   const cards: Card[] = graph.issues.flatMap((issue) => {
-    const position = layout.positions.get(issue.key);
+    const position = cardPositions.get(issue.key);
     if (!position) return [];
     const epic = showEpicBadges && issue.epicKey && issue.epicKey !== issue.key
       ? { key: issue.epicKey, summary: issue.epicSummary ?? basisIssues.get(issue.epicKey)?.summary } : undefined;
     return [{
       id: issue.key, type: 'issue',
-      position: (groupMode === 'none' ? dragPositions[issue.key] ?? manualPositions[issue.key] : undefined) ?? position,
-      width: CARD_WIDTH, height: cardHeight, zIndex: 2,
+      position,
+      width: CARD_WIDTH, height: cardHeight, zIndex: 3,
       measured: { width: CARD_WIDTH, height: cardHeight }, handles,
       selected: issue.key === selectedKey,
       ariaLabel: `${issue.key} ${issue.summary}`,
@@ -334,21 +420,16 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     measured: { width: zone.width, height: zone.height },
     selectable: false, focusable: false, draggable: false, connectable: false, style: { pointerEvents: 'none' },
   }));
-  function sticker(issueKey: string, anchor: GraphPosition & { width: number; height: number }, placement: Direction): Sticky | undefined {
-    const notes = notesByIssue[issueKey];
-    if (!notes?.length) return;
+  const stickers: Sticky[] = notePlacements.map(({ key, position, direction }) => {
+    const notes = notesByIssue[key];
     const note = notes.reduce((latest, entry) => (Date.parse(entry.createdAt) || 0) >= (Date.parse(latest.createdAt) || 0) ? entry : latest);
     return {
-      id: `note:${issueKey}`, type: 'note', position: notePosition(anchor, placement), zIndex: 3,
+      id: `note:${key}`, type: 'note', position, zIndex: 4,
       width: NOTE_WIDTH, height: NOTE_HEIGHT, measured: { width: NOTE_WIDTH, height: NOTE_HEIGHT },
-      data: { issueKey, note, count: notes.length, direction: placement, onOpen: onNoteIssue },
+      data: { issueKey: key, note, count: notes.length, direction, onOpen: onNoteIssue },
       selectable: false, focusable: false, draggable: false, connectable: false,
     };
-  }
-  const stickers = [
-    ...cards.map(({ id, position }) => sticker(id, { ...position, width: CARD_WIDTH, height: cardHeight }, direction)),
-    ...layout.zones.map((zone) => zone.epicKey ? sticker(zone.epicKey, zone, 'TB') : undefined),
-  ].filter((item) => item !== undefined);
+  });
   const visibleKeys = new Set(cards.map(({ id }) => id));
   const edges: Link[] = showLinks ? displayedEdges.map((edge) => {
     const active = Boolean(trace && (
@@ -357,14 +438,13 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     ));
     const cycle = cycleIds.has(edge.id);
     const analysisMatch = highlightedEdges?.has(edge.id);
-    const color = cycle ? '#dc5265' : analysisMatch ? (theme === 'light' ? '#176747' : '#71dfb8')
-      : active ? (theme === 'light' ? '#684bc5' : '#ab99ff') : (theme === 'light' ? '#697389' : '#9094b0');
+    const label = edgeLabels.get(edge.id);
     return {
-      id: edge.id, source: edge.source, target: edge.target, label: edge.label, zIndex: 1,
+      id: edge.id, source: edge.source, target: edge.target, label: label?.label ?? edge.label,
+      zIndex: active || cycle || analysisMatch || edge.id === selectedEdge ? 2 : 1,
       type: 'jiraLink', selected: edge.id === selectedEdge,
-      markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color },
-      data: { offset: lanes.get(edge.id) ?? 0, hierarchy: edge.kind === 'parent', active,
-        muted: Boolean(trace && !active && !analysisMatch), cycle, analysisMatch, points: estimates?.get(edge.id) },
+      data: { route: routes?.get(edge.id), labelWidth: label?.width ?? maximumLabelWidth, hierarchy: edge.kind === 'parent', active,
+        muted: Boolean(trace && !active && !analysisMatch), cycle, analysisMatch, points: estimates?.get(edge.id), onSelect: onSelectEdge },
     };
   }) : [];
 
@@ -400,8 +480,20 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     const moved = changes.filter((change) => change.type === 'position').filter(({ id, position }) => position && visibleKeys.has(id));
     if (moved.length && groupMode === 'none') {
       const next = Object.fromEntries(moved.flatMap(({ id, position }) => position ? [[id, position]] : []));
-      if (moved.some(({ dragging }) => dragging)) setDragPositions(next);
-      else {
+      if (moved.some(({ dragging }) => dragging)) {
+        Object.assign(pendingDrag.current, next);
+        if (dragFrame.current === undefined) {
+          dragFrame.current = requestAnimationFrame(() => {
+            dragFrame.current = undefined;
+            const positions = pendingDrag.current;
+            pendingDrag.current = {};
+            setDragPositions((previous) => ({ ...previous, ...positions }));
+          });
+        }
+      } else {
+        if (dragFrame.current !== undefined) cancelAnimationFrame(dragFrame.current);
+        dragFrame.current = undefined;
+        pendingDrag.current = {};
         setDragPositions({});
         onManualPositionsChange({ ...manualPositions, ...next });
       }

@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useId, useMemo,
 import { ReactFlowProvider, useReactFlow } from '@xyflow/react';
 import {
   ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleAlert, CircleDot, Crosshair, Download, FileText,
-  GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, Trash2, X,
+  GitBranch, GitMerge, Layers3, LayoutGrid, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Trash2, X,
 } from 'lucide-react';
 import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraGraphNote, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
 import { defaultAnalysisSettings } from './analysis-settings';
@@ -16,9 +16,10 @@ import { exportGraph, type GraphExportFormat } from './graph-export';
 import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
 import { assigneeInitials, blockersFor, blockingEdges, isBlockingType, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { GraphNotes, type NoteFocus } from './graph-notes';
-import { localizeMessage, PreferenceControls, usePreferences } from './i18n';
+import { localizeMessage, usePreferences } from './i18n';
 import { PanelSplitter } from './panel-splitter';
 import { PersonAvatar, ProjectTeam, useCurrentAvatar, useGraphAvatars, useProjectTeam } from './project-team';
+import { SettingsButton } from './settings';
 import { defaultCardFields, GraphViewControls, type FocusMode } from './view-controls';
 import { RefreshMenu, SavedFilters } from './workspace-controls';
 import {
@@ -229,9 +230,9 @@ export function App() {
         onPin={(id, pinned) => setTabs((previous) => setWorkspaceTabPinned(previous, id, pinned))}
         onMove={(id, target, side) => setTabs((previous) => moveWorkspaceTab(previous, id, target, side))} />
       <div className="topbar-actions">
-        <PreferenceControls />
+        <SettingsButton />
         <details className="view-menu workspace-menu">
-          <summary aria-label={t('Рабочая область', 'Workspace')} title={t('Рабочая область', 'Workspace')}><Settings2 size={16} /></summary>
+          <summary aria-label={t('Рабочая область', 'Workspace')} title={t('Рабочая область', 'Workspace')}><LayoutGrid size={16} /></summary>
           <div>
             <button type="button" className="button secondary" disabled={restoring || disconnecting || busyTabs.length > 0}
               onClick={(event) => {

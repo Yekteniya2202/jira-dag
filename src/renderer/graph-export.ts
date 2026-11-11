@@ -82,6 +82,56 @@ function download(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
+const embeddedFontFiles = new Map<string, Promise<string>>();
+
+function embedFontFile(url: string): Promise<string> {
+  const cached = embeddedFontFiles.get(url);
+  if (cached) return cached;
+  const data = fetch(url, { redirect: 'error' }).then(async (response) => {
+    if (!response.ok) throw new Error(`Could not load font: ${response.status}`);
+    const font = new Blob([await response.arrayBuffer()], { type: 'font/woff2' });
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(font);
+    });
+  }).catch(() => {
+    embeddedFontFiles.delete(url);
+    return '';
+  });
+  embeddedFontFiles.set(url, data);
+  return data;
+}
+
+function fontNames(families: string): string[] {
+  return families.split(',').map((name) => name.trim().replace(/^['"]|['"]$/g, ''));
+}
+
+async function fontEmbedCSS(canvas: HTMLElement): Promise<string> {
+  const fonts = new Set<string>();
+  for (const element of [canvas, ...canvas.querySelectorAll<HTMLElement>('*')]) {
+    for (const name of fontNames(getComputedStyle(element).fontFamily)) fonts.add(name);
+  }
+  const app = new URL(window.location.href);
+  const rules: Promise<string>[] = [];
+  for (const sheet of document.styleSheets) {
+    let cssRules: CSSRuleList;
+    try { cssRules = sheet.cssRules; } catch { continue; }
+    for (const rule of cssRules) {
+      if (!(rule instanceof CSSFontFaceRule) || !fonts.has(fontNames(rule.style.fontFamily)[0])) continue;
+      const urls = rule.style.getPropertyValue('src').matchAll(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]*?))\s*\)/g);
+      const source = [...urls].map((match) => URL.parse(match[1] ?? match[2] ?? match[3], sheet.href ?? document.baseURI))
+        .find((url) => url?.protocol === app.protocol && url.host === app.host && /\.woff2$/i.test(url.pathname));
+      if (!source) continue;
+      const styles = Array.from(rule.style).filter((name) => name !== 'src')
+        .map((name) => `${name}:${rule.style.getPropertyValue(name)}`).join(';');
+      rules.push(embedFontFile(source.href).then((data) => data ? `@font-face{${styles};src:url("${data}") format("woff2");}` : ''));
+    }
+  }
+  return (await Promise.all(rules)).join('\n');
+}
+
 export async function exportGraph(canvas: HTMLElement, format: GraphExportFormat, filename: string, direction: Direction,
   edges: readonly JiraEdge[], parentLabel: string): Promise<void> {
   if (format === 'mermaid') {
@@ -92,8 +142,9 @@ export async function exportGraph(canvas: HTMLElement, format: GraphExportFormat
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
   if (!width || !height) throw new Error('Graph viewport is empty.');
+  await document.fonts.ready;
   const image = await toCanvas(canvas, {
-    width, height, pixelRatio: Math.min(2, 4096 / Math.max(width, height)), skipFonts: true,
+    width, height, pixelRatio: Math.min(2, 4096 / Math.max(width, height)), fontEmbedCSS: await fontEmbedCSS(canvas),
     style: { overflow: 'hidden' },
     filter: (node) => !(node instanceof Element && node.matches(
       '[data-export-ignore], .react-flow__controls, .react-flow__minimap, .react-flow__attribution',

@@ -1,0 +1,129 @@
+[data-palette='dark'] {
+  --palette-base: #151725;
+  --palette-ink: #f4f1ff;
+  --palette-accent: #aa95ff;
+}
+[data-palette='graphite'] {
+  --palette-base: #1b1e22;
+  --palette-ink: #f2f5f8;
+  --palette-accent: #b3cbdf;
+  --palette-primary: #435c73;
+}
+[data-palette='midnight'] {
+  --palette-base: #121c33;
+  --palette-ink: #eef5ff;
+  --palette-accent: #8db9ff;
+  --palette-primary: #2c54a2;
+}
+[data-palette='forest'] {
+  --palette-base: #14231e;
+  --palette-ink: #f0fbf5;
+  --palette-accent: #78d4ab;
+  --palette-primary: #296348;
+}
+[data-palette='espresso'] {
+  --palette-base: #291e1b;
+  --palette-ink: #fff1e7;
+  --palette-accent: #f0b98d;
+  --palette-primary: #804631;
+}
+[data-palette='aurora'] {
+  --palette-base: #211833;
+  --palette-ink: #f8f0ff;
+  --palette-accent: #9de5c8;
+  --palette-primary: #625099;
+}
+[data-palette='light'] {
+  --palette-base: #f7f8fc;
+  --palette-ink: #20253c;
+  --palette-accent: #6747c7;
+}
+[data-palette='paper'] {
+  --palette-base: #fbf5e7;
+  --palette-ink: #33291a;
+  --palette-accent: #86572b;
+  --palette-primary: #795025;
+}
+[data-palette='frost'] {
+  --palette-base: #edf5ff;
+  --palette-ink: #162840;
+  --palette-accent: #2e64a5;
+  --palette-primary: #315895;
+}
+[data-palette='mint'] {
+  --palette-base: #eaf7ef;
+  --palette-ink: #142d24;
+  --palette-accent: #246b4f;
+  --palette-primary: #245f46;
+}
+[data-palette='rose'] {
+  --palette-base: #fff0f4;
+  --palette-ink: #402332;
+  --palette-accent: #9b446e;
+  --palette-primary: #83375d;
+}
+[data-palette='contrast'] {
+  --palette-base: #fff;
+  --palette-ink: #17171a;
+  --palette-accent: #234bb0;
+  --palette-primary: #21449e;
+}
+
+/* Mix the app's semantic colors around each palette while retaining the status colors. */
+:root[data-palette]:not([data-palette='dark'], [data-palette='light']) {
+  --palette-surface-white: 3%;
+  --background: color-mix(in srgb, var(--palette-base) 94%, black);
+  --surface: color-mix(in srgb, var(--palette-base), white var(--palette-surface-white));
+  --surface-deep: var(--palette-base);
+  --surface-raised: color-mix(in srgb, var(--palette-base) 94%, var(--palette-ink));
+  --surface-hover: color-mix(in srgb, var(--palette-base) 87%, var(--palette-ink));
+  --field: var(--palette-base);
+  --border: color-mix(in srgb, var(--palette-base) 84%, var(--palette-ink));
+  --border-strong: color-mix(in srgb, var(--palette-base) 71%, var(--palette-ink));
+  --text: color-mix(in srgb, var(--palette-ink) 94%, var(--palette-base));
+  --heading: var(--palette-ink);
+  --muted: color-mix(in srgb, var(--palette-ink) 72%, var(--palette-base));
+  --dim: color-mix(in srgb, var(--palette-ink) 66%, var(--palette-base));
+  --accent: var(--palette-accent);
+  --accent-ink: color-mix(in srgb, var(--palette-accent) 83%, var(--palette-ink));
+  --accent-surface: color-mix(in srgb, var(--palette-base) 85%, var(--palette-accent));
+  --accent-border: color-mix(in srgb, var(--palette-base) 59%, var(--palette-accent));
+  --primary: var(--palette-primary);
+  --primary-hover: color-mix(in srgb, var(--palette-primary) 82%, var(--palette-accent));
+  --primary-border: color-mix(in srgb, var(--palette-primary) 66%, var(--palette-accent));
+  --canvas-dot: color-mix(in srgb, var(--palette-base) 81%, var(--palette-ink));
+  --edge-default: color-mix(in srgb, var(--palette-ink) 63%, var(--palette-base));
+  --edge-active: var(--palette-accent);
+  --edge-hierarchy: color-mix(in srgb, var(--palette-ink) 60%, var(--palette-base));
+  --edge-arrow: var(--edge-default);
+  --minimap-mask: color-mix(in srgb, var(--palette-base) 78%, transparent);
+  --minimap-node: var(--palette-accent);
+  --zone-fill: color-mix(in srgb, var(--accent-surface) 62%, transparent);
+  --zone-border: var(--accent-border);
+  --zone-nested-fill: color-mix(in srgb, var(--surface-raised) 85%, transparent);
+  --epic-zone-fill: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  --epic-zone-border: var(--border-strong);
+}
+:root[data-theme='light'][data-palette]:not([data-palette='light']) {
+  --palette-surface-white: 65%;
+  --background: color-mix(in srgb, var(--palette-base) 96%, var(--palette-ink));
+  --accent-surface: color-mix(in srgb, var(--palette-base) 91%, var(--palette-accent));
+}
+:root[data-palette='contrast'] {
+  --border: #9c9ca6;
+  --border-strong: #6a6a76;
+  --muted: #3d3d48;
+  --dim: #42424e;
+  --edge-default: #393946;
+  --edge-hierarchy: #51515e;
+}
+:root[data-palette]:not([data-palette='dark'], [data-palette='light']) .brand-icon {
+  background: var(--primary);
+  border-color: var(--primary-border);
+  color: white;
+  box-shadow: none;
+}
+
+.canvas, .canvas .issue-card-key, .settings-preview {
+  font-family: var(--graph-font, var(--app-font, Inter, 'Segoe UI', sans-serif));
+}

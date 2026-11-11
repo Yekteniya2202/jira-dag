@@ -1,15 +1,18 @@
 import { createContext, useCallback, useContext, useLayoutEffect, useMemo, useState, type ReactNode } from 'react';
-import { Languages, Moon, Sun } from 'lucide-react';
+import { appearanceKey, defaultAppearance, fontStack, paletteTheme, readAppearance, type Appearance, type Theme } from './appearance';
 
 export type Language = 'ru' | 'en';
-export type Theme = 'dark' | 'light';
+export type { Theme } from './appearance';
 export type Translate = (ru: string, en: string) => string;
 
 interface Preferences {
   language: Language;
   theme: Theme;
+  appearance: Appearance;
+  graphFont: string;
   setLanguage(language: Language): void;
-  setTheme(theme: Theme): void;
+  updateAppearance(changes: Partial<Appearance>): void;
+  resetAppearance(): void;
   t: Translate;
 }
 
@@ -24,18 +27,33 @@ function getPreference(key: string): string | null {
 
 export function PreferencesProvider({ children }: { children: ReactNode }) {
   const [language, setLanguage] = useState<Language>(() => getPreference(languageKey) === 'en' ? 'en' : 'ru');
-  const [theme, setTheme] = useState<Theme>(() => getPreference(themeKey) === 'light' ? 'light' : 'dark');
+  const [appearance, setAppearance] = useState(() => readAppearance(getPreference(appearanceKey), getPreference(themeKey)));
+  const theme = paletteTheme(appearance.palette);
+  const appFont = fontStack(appearance.font);
+  const graphFont = appearance.graphFont === 'inherit' ? appFont : fontStack(appearance.graphFont);
+  const updateAppearance = useCallback((changes: Partial<Appearance>) => {
+    setAppearance((previous) => ({ ...previous, ...changes }));
+  }, []);
+  const resetAppearance = useCallback(() => setAppearance(defaultAppearance), []);
   const t = useCallback<Translate>((ru, en) => language === 'en' ? en : ru, [language]);
-  const value = useMemo(() => ({ language, theme, setLanguage, setTheme, t }), [language, theme, t]);
+  const value = useMemo(() => ({ language, theme, appearance, graphFont, setLanguage, updateAppearance, resetAppearance, t }),
+    [language, theme, appearance, graphFont, updateAppearance, resetAppearance, t]);
 
   useLayoutEffect(() => {
-    document.documentElement.lang = language;
-    document.documentElement.dataset.theme = theme;
+    const root = document.documentElement;
+    root.lang = language;
+    root.dataset.theme = theme;
+    root.dataset.palette = appearance.palette;
+    root.dataset.appFont = appearance.font;
+    root.dataset.graphFont = appearance.graphFont;
+    root.style.setProperty('--app-font', appFont);
+    root.style.setProperty('--graph-font', graphFont);
     try {
       window.localStorage.setItem(languageKey, language);
       window.localStorage.setItem(themeKey, theme);
+      window.localStorage.setItem(appearanceKey, JSON.stringify(appearance));
     } catch { /* Preferences remain usable when local storage is unavailable. */ }
-  }, [language, theme]);
+  }, [language, theme, appearance, appFont, graphFont]);
 
   return <preferenceContext.Provider value={value}>{children}</preferenceContext.Provider>;
 }
@@ -44,25 +62,6 @@ export function usePreferences(): Preferences {
   const value = useContext(preferenceContext);
   if (!value) throw new Error('PreferencesProvider is missing.');
   return value;
-}
-
-export function PreferenceControls() {
-  const { language, theme, setLanguage, setTheme, t } = usePreferences();
-  const themeLabel = theme === 'dark' ? t('Включить светлую тему', 'Switch to light theme') : t('Включить тёмную тему', 'Switch to dark theme');
-  return <div className="preference-controls">
-    <label className="language-control" title={t('Язык интерфейса', 'Interface language')}>
-      <Languages size={15} aria-hidden="true" />
-      <select aria-label={t('Язык интерфейса', 'Interface language')} value={language}
-        onChange={(event) => setLanguage(event.target.value === 'en' ? 'en' : 'ru')}>
-        <option value="ru">RU</option>
-        <option value="en">EN</option>
-      </select>
-    </label>
-    <button type="button" className="icon-button outline" aria-label={themeLabel} title={themeLabel}
-      onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
-      {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
-    </button>
-  </div>;
 }
 
 const applicationMessages: [ru: string, en: string][] = [

@@ -42,6 +42,50 @@
 .issue-card-assignee .person-avatar { width: 16px; height: 16px; font-size: 8px; }
 .graph-zone-title[title] { pointer-events: auto; }
 
+.canvas .react-flow__edgelabel-renderer { z-index: 1100; }
+.edge-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: grid;
+  align-content: center;
+  min-height: 23px;
+  padding: 3px 7px;
+  pointer-events: auto;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: 600 11px/15px var(--graph-font, var(--app-font));
+  white-space: nowrap;
+}
+.edge-label > :is(span, small) { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.edge-label:hover, .edge-label.is-active { color: var(--accent-ink); border-color: var(--accent-border); background: var(--accent-surface); }
+.edge-label.is-muted:not(:hover) { color: var(--dim); border-color: var(--border); }
+.edge-label.is-cycle { color: var(--danger-text); border-color: var(--danger-border); background: var(--danger-surface); }
+.graph-points-edge { color: var(--accent-ink); font-size: 10px; font-weight: 650; line-height: 14px; }
+.graph-edge-arrow {
+  stroke: var(--surface-deep);
+  stroke-width: 2px;
+  stroke-linejoin: round;
+  paint-order: stroke fill;
+  pointer-events: none;
+}
+.graph-edge-label-leader { stroke-width: 1px; stroke-dasharray: 2 3; pointer-events: none; }
+.canvas .react-flow__handle { width: 14px; height: 14px; background: transparent; border: 0; }
+.canvas .react-flow__handle::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border: 1px solid var(--surface-deep);
+  border-radius: 50%;
+  background: var(--edge-default);
+}
+.canvas .react-flow__handle:is(:hover, .connectingfrom, .connectingto, .valid)::before {
+  inset: 2px;
+  background: var(--accent);
+}
+.canvas[data-show-links='false'] .react-flow__handle { visibility: hidden; }
+
 .issue-card-create {
   display: inline-grid;
   place-items: center;

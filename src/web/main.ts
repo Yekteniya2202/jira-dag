@@ -20,6 +20,7 @@ const contentTypes: Record<string, string> = {
   '.webp': 'image/webp',
   '.woff2': 'font/woff2',
   '.woff': 'font/woff',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
 class HttpError extends Error {
@@ -121,7 +122,7 @@ function securityHeaders(response: ServerResponse): void {
   response.setHeader('X-Content-Type-Options', 'nosniff');
   response.setHeader('Referrer-Policy', 'no-referrer');
   response.setHeader('Content-Security-Policy', [
-    "default-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data:",
+    "default-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data:", "font-src 'self' data:",
     "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "form-action 'none'",
   ].join('; '));
 }

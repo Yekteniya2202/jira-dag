@@ -1,7 +1,7 @@
 :root {
   color: var(--text);
   background: var(--background);
-  font-family: Inter, 'Segoe UI', sans-serif;
+  font-family: var(--app-font, Inter, 'Segoe UI', sans-serif);
   font-synthesis: none;
   color-scheme: dark;
   --background: #141622;
@@ -154,16 +154,6 @@ button svg { flex: none; }
 .demo-pill { color: var(--accent-ink); background: var(--accent-surface); border: 1px solid var(--accent-border); border-radius: 20px; padding: 4px 9px; }
 .demo-pill span, .connection-state i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
 .connection-state i { background: var(--green); }
-.preference-controls { display: inline-flex; align-items: center; gap: 7px; flex: none; }
-.language-control {
-  display: inline-flex; align-items: center; gap: 5px; height: 34px; padding: 0 5px 0 8px;
-  border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--muted);
-}
-.language-control select {
-  border: none; background: transparent; color: var(--text); padding: 0; width: auto;
-  font-size: 12px; font-weight: 650; min-height: 26px;
-}
-.language-control:focus-within { border-color: var(--accent); }
 
 .workspace {
   display: flex; flex: 1; min-height: 0; min-width: 0;
@@ -405,17 +395,6 @@ select { padding-right: 6px; }
 .status.done { background: var(--badge-done); color: var(--status-done); }
 .status.active { background: var(--badge-active); color: var(--status-active); }
 .points { background: var(--accent-surface); color: var(--accent-ink); }
-.canvas .react-flow__handle { background: var(--accent); border: 2px solid var(--surface-deep); width: 10px; height: 10px; }
-.canvas .react-flow__handle:hover { background: var(--accent-ink); }
-.canvas[data-show-links='false'] .react-flow__handle { visibility: hidden; }
-.edge-label {
-  position: absolute; pointer-events: none; color: var(--muted); background: var(--surface);
-  padding: 2px 6px; border: 1px solid var(--border-strong); border-radius: 10px; font-size: 10.5px; white-space: nowrap;
-}
-.edge-label.is-active { color: var(--accent-ink); border-color: var(--accent-border); background: var(--accent-surface); }
-.edge-label.is-muted { opacity: .44; }
-.edge-label.is-cycle { color: var(--danger-text); border-color: var(--danger-border); background: var(--danger-surface); }
-.graph-points-edge { display: block; color: var(--accent-ink); font-weight: 650; text-align: center; }
 
 .inspector { width: var(--right-panel-width, 259px); max-width: 42%; border-left: 1px solid var(--border); }
 .inspector-heading {
@@ -424,7 +403,7 @@ select { padding-right: 6px; }
 }
 .inspector-content { flex: 1; min-height: 0; overflow: auto; padding: 18px 16px; }
 .inspector-key { font: 700 12px 'IBM Plex Mono', Consolas, monospace; color: var(--accent-ink); display: flex; justify-content: space-between; gap: 4px; }
-.inspector-key span { font: 11px Inter, 'Segoe UI', sans-serif; color: var(--dim); }
+.inspector-key span { font: 11px var(--app-font, Inter, 'Segoe UI', sans-serif); color: var(--dim); }
 .inspector-content h3 { font-size: 18px; line-height: 1.25; margin: 8px 0 11px; letter-spacing: -.025em; overflow-wrap: anywhere; }
 .assignee { font-size: 12px; line-height: 1.5; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
 .issue-description-button { margin-top: 9px; }
@@ -558,7 +537,6 @@ select { padding-right: 6px; }
   .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); padding-inline: 9px; gap: 2px 7px; }
   .workspace-tabs { grid-column: 1 / -1; grid-row: 2; }
   .topbar-actions { gap: 7px; }
-  .preference-controls { gap: 5px; }
   .workspace { display: grid; grid-template-columns: minmax(0, 1fr); min-height: calc(100dvh - 73px); }
   .workspace > :is(.sidebar, .inspector), .workspace:has(.sidebar:not([hidden])):has(.inspector:not([hidden])) > :is(.sidebar, .inspector) { max-width: none; }
   .sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--border); }
@@ -579,8 +557,6 @@ select { padding-right: 6px; }
   .demo-pill { display: none; }
   .brand { font-size: 18px; gap: 7px; }
   .brand-icon { width: 30px; height: 30px; }
-  .language-control { padding-left: 4px; }
-  .language-control > svg { display: none; }
   .topbar-actions > .button { padding-inline: 7px; }
   .connection-state { max-width: 105px; }
   .refresh-menu > summary span { display: none; }
