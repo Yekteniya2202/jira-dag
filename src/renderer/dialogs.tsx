@@ -5,6 +5,7 @@ import type {
 } from '../shared/contracts';
 import { errorMessage, IssueCreationUnconfirmed, request } from './api';
 import { isBlockingType } from './graph-model';
+import { localizeMessage, usePreferences, type Translate } from './i18n';
 
 interface DialogProps {
   title: string;
@@ -14,6 +15,7 @@ interface DialogProps {
 }
 
 export function Dialog({ title, children, onClose, busy }: DialogProps) {
+  const { t } = usePreferences();
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => { ref.current?.showModal(); }, []);
   return (
@@ -21,7 +23,7 @@ export function Dialog({ title, children, onClose, busy }: DialogProps) {
       onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}>
       <header className="dialog-heading">
         <h2 id="dialog-title">{title}</h2>
-        <button type="button" className="icon-button" aria-label="Закрыть" disabled={busy} onClick={onClose}><X size={18} /></button>
+        <button type="button" className="icon-button" aria-label={t('Закрыть', 'Close')} disabled={busy} onClick={onClose}><X size={18} /></button>
       </header>
       {children}
     </dialog>
@@ -32,6 +34,7 @@ export function ConnectionDialog({ onConnect, onClose }: {
   onConnect(credentials: JiraCredentials): Promise<void>;
   onClose(): void;
 }) {
+  const { t, language } = usePreferences();
   const [edition, setEdition] = useState<JiraEdition>('cloud');
   const [scopedToken, setScopedToken] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -54,36 +57,39 @@ export function ConnectionDialog({ onConnect, onClose }: {
     }
   }
   return (
-    <Dialog title="Подключить Jira" onClose={onClose} busy={busy}>
+    <Dialog title={t('Подключить Jira', 'Connect to Jira')} onClose={onClose} busy={busy}>
       <form onSubmit={submit} className="dialog-form" autoComplete="off">
         <fieldset disabled={busy}>
-          <label>Редакция Jira
+          <label>{t('Редакция Jira', 'Jira edition')}
             <select value={edition} onChange={(event) => setEdition(event.target.value as JiraEdition)}>
               <option value="cloud">Jira Cloud</option><option value="data-center">Jira Data Center</option>
             </select>
           </label>
-          <label>Адрес Jira
+          <label>{t('Адрес Jira', 'Jira URL')}
             <input name="url" type="url" placeholder={edition === 'cloud' ? 'https://team.atlassian.net' : 'https://jira.example.org'} required />
           </label>
           <div className="form-row">
-            <label>Пользователь <span>необязательно</span><input name="username" placeholder="Имя для отображения" /></label>
-            <label>Email {edition === 'data-center' && <span>необязательно</span>}
+            <label>{t('Пользователь', 'Username')} <span>{t('необязательно', 'optional')}</span>
+              <input name="username" placeholder={t('Имя для отображения', 'Display name')} />
+            </label>
+            <label>Email {edition === 'data-center' && <span>{t('необязательно', 'optional')}</span>}
               <input name="email" type="email" placeholder="name@example.org" required={edition === 'cloud'} />
             </label>
           </div>
-          <label>{edition === 'cloud' ? 'API-токен' : 'Personal Access Token'}
-            <input name="token" type="password" autoComplete="new-password" placeholder="Вставь токен Jira" required />
+          <label>{edition === 'cloud' ? t('API-токен', 'API token') : 'Personal Access Token'}
+            <input name="token" type="password" autoComplete="new-password" placeholder={t('Вставь токен Jira', 'Paste a Jira token')} required />
           </label>
           {edition === 'cloud' && <label className="checkbox">
-            <input type="checkbox" checked={scopedToken} onChange={(event) => setScopedToken(event.target.checked)} /> Токен с заданными разрешениями (scoped)
+            <input type="checkbox" checked={scopedToken} onChange={(event) => setScopedToken(event.target.checked)} />
+            {t('Токен с заданными разрешениями (scoped)', 'Scoped API token')}
           </label>}
-          <p className="form-hint"><LockKeyhole size={14} /> Токен хранится в памяти до завершения сессии.</p>
+          <p className="form-hint"><LockKeyhole size={14} /> {t('Токен хранится в памяти до завершения сессии.', 'The token stays in memory for the session.')}</p>
         </fieldset>
-        {error && <p className="form-error" role="alert">{error}</p>}
+        {error && <p className="form-error" role="alert">{localizeMessage(error, language)}</p>}
         <div className="dialog-actions">
-          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Отмена</button>
+          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{t('Отмена', 'Cancel')}</button>
           <button className="button primary" disabled={busy}>
-            {busy ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />} Подключиться
+            {busy ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />} {t('Подключиться', 'Connect')}
           </button>
         </div>
       </form>
@@ -91,7 +97,7 @@ export function ConnectionDialog({ onConnect, onClose }: {
   );
 }
 
-function requiredValue(field: JiraCreateField, raw: string): unknown {
+function requiredValue(field: JiraCreateField, raw: string, t: Translate): unknown {
   if (field.id === 'parent') return { key: raw.trim() };
   if (field.options?.length) {
     const option = { id: raw };
@@ -109,23 +115,26 @@ function requiredValue(field: JiraCreateField, raw: string): unknown {
     case 'version':
     case 'component':
       try { return JSON.parse(raw) as unknown; }
-      catch { throw new Error(`Укажи корректный JSON для поля «${field.name}».`); }
+      catch { throw new Error(t(`Укажи корректный JSON для поля «${field.name}».`, `Enter valid JSON for “${field.name}”.`)); }
     default: return raw;
   }
 }
 
 function RequiredField({ field }: { field: JiraCreateField }) {
+  const { t } = usePreferences();
   let control: ReactNode;
   if (field.options?.length || field.schemaType === 'boolean') {
-    const options = field.options?.length ? field.options : [{ id: 'true', name: 'Да' }, { id: 'false', name: 'Нет' }];
+    const options = field.options?.length ? field.options : [
+      { id: 'true', name: t('Да', 'Yes') }, { id: 'false', name: t('Нет', 'No') },
+    ];
     control = <select name={field.id} required defaultValue="">
-      <option value="" disabled>Выбери значение</option>
+      <option value="" disabled>{t('Выбери значение', 'Select a value')}</option>
       {options.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
     </select>;
   } else {
     const type = field.schemaType === 'number' ? 'number' : field.schemaType === 'date' ? 'date' : 'text';
     const placeholder = field.id === 'parent' ? 'PROJ-123'
-      : field.schemaType === 'array' ? '["значение"]'
+      : field.schemaType === 'array' ? t('["значение"]', '["value"]')
         : ['object', 'user', 'option', 'issuelink', 'priority', 'version', 'component'].includes(field.schemaType ?? '') ? '{"id":"10000"}' : undefined;
     control = <input name={field.id} type={type} step={type === 'number' ? 'any' : undefined} required placeholder={placeholder} />;
   }
@@ -141,6 +150,7 @@ export function CreateDialog({ project, source, types, onCreate, onClose }: {
   onCreate(input: JiraIssueInput, linkTypeId?: string): Promise<void>;
   onClose(): void;
 }) {
+  const { t, language } = usePreferences();
   const [projectKey, setProjectKey] = useState(project);
   const [typeId, setTypeId] = useState('');
   const [options, setOptions] = useState<JiraCreateOptions>();
@@ -211,9 +221,9 @@ export function CreateDialog({ project, source, types, onCreate, onClose }: {
           const value: unknown = JSON.parse(extraFields);
           if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error();
           fields = value as Record<string, unknown>;
-        } catch { throw new Error('Дополнительные поля должны быть объектом JSON.'); }
+        } catch { throw new Error(t('Дополнительные поля должны быть объектом JSON.', 'Additional fields must be a JSON object.')); }
       }
-      for (const field of required) fields[field.id] = requiredValue(field, read(field.id));
+      for (const field of required) fields[field.id] = requiredValue(field, read(field.id), t);
       await onCreate({
         projectKey: projectKey.trim(), typeId, summary: read('summary').trim(),
         description: read('description').trim() || undefined, fields,
@@ -227,41 +237,41 @@ export function CreateDialog({ project, source, types, onCreate, onClose }: {
   }
 
   return (
-    <Dialog title={source ? 'Добавить следующий шаг' : 'Новая задача Jira'} onClose={onClose} busy={busy}>
+    <Dialog title={source ? t('Добавить следующий шаг', 'Add next step') : t('Новая задача Jira', 'New Jira issue')} onClose={onClose} busy={busy}>
       <form className="dialog-form" onSubmit={submit}>
         <fieldset disabled={busy}>
-          {source && <p className="form-hint"><GitBranch size={15} /> Связать с {source.key}</p>}
+          {source && <p className="form-hint"><GitBranch size={15} /> {t('Связать с', 'Link to')} {source.key}</p>}
           <div className="form-row">
-            <label>Ключ проекта<input required value={projectKey} onChange={(event) => setProjectKey(event.target.value)} placeholder="PROJ" /></label>
-            <label>Тип задачи
+            <label>{t('Ключ проекта', 'Project key')}<input required value={projectKey} onChange={(event) => setProjectKey(event.target.value)} placeholder="PROJ" /></label>
+            <label>{t('Тип задачи', 'Issue type')}
               <select required value={typeId} onChange={(event) => setTypeId(event.target.value)} disabled={!options?.issueTypes.length}>
-                <option value="">{loadingTypes ? 'Загрузка…' : 'Выбери тип'}</option>
+                <option value="">{loadingTypes ? t('Загрузка…', 'Loading…') : t('Выбери тип', 'Select a type')}</option>
                 {options?.issueTypes.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
               </select>
             </label>
           </div>
-          {metadataError && <p className="form-error" role="alert">{metadataError}</p>}
-          {options && !options.issueTypes.length && <p className="form-hint">В проекте нет доступных типов задач.</p>}
-          <label>Название<input name="summary" placeholder="Например, удалить старую колонку" required maxLength={255} /></label>
-          <label>Описание<textarea name="description" rows={3} placeholder="Что нужно сделать" required={requiresDescription} /></label>
-          {fieldsError && <p className="form-error" role="alert">{fieldsError}</p>}
+          {metadataError && <p className="form-error" role="alert">{localizeMessage(metadataError, language)}</p>}
+          {options && !options.issueTypes.length && <p className="form-hint">{t('В проекте нет доступных типов задач.', 'This project has no available issue types.')}</p>}
+          <label>{t('Название', 'Summary')}<input name="summary" placeholder={t('Например, удалить старую колонку', 'For example, remove the old column')} required maxLength={255} /></label>
+          <label>{t('Описание', 'Description')}<textarea name="description" rows={3} placeholder={t('Что нужно сделать', 'What needs to be done')} required={requiresDescription} /></label>
+          {fieldsError && <p className="form-error" role="alert">{localizeMessage(fieldsError, language)}</p>}
           {required.map((field) => <RequiredField field={field} key={field.id} />)}
-          {source && <label>Тип связи
+          {source && <label>{t('Тип связи', 'Link type')}
             <select name="linkTypeId" defaultValue={suggestedLinkType}>
-              <option value="">Без связи</option>
-              {types.map(({ id, outward }) => <option key={id} value={id}>{source.key} {outward} новую задачу</option>)}
+              <option value="">{t('Без связи', 'No link')}</option>
+              {types.map(({ id, outward }) => <option key={id} value={id}>{source.key} {outward} {t('новую задачу', 'new issue')}</option>)}
             </select>
           </label>}
           <details className="advanced-fields">
-            <summary><CircleHelp size={15} /> Дополнительные поля Jira</summary>
-            <label>Объект JSON<textarea name="extra" rows={3} placeholder={'{"labels":["migration"]}'} /></label>
+            <summary><CircleHelp size={15} /> {t('Дополнительные поля Jira', 'Additional Jira fields')}</summary>
+            <label>{t('Объект JSON', 'JSON object')}<textarea name="extra" rows={3} placeholder={'{"labels":["migration"]}'} /></label>
           </details>
         </fieldset>
-        {error && <p className="form-error" role="alert">{error}</p>}
+        {error && <p className="form-error" role="alert">{localizeMessage(error, language)}</p>}
         <div className="dialog-actions">
-          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Отмена</button>
+          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{t('Отмена', 'Cancel')}</button>
           <button className="button primary" disabled={busy || unconfirmed || loadingTypes || loadingFields || !typeId || !fieldOptions}>
-            {busy && <LoaderCircle size={16} className="spin" />} Создать в Jira
+            {busy && <LoaderCircle size={16} className="spin" />} {t('Создать в Jira', 'Create in Jira')}
           </button>
         </div>
       </form>
@@ -273,6 +283,7 @@ export function LinkDialog({ source, target, types, onLink, onClose }: {
   source: string; target: string; types: JiraLinkType[];
   onLink(typeId: string): Promise<void>; onClose(): void;
 }) {
+  const { t, language } = usePreferences();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -285,19 +296,19 @@ export function LinkDialog({ source, target, types, onLink, onClose }: {
     finally { setBusy(false); }
   }
   return (
-    <Dialog title="Добавить связь" onClose={onClose} busy={busy}>
+    <Dialog title={t('Добавить связь', 'Add link')} onClose={onClose} busy={busy}>
       <form className="dialog-form" onSubmit={submit}>
         <fieldset disabled={busy}>
-          <label>Направление связи
+          <label>{t('Направление связи', 'Link direction')}
             <select name="typeId" required defaultValue={types.find(isBlockingType)?.id ?? types[0]?.id ?? ''}>
               {types.map(({ id, outward }) => <option key={id} value={id}>{source} {outward} {target}</option>)}
             </select>
           </label>
         </fieldset>
-        {error && <p className="form-error" role="alert">{error}</p>}
+        {error && <p className="form-error" role="alert">{localizeMessage(error, language)}</p>}
         <div className="dialog-actions">
-          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Отмена</button>
-          <button className="button primary" disabled={busy || !types.length}>Сохранить связь</button>
+          <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{t('Отмена', 'Cancel')}</button>
+          <button className="button primary" disabled={busy || !types.length}>{t('Сохранить связь', 'Save link')}</button>
         </div>
       </form>
     </Dialog>

@@ -32,6 +32,30 @@ export interface JiraIssue {
   description?: string;
   url: string;
   external?: boolean;
+  labels?: string[];
+  parentKey?: string;
+  epicKey?: string;
+  isEpic?: boolean;
+  isSubtask?: boolean;
+  priority?: string;
+  sprints?: string[];
+  fixVersions?: string[];
+  dueDate?: string;
+  originalEstimateSeconds?: number;
+  remainingEstimateSeconds?: number;
+}
+
+export interface JiraSavedFilter {
+  id: string;
+  name: string;
+  jql?: string;
+}
+
+export interface JiraGraphNote {
+  id: string;
+  text: string;
+  author: string;
+  createdAt: string;
 }
 
 export interface JiraLinkType {
@@ -103,6 +127,10 @@ export interface ApiMethods {
   };
   createLink: { input: JiraLinkInput; output: JiraEdge | null };
   deleteLink: { input: { id: string }; output: null };
+  listSavedFilters: { input: null; output: JiraSavedFilter[] };
+  listNotes: { input: { key: string }; output: JiraGraphNote[] };
+  createNote: { input: { key: string; text: string }; output: JiraGraphNote };
+  deleteNote: { input: { key: string; id: string }; output: null };
 }
 
 export type ApiMethod = keyof ApiMethods;

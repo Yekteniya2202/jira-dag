@@ -1,29 +1,9 @@
-import dagre from '@dagrejs/dagre';
-import type { JiraEdge, JiraGraph, JiraIssue, JiraLinkType } from '../shared/contracts';
+import type { JiraEdge, JiraGraph, JiraIssue, JiraLinkType } from '../shared/contracts.js';
 
 export const CARD_WIDTH = 240;
-export const CARD_HEIGHT = 104;
+export const CARD_HEIGHT = 112;
 export type Direction = 'LR' | 'TB';
 export type GraphPosition = { x: number; y: number };
-
-export function layoutGraph(graph: JiraGraph, direction: Direction): Map<string, GraphPosition> {
-  const layout = new dagre.graphlib.Graph({ multigraph: true })
-    .setGraph({ rankdir: direction, nodesep: 38, ranksep: 92, marginx: 20, marginy: 22 })
-    .setDefaultEdgeLabel(() => ({}));
-  for (const issue of graph.issues) {
-    layout.setNode(issue.key, { width: CARD_WIDTH, height: CARD_HEIGHT });
-  }
-  for (const edge of graph.edges) {
-    if (layout.hasNode(edge.source) && layout.hasNode(edge.target)) {
-      layout.setEdge(edge.source, edge.target, {}, edge.id);
-    }
-  }
-  dagre.layout(layout);
-  return new Map(graph.issues.map(({ key }) => {
-    const { x, y } = layout.node(key);
-    return [key, { x: x - CARD_WIDTH / 2, y: y - CARD_HEIGHT / 2 }];
-  }));
-}
 
 export function statusTone(issue: JiraIssue): 'done' | 'active' | 'waiting' {
   if (issue.statusCategory === 'done') return 'done';
@@ -81,5 +61,28 @@ export function putIssue(graph: JiraGraph, issue: JiraIssue): JiraGraph {
     issues: existing
       ? graph.issues.map((previous) => previous.key === issue.key ? { ...previous, ...issue } : previous)
       : [...graph.issues, issue],
+  };
+}
+
+export function blockingEdges(graph: JiraGraph): JiraEdge[] {
+  const types = new Set(graph.linkTypes.filter(isBlockingType).map(({ id }) => id));
+  return graph.edges.filter((edge) => edge.typeId && types.has(edge.typeId));
+}
+
+export function mergeGraphs(current: JiraGraph, incoming: JiraGraph): JiraGraph {
+  const issues = new Map(current.issues.map((issue) => [issue.key, issue]));
+  for (const issue of incoming.issues) {
+    const existing = issues.get(issue.key);
+    if (!existing || existing.external || !issue.external) issues.set(issue.key, issue);
+  }
+  const linkKey = ({ source, target, typeId }: JiraEdge) => JSON.stringify([source, target, typeId]);
+  const confirmedLinks = new Set(incoming.edges.map(linkKey));
+  const retained = current.edges.filter((edge) => !edge.id.startsWith('unconfirmed:') || !confirmedLinks.has(linkKey(edge)));
+  return {
+    issues: [...issues.values()],
+    edges: [...new Map([...retained, ...incoming.edges].map((edge) => [edge.id, edge])).values()],
+    linkTypes: [...new Map([...current.linkTypes, ...incoming.linkTypes].map((type) => [type.id, type])).values()],
+    storyPointsFields: [...new Map([...current.storyPointsFields, ...incoming.storyPointsFields].map((field) => [field.id, field])).values()],
+    warnings: [...new Set([...current.warnings, ...incoming.warnings])],
   };
 }

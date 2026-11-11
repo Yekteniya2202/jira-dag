@@ -8,11 +8,13 @@ import type {
   JiraEdge,
   JiraEdition,
   JiraGraph,
+  JiraGraphNote,
   JiraIssue,
   JiraIssueInput,
   JiraLinkInput,
   JiraLinkType,
   JiraOption,
+  JiraSavedFilter,
 } from '../shared/contracts.js';
 
 type JsonObject = Record<string, unknown>;
@@ -29,8 +31,11 @@ const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
 const TIMEOUT_MS = 15_000;
+const NOTE_MARKER = 'Jira DAG note v1';
+export const MAX_NOTE_LENGTH = 8_000;
 const ISSUE_FIELDS = [
   'summary', 'description', 'status', 'issuetype', 'assignee', 'project', 'issuelinks', 'parent', 'subtasks',
+  'labels', 'priority', 'fixVersions', 'duedate', 'timeoriginalestimate', 'timeestimate',
 ];
 const RESERVED_FIELDS = new Set(['key', 'id', 'project', 'issuetype', 'summary', 'description', 'issuelinks']);
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -97,6 +102,9 @@ async function scopedCloudSite(site: URL): Promise<URL> {
 export class JiraClient {
   private readonly apiBase: string;
   private readonly knownStoryFields = new Set<string>();
+  private readonly knownHierarchyFields = new Set<string>();
+  private readonly knownEpicFields = new Set<string>();
+  private readonly knownSprintFields = new Set<string>();
   private readonly adfFieldIds = new Set(['environment']);
 
   constructor(
@@ -141,7 +149,12 @@ export class JiraClient {
     const storyFields = selectedStoryPoints ? [selectedStoryPoints] : storyPointsFields.map((field) => field.id);
     for (const field of storyFields) this.knownStoryFields.add(field);
     const hierarchyFields = fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id);
-    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...hierarchyFields])];
+    const epicFields = fields.filter(isEpicLinkField).flatMap(fieldOption).map((field) => field.id);
+    const sprintFields = fields.filter(isSprintField).flatMap(fieldOption).map((field) => field.id);
+    for (const field of hierarchyFields) this.knownHierarchyFields.add(field);
+    for (const field of epicFields) this.knownEpicFields.add(field);
+    for (const field of sprintFields) this.knownSprintFields.add(field);
+    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...hierarchyFields, ...sprintFields])];
     const initial = await this.search(jql, requestedFields, MAX_SEARCH_ISSUES);
     if (initial.truncated) warnings.add(`Показаны первые ${MAX_SEARCH_ISSUES} задач. Уточни JQL для полной выборки.`);
 
@@ -210,9 +223,13 @@ export class JiraClient {
       if (frontier.length < keys.length) warnings.add('Часть связанных задач недоступна для этой учётной записи.');
     }
 
+    const graphEdges = [...edges.values()];
+    const graphIssues = [...issues.values()].map((issue) =>
+      this.toIssue(issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key)));
+    addIssueHierarchy(graphIssues, graphEdges);
     return {
-      issues: [...issues.values()].map((issue) => this.toIssue(issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key))),
-      edges: [...edges.values()],
+      issues: graphIssues,
+      edges: graphEdges,
       linkTypes: [...linkTypes.values()],
       storyPointsFields,
       warnings: [...warnings],
@@ -315,6 +332,66 @@ export class JiraClient {
     await this.call('DELETE', `/issueLink/${encodeURIComponent(id)}`);
   }
 
+  async listSavedFilters(): Promise<JiraSavedFilter[]> {
+    return list(await this.call('GET', '/filter/favourite')).flatMap((value) => {
+      const filter = record(value);
+      const id = numericId(filter.id);
+      const name = string(filter.name)?.trim();
+      const jql = string(filter.jql)?.trim();
+      return id && name ? [{ id, name, jql: jql || undefined }] : [];
+    });
+  }
+
+  async listNotes(key: string): Promise<JiraGraphNote[]> {
+    const path = issueCommentPath(key);
+    const notes = new Map<string, JiraGraphNote>();
+    let startAt = 0;
+    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+      const page = record(await this.call('GET', `${path}?startAt=${startAt}&maxResults=100`));
+      const comments = list(page.comments);
+      for (const value of comments) {
+        const note = toGraphNote(value);
+        if (note) notes.set(note.id, note);
+      }
+      const nextAt = (integer(page.startAt) ?? startAt) + comments.length;
+      if (!comments.length || (typeof page.total === 'number' ? nextAt >= page.total : comments.length < 100)) {
+        return [...notes.values()];
+      }
+      if (nextAt <= startAt) break;
+      startAt = nextAt;
+    }
+    throw new JiraError('Jira вернула слишком много страниц комментариев или некорректную пагинацию.');
+  }
+
+  async createNote(key: string, text: string): Promise<JiraGraphNote> {
+    const content = text.replaceAll('\r\n', '\n').trim();
+    if (!content || content.length > MAX_NOTE_LENGTH) {
+      throw new JiraError(`Введи текст заметки длиной до ${MAX_NOTE_LENGTH} символов.`, 400);
+    }
+    const body = this.description(`${NOTE_MARKER}\n${content}`);
+    const path = issueCommentPath(key);
+    let comment: unknown;
+    try {
+      comment = await this.call('POST', path, { body });
+    } catch (error) {
+      if (error instanceof JiraError && error.status && error.status < 500 && error.status !== 408) throw error;
+      throw new JiraError('Jira не подтвердила создание заметки. Обнови заметки перед повторной отправкой.');
+    }
+    const note = toGraphNote(comment);
+    if (!note) throw new JiraError('Jira не подтвердила создание заметки. Обнови заметки перед повторной отправкой.');
+    return note;
+  }
+
+  async deleteNote(key: string, id: string): Promise<void> {
+    if (!/^\d+$/.test(id)) throw new JiraError('Неверный идентификатор заметки.', 400);
+    const path = `${issueCommentPath(key)}/${encodeURIComponent(id)}`;
+    const comment = record(await this.call('GET', path));
+    if (numericId(comment.id) !== id || !noteText(comment.body)) {
+      throw new JiraError('Этот комментарий не является заметкой Jira DAG.', 409);
+    }
+    await this.call('DELETE', path);
+  }
+
   private async search(jql: string, fields: string[], limit: number): Promise<{ issues: IssueRef[]; truncated: boolean }> {
     const cloud = this.edition === 'cloud';
     const issues = new Map<string, IssueRef>();
@@ -382,7 +459,8 @@ export class JiraClient {
   private async readIssueOrFallback(key: string, fallback: JiraIssue): Promise<JiraIssue> {
     try {
       const storyFields = [...this.knownStoryFields];
-      return this.toIssue(await this.readIssue(key, [...ISSUE_FIELDS, ...storyFields]), storyFields);
+      const fields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...this.knownHierarchyFields, ...this.knownSprintFields])];
+      return this.toIssue(await this.readIssue(key, fields), storyFields);
     } catch {
       return fallback;
     }
@@ -391,6 +469,15 @@ export class JiraClient {
   private toIssue(issue: IssueRef, storyFields: string[], external = false, stub = false): JiraIssue {
     const fields = issue.fields ?? {};
     const status = record(fields.status);
+    const issueType = record(fields.issuetype);
+    const epic = issueType.hierarchyLevel === 1 || ['epic', 'эпик'].includes(string(issueType.name)?.toLowerCase() ?? '');
+    const parent = toRef(fields.parent)[0] ??
+      [...this.knownHierarchyFields].flatMap((field) => toRef(fields[field]))[0];
+    const directEpic = [...this.knownEpicFields].flatMap((field) => toRef(fields[field]))[0];
+    const sprints = [...this.knownSprintFields].flatMap((field) => {
+      const value = fields[field];
+      return (Array.isArray(value) ? value : [value]).map(sprintName).filter(isPresent);
+    });
     const storyPoints = storyFields.map((field) => fields[field]).find((value) =>
       typeof value === 'number' && Number.isFinite(value));
     return {
@@ -398,13 +485,24 @@ export class JiraClient {
       summary: string(fields.summary) ?? issue.key,
       status: string(status.name) ?? (stub ? 'Вне выборки' : 'Неизвестен'),
       statusCategory: string(record(status.statusCategory).key),
-      issueType: string(record(fields.issuetype).name),
+      issueType: string(issueType.name),
       assignee: string(record(fields.assignee).displayName),
       project: string(record(fields.project).key) ?? issue.key.replace(/-\d+$/, ''),
       storyPoints: typeof storyPoints === 'number' ? storyPoints : undefined,
       description: typeof fields.description === 'string' ? fields.description : adfText(fields.description),
       url: this.getIssueUrl(issue.key),
       external,
+      labels: [...new Set(list(fields.labels).map(string).filter(isPresent))],
+      parentKey: parent?.key,
+      epicKey: epic ? issue.key : directEpic?.key,
+      isEpic: epic,
+      isSubtask: issueType.subtask === true || issueType.hierarchyLevel === -1,
+      priority: string(record(fields.priority).name),
+      sprints: [...new Set(sprints)],
+      fixVersions: [...new Set(list(fields.fixVersions).map((version) => string(record(version).name)).filter(isPresent))],
+      dueDate: string(fields.duedate),
+      originalEstimateSeconds: integer(fields.timeoriginalestimate),
+      remainingEstimateSeconds: integer(fields.timeestimate),
     };
   }
 
@@ -465,6 +563,41 @@ function addParent(edges: Map<string, JiraEdge>, parent: string, child: string) 
   edges.set(id, { id, source: parent, target: child, label: 'Родительская задача', kind: 'parent' });
 }
 
+function addIssueHierarchy(issues: JiraIssue[], edges: JiraEdge[]): void {
+  const byKey = new Map(issues.map((issue) => [issue.key, issue]));
+  for (const edge of edges) {
+    if (edge.kind !== 'parent') continue;
+    const child = byKey.get(edge.target);
+    if (child) child.parentKey ??= edge.source;
+  }
+
+  for (const issue of issues) {
+    if (!issue.epicKey) continue;
+    const epic = byKey.get(issue.epicKey);
+    if (epic) {
+      epic.isEpic = true;
+      epic.epicKey = epic.key;
+    }
+  }
+
+  const ancestors = new Map<string, string | undefined>();
+  for (const issue of issues) {
+    if (ancestors.has(issue.key)) {
+      issue.epicKey = ancestors.get(issue.key);
+      continue;
+    }
+    const path = new Set<string>();
+    let current: JiraIssue | undefined = issue;
+    while (current && !current.epicKey && !ancestors.has(current.key) && !path.has(current.key)) {
+      path.add(current.key);
+      current = current.parentKey ? byKey.get(current.parentKey) : undefined;
+    }
+    const epicKey = current?.epicKey ?? (current ? ancestors.get(current.key) : undefined);
+    for (const key of path) ancestors.set(key, epicKey);
+    issue.epicKey = epicKey;
+  }
+}
+
 function isStoryPointsField(field: JsonObject): boolean {
   const schema = record(field.schema);
   const name = string(field.name)?.trim().toLowerCase();
@@ -473,9 +606,65 @@ function isStoryPointsField(field: JsonObject): boolean {
 }
 
 function isHierarchyField(field: JsonObject): boolean {
+  return isEpicLinkField(field) || string(field.name)?.trim().toLowerCase() === 'parent link';
+}
+
+function isEpicLinkField(field: JsonObject): boolean {
   const name = string(field.name)?.trim().toLowerCase();
   const schema = record(field.schema);
-  return schema.custom === 'com.pyxis.greenhopper.jira:gh-epic-link' || name === 'epic link' || name === 'parent link';
+  return schema.custom === 'com.pyxis.greenhopper.jira:gh-epic-link' || name === 'epic link';
+}
+
+function isSprintField(field: JsonObject): boolean {
+  const name = string(field.name)?.trim().toLowerCase();
+  const schema = record(field.schema);
+  return schema.custom === 'com.pyxis.greenhopper.jira:gh-sprint' || name === 'sprint' || name === 'спринт';
+}
+
+function sprintName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return string(record(value).name)?.trim() || undefined;
+  if (value.includes('com.atlassian.greenhopper.service.sprint.Sprint@')) {
+    return /(?:\[|,)name=(.*?)(?=,\w+=|\]$)/.exec(value)?.[1]?.trim() || undefined;
+  }
+  return value.trim() || undefined;
+}
+
+function issueCommentPath(key: string): string {
+  if (!/^[a-z][a-z\d_]*-\d+$/i.test(key)) throw new JiraError('Укажи корректный ключ задачи Jira.', 400);
+  return `/issue/${encodeURIComponent(key)}/comment`;
+}
+
+function noteText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const body = value.replace(/\r\n?/g, '\n');
+    const breakIndex = body.indexOf('\n');
+    if (breakIndex === -1 || body.slice(0, breakIndex) !== NOTE_MARKER) return undefined;
+    return body.slice(breakIndex + 1).trim() || undefined;
+  }
+
+  const doc = record(value);
+  const [first, ...content] = list(doc.content);
+  const marker = record(first);
+  const textNodes = list(marker.content).map(record);
+  if (doc.type !== 'doc' || marker.type !== 'paragraph' ||
+      textNodes.length !== 1 || textNodes[0]?.type !== 'text' || textNodes[0]?.text !== NOTE_MARKER) {
+    return undefined;
+  }
+  return adfText({ ...doc, content })?.trim() || undefined;
+}
+
+function toGraphNote(value: unknown): JiraGraphNote | undefined {
+  const comment = record(value);
+  const id = numericId(comment.id);
+  const text = noteText(comment.body);
+  if (!id || !text) return undefined;
+  const author = record(comment.author);
+  return {
+    id,
+    text,
+    author: string(author.displayName) ?? string(author.name) ?? 'Jira',
+    createdAt: string(comment.created) ?? '',
+  };
 }
 
 function option(value: unknown): JiraOption[] {
@@ -535,6 +724,20 @@ function list(value: unknown): unknown[] {
 
 function string(value: unknown): string | undefined {
   return typeof value === 'string' && value.length ? value : undefined;
+}
+
+function isPresent(value: string | undefined): value is string {
+  return value !== undefined;
+}
+
+function integer(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function numericId(value: unknown): string | undefined {
+  if (typeof value === 'string') return /^\d+$/.test(value) ? value : undefined;
+  const id = integer(value);
+  return id === undefined ? undefined : String(id);
 }
 
 async function request(url: URL, method: string, authorization?: string, token?: string, body?: unknown): Promise<unknown> {

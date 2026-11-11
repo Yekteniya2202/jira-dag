@@ -1,5 +1,5 @@
 import type { ApiRequest, ApiResponse, JiraEdition } from '../shared/contracts.js';
-import { connectJira, JiraError, type JiraClient } from './jira.js';
+import { connectJira, JiraError, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
 
@@ -81,6 +81,7 @@ function customFields(value: unknown): Record<string, unknown> | undefined {
 function parseRequest(value: unknown): ApiRequest {
   const { method, input: raw } = object(value, 'Request');
   if (method === 'disconnect' && raw === null) return { method, input: null };
+  if (method === 'listSavedFilters' && raw === null) return { method, input: null };
   const input = object(raw, 'Input');
   switch (method) {
     case 'connect': {
@@ -150,6 +151,18 @@ function parseRequest(value: unknown): ApiRequest {
     }
     case 'deleteLink':
       return { method, input: { id: identifier(input.id, 'Link') } };
+    case 'listNotes':
+      return { method, input: { key: identifier(input.key, 'Issue key') } };
+    case 'createNote':
+      return { method, input: {
+        key: identifier(input.key, 'Issue key'),
+        text: text(input.text, 'Note', MAX_NOTE_LENGTH).trim(),
+      } };
+    case 'deleteNote':
+      return { method, input: {
+        key: identifier(input.key, 'Issue key'),
+        id: identifier(input.id, 'Note id'),
+      } };
     default:
       throw new RequestError('Unknown action.');
   }
@@ -177,6 +190,12 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'createIssue': return client.createIssue(request.input);
     case 'updateIssue': return client.updateIssue(request.input);
     case 'createLink': return client.createLink(request.input);
+    case 'listSavedFilters': return client.listSavedFilters();
+    case 'listNotes': return client.listNotes(request.input.key);
+    case 'createNote': return client.createNote(request.input.key, request.input.text);
+    case 'deleteNote':
+      await client.deleteNote(request.input.key, request.input.id);
+      return null;
     case 'deleteLink':
       await client.deleteLink(request.input.id);
       return null;

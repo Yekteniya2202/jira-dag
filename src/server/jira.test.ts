@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import type { JiraCredentials } from '../shared/contracts.js';
 import { connectJira, JiraError } from './jira.js';
+import { createApiSession } from './session.js';
 
 const cloud: JiraCredentials = {
   edition: 'cloud', url: 'https://team.atlassian.net/', username: 'Test user',
@@ -15,6 +16,14 @@ const json = (payload: unknown, status = 200) => new Response(JSON.stringify(pay
 const noContent = (status = 204) => new Response(null, { status });
 const profile = () => json({ displayName: 'Jira User', accountId: 'abc' });
 const rawIssue = (key: string, fields: Record<string, unknown> = {}) => ({ key, fields: { summary: key, ...fields } });
+const adf = (...lines: string[]) => ({
+  type: 'doc', version: 1,
+  content: lines.map((text) => ({ type: 'paragraph', content: text ? [{ type: 'text', text }] : [] })),
+});
+const noteMarker = 'Jira DAG note v1';
+const rawComment = (id: string, body: unknown) => ({
+  id, body, author: { displayName: 'Jira User' }, created: '2026-11-11T12:00:00.000Z',
+});
 
 function mockFetch(t: TestContext, handler: (url: URL, init: RequestInit) => Response) {
   t.mock.method(globalThis, 'fetch', async (url: URL, init: RequestInit) => {
@@ -110,12 +119,21 @@ test('Data Center requests preserve the Jira context path and use offset paging 
     assert.equal(new Headers(init.headers).get('Authorization'), `Bearer ${cloud.token}`);
     switch (url.pathname) {
       case '/jira/rest/api/2/myself': return json({ displayName: 'Jira User', name: 'jira-user' });
-      case '/jira/rest/api/2/field': return json([{ id: 'customfield_10002', name: 'Epic Link', schema: { custom: 'com.pyxis.greenhopper.jira:gh-epic-link' } }]);
+      case '/jira/rest/api/2/field': return json([
+        { id: 'customfield_10002', name: 'Epic Link', schema: { custom: 'com.pyxis.greenhopper.jira:gh-epic-link' } },
+        { id: 'customfield_10003', name: 'Local Sprint', schema: { custom: 'com.pyxis.greenhopper.jira:gh-sprint' } },
+      ]);
       case '/jira/rest/api/2/issueLinkType': return json({ errorMessages: ['Issue linking is disabled'] }, 404);
       case '/jira/rest/api/2/search': {
-        const query = JSON.parse(String(init.body)) as { startAt: number };
+        const query = JSON.parse(String(init.body)) as { startAt: number; fields: string[] };
         offsets.push(query.startAt);
-        return json({ total: 2, issues: [query.startAt ? rawIssue('APP-2') : rawIssue('APP-1', { customfield_10002: 'APP-2' })] });
+        assert.ok(query.fields.includes('customfield_10003'));
+        return json({ total: 2, issues: [query.startAt ? rawIssue('APP-2') : rawIssue('APP-1', {
+          customfield_10002: 'APP-2',
+          customfield_10003: [
+            'com.atlassian.greenhopper.service.sprint.Sprint@1bf75fd[id=1,rapidViewId=1,state=CLOSED,name=Спринт, ноябрь,goal=Цель,sequence=1]',
+          ],
+        })] });
       }
       default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
     }
@@ -124,6 +142,10 @@ test('Data Center requests preserve the Jira context path and use offset paging 
   const graph = await client.loadGraph({ jql: 'project = APP', depth: 0 });
   assert.deepEqual(offsets, [0, 1]);
   assert.equal(graph.issues[0]?.url, 'https://jira.example.com/jira/browse/APP-1');
+  assert.equal(graph.issues[0]?.parentKey, 'APP-2');
+  assert.equal(graph.issues[0]?.epicKey, 'APP-2');
+  assert.deepEqual(graph.issues[0]?.sprints, ['Спринт, ноябрь']);
+  assert.equal(graph.issues[1]?.isEpic, true);
   assert.deepEqual(graph.edges[0], { id: 'parent:APP-2:APP-1', source: 'APP-2', target: 'APP-1', label: 'Родительская задача', kind: 'parent' });
   assert.match(graph.warnings.join(' '), /типов связей/);
 });
@@ -236,4 +258,138 @@ test('Jira errors redact credential data', async (t) => {
     assert.equal(error.message, 'Ответ Jira HTTP 401: Invalid [redacted] or [redacted]');
     return true;
   });
+});
+
+test('Cloud search supplies filters and finds the epic of a nested subtask', async (t) => {
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/rest/api/3/myself': return profile();
+      case '/rest/api/3/field': return json([
+        { id: 'customfield_10004', name: 'Plan', schema: { custom: 'com.pyxis.greenhopper.jira:gh-sprint' } },
+      ]);
+      case '/rest/api/3/issueLinkType': return json({ issueLinkTypes: [] });
+      case '/rest/api/3/search/jql': {
+        const { fields } = JSON.parse(String(init.body)) as { fields: string[] };
+        for (const key of ['labels', 'priority', 'fixVersions', 'duedate', 'timeoriginalestimate', 'timeestimate', 'customfield_10004']) {
+          assert.ok(fields.includes(key));
+        }
+        return json({ isLast: true, issues: [
+          rawIssue('APP-3', { issuetype: { name: 'Local Subtask', hierarchyLevel: -1 }, parent: rawIssue('APP-2') }),
+          rawIssue('APP-2', {
+            parent: rawIssue('APP-1'), labels: ['cleanup', 'cleanup', 'schema'], priority: { name: 'High' },
+            fixVersions: [{ name: 'Release 2.1' }], customfield_10004: [{ name: 'Sprint 2' }, { name: 'Sprint 1' }],
+            duedate: '2026-11-19', timeoriginalestimate: 3_600, timeestimate: 0,
+          }),
+          rawIssue('APP-1', { issuetype: { name: 'Local Epic', hierarchyLevel: 1 } }),
+        ] });
+      }
+      default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+    }
+  });
+  const { client } = await connectJira(cloud, () => {});
+  const { issues } = await client.loadGraph({ jql: 'project = APP', depth: 0 });
+  const [subtask, task, epic] = issues;
+  assert.equal(subtask?.isSubtask, true);
+  assert.equal(subtask?.parentKey, 'APP-2');
+  assert.equal(subtask?.epicKey, 'APP-1');
+  assert.deepEqual(task?.labels, ['cleanup', 'schema']);
+  assert.equal(task?.priority, 'High');
+  assert.deepEqual(task?.fixVersions, ['Release 2.1']);
+  assert.deepEqual(task?.sprints, ['Sprint 2', 'Sprint 1']);
+  assert.equal(task?.dueDate, '2026-11-19');
+  assert.equal(task?.originalEstimateSeconds, 3_600);
+  assert.equal(task?.remainingEstimateSeconds, 0);
+  assert.equal(epic?.isEpic, true);
+  assert.equal(epic?.epicKey, 'APP-1');
+});
+
+test('saved favorites support Jira Cloud and Data Center, including filters without exposed JQL', async (t) => {
+  const paths: string[] = [];
+  mockFetch(t, (url) => {
+    if (url.pathname.endsWith('/myself')) return profile();
+    paths.push(url.pathname);
+    return json([
+      { id: '1010', name: 'Dependencies', jql: 'project = APP' },
+      { id: 1011, name: 'Restricted query' },
+      { id: 'bad', name: 'Invalid' },
+    ]);
+  });
+  const { client } = await connectJira(cloud, () => {});
+  const { client: dc } = await connectJira({ ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' }, () => {});
+  const expected = [
+    { id: '1010', name: 'Dependencies', jql: 'project = APP' },
+    { id: '1011', name: 'Restricted query', jql: undefined },
+  ];
+  assert.deepEqual(await client.listSavedFilters(), expected);
+  assert.deepEqual(await dc.listSavedFilters(), expected);
+  assert.deepEqual(paths, ['/rest/api/3/filter/favourite', '/jira/rest/api/2/filter/favourite']);
+});
+
+test('Cloud graph notes read all pages and refuse to delete comments outside the note namespace', async (t) => {
+  const methods: string[] = [];
+  const path = '/rest/api/3/issue/APP-1/comment';
+  mockFetch(t, (url, init) => {
+    if (url.pathname.endsWith('/myself')) return profile();
+    methods.push(`${init.method} ${url.pathname}`);
+    if (url.pathname === path && init.method === 'GET') {
+      const startAt = Number(url.searchParams.get('startAt'));
+      return startAt === 0
+        ? json({ startAt, total: 4, comments: [rawComment('1', adf(noteMarker, 'First note')), rawComment('2', adf('Normal comment', noteMarker, 'Not a note'))] })
+        : json({ startAt, total: 4, comments: [rawComment('3', adf(`${noteMarker}0`, 'Wrong version')), rawComment('4', adf(noteMarker, 'Second note', 'Line two'))] });
+    }
+    if (url.pathname === path && init.method === 'POST') {
+      const payload = JSON.parse(String(init.body)) as { body: unknown };
+      assert.deepEqual(payload.body, adf(noteMarker, 'New note', '', 'Line two'));
+      return json(rawComment('5', payload.body), 201);
+    }
+    if (url.pathname === `${path}/2`) return json(rawComment('2', adf('Normal comment')));
+    if (url.pathname === `${path}/4` && init.method === 'GET') return json(rawComment('4', adf(noteMarker, 'Second note')));
+    if (url.pathname === `${path}/4` && init.method === 'DELETE') return noContent();
+    assert.fail(`Unexpected Jira URL ${url.pathname}`);
+  });
+  const { client } = await connectJira(cloud, () => {});
+  assert.deepEqual((await client.listNotes('APP-1')).map(({ id, text }) => [id, text]), [
+    ['1', 'First note'], ['4', 'Second note\nLine two'],
+  ]);
+  assert.deepEqual(await client.createNote('APP-1', 'New note\r\n\r\nLine two'), {
+    id: '5', text: 'New note\n\nLine two', author: 'Jira User', createdAt: '2026-11-11T12:00:00.000Z',
+  });
+  await assert.rejects(client.deleteNote('APP-1', '2'), (error) => error instanceof JiraError && error.status === 409);
+  await client.deleteNote('APP-1', '4');
+  assert.deepEqual(methods, [
+    `GET ${path}`, `GET ${path}`, `POST ${path}`, `GET ${path}/2`, `GET ${path}/4`, `DELETE ${path}/4`,
+  ]);
+});
+
+test('Data Center graph notes use plain Jira comments and the session rejects invalid note inputs', async (t) => {
+  const calls: string[] = [];
+  const path = '/jira/rest/api/2/issue/APP-1/comment';
+  mockFetch(t, (url, init) => {
+    assert.equal(new Headers(init.headers).get('Authorization'), `Bearer ${cloud.token}`);
+    calls.push(`${init.method} ${url.pathname}`);
+    if (url.pathname.endsWith('/myself')) return profile();
+    assert.equal(url.pathname, path);
+    if (init.method === 'GET') return json({ startAt: 0, total: 2, comments: [
+      rawComment('1', `${noteMarker}\r\nLegacy note`), rawComment('2', ` ${noteMarker}\nRegular comment`),
+    ] });
+    assert.deepEqual(JSON.parse(String(init.body)), { body: `${noteMarker}\nWrite a note` });
+    return json(rawComment('3', `${noteMarker}\nWrite a note`), 201);
+  });
+  const session = createApiSession();
+  assert.equal((await session.invoke({
+    method: 'connect', input: { ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' },
+  })).ok, true);
+  assert.equal((await session.invoke({ method: 'createNote', input: { key: 'APP-1', text: ' ' } })).ok, false);
+  assert.equal((await session.invoke({ method: 'createNote', input: { key: 'APP-1', text: 'x'.repeat(8_001) } })).ok, false);
+  assert.equal((await session.invoke({ method: 'deleteNote', input: { key: 'APP-1', id: 'bad' } })).ok, false);
+  assert.equal((await session.invoke({ method: 'listNotes', input: { key: 'invalid' } })).ok, false);
+  const listed = await session.invoke({ method: 'listNotes', input: { key: 'APP-1' } });
+  assert.deepEqual(listed, { ok: true, data: [{
+    id: '1', text: 'Legacy note', author: 'Jira User', createdAt: '2026-11-11T12:00:00.000Z',
+  }] });
+  const created = await session.invoke({ method: 'createNote', input: { key: 'APP-1', text: 'Write a note' } });
+  assert.deepEqual(created, { ok: true, data: {
+    id: '3', text: 'Write a note', author: 'Jira User', createdAt: '2026-11-11T12:00:00.000Z',
+  } });
+  assert.deepEqual(calls, ['GET /jira/rest/api/2/myself', `GET ${path}`, `POST ${path}`]);
 });
