@@ -6,7 +6,7 @@ import {
 } from '@xyflow/react';
 import { ArrowRight, ArrowUpRight, CheckSquare2, CircleDot, GitBranch, Layers3, MessageSquarePlus } from 'lucide-react';
 import type { JiraGraph, JiraIssue } from '../shared/contracts';
-import { cyclicBlockingEdges, downstreamPoints, layoutWorkspace, type GraphZone, type GroupMode } from './graph-layout';
+import { downstreamPoints, layoutWorkspace, type GraphZone, type GroupMode } from './graph-layout';
 import { CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
 
@@ -125,6 +125,7 @@ const edgeTypes = { jiraLink: JiraLink };
 interface Props {
   graph: JiraGraph;
   basis: JiraGraph;
+  cycleIds: ReadonlySet<string>;
   direction: Direction;
   groupMode: GroupMode;
   fields: CardFields;
@@ -141,7 +142,7 @@ interface Props {
   onConnect: OnConnect;
 }
 
-export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEdgePoints, selectedKey, selectedEdge, connected, editable,
+export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fields, showEdgePoints, selectedKey, selectedEdge, connected, editable,
   noteCounts, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
@@ -162,10 +163,6 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
     cycle: t('Заблокировано циклом', 'Blocked by a cycle'),
     done: t('Выполнено', 'Done'),
   }, cardHeight, basis), [basis, cardHeight, direction, graph, groupMode, t]);
-  const cycles = useMemo(() => {
-    const cycleIds = cyclicBlockingEdges(basis);
-    return new Set(graph.edges.filter(({ id }) => cycleIds.has(id)).map(({ id }) => id));
-  }, [basis, graph.edges]);
   const estimates = useMemo(() => showEdgePoints ? downstreamPoints(graph) : undefined, [graph, showEdgePoints]);
   const lanes = useMemo(() => {
     const groups = new Map<string, string[]>();
@@ -210,7 +207,7 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
       (trace.upstream.has(edge.source) && trace.upstream.has(edge.target)) ||
       (trace.downstream.has(edge.source) && trace.downstream.has(edge.target))
     ));
-    const cycle = cycles.has(edge.id);
+    const cycle = cycleIds.has(edge.id);
     const color = cycle ? '#dc5265' : active ? (theme === 'light' ? '#684bc5' : '#ab99ff') : (theme === 'light' ? '#697389' : '#9094b0');
     return {
       id: edge.id, source: edge.source, target: edge.target, label: edge.label, zIndex: 1,
@@ -273,7 +270,7 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
       </ReactFlow>}
       <div className="canvas-legend"><ArrowRight size={14} /> {t('Связь Jira', 'Jira link')} <Layers3 size={13} /> {t('Иерархия', 'Hierarchy')}
         {layout.parts > 1 && <span>· {t('Частей', 'Components')}: {layout.parts}</span>}
-        {cycles.size > 0 && <span className="legend-cycle">↻ {t('Циклические связи', 'Cyclic links')}: {cycles.size}</span>}
+        {edges.some(({ data }) => data?.cycle) && <span className="legend-cycle">↻ {t('Связь в цикле', 'Link in a cycle')}</span>}
       </div>
     </div>
   );

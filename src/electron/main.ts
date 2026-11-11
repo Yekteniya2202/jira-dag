@@ -123,6 +123,8 @@ async function verifyRenderer(browser: BrowserWindow): Promise<void> {
     })
   `);
   if (!loaded) throw new Error('Jira DAG renderer or preload failed to initialize');
+  const displayedVersion = await browser.webContents.executeJavaScript("document.querySelector('.app-version')?.textContent");
+  if (displayedVersion !== `v${app.getVersion()}`) throw new Error('The displayed version does not match the Electron package');
   const responds = await browser.webContents.executeJavaScript(
     'Promise.all([window.jiraDag.invoke(null), window.jiraDag.restoreConnection()])' +
       '.then(([invalid, restored]) => invalid.ok === false && restored.ok && restored.data === null)',

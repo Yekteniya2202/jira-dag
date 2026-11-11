@@ -10,7 +10,7 @@ import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
 import { emptyGraphFilters, filterGraph } from './filter-model';
 import { GraphFilterPanel, GraphScopePresets } from './filters';
 import { GraphCanvas, type CardFields } from './graph-canvas';
-import type { GroupMode } from './graph-layout';
+import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
 import { blockersFor, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction } from './graph-model';
 import { GraphNotes } from './graph-notes';
 import { localizeMessage, PreferenceControls, usePreferences } from './i18n';
@@ -54,6 +54,8 @@ export function App() {
   const [noteFocus, setNoteFocus] = useState<string>();
   const [noteCounts, setNoteCounts] = useState<Record<string, number>>({});
 
+  const cycleIds = useMemo(() => cyclicBlockingEdges(graph), [graph]);
+  const cycleExamples = useMemo(() => graph.edges.filter(({ id }) => cycleIds.has(id)).slice(0, 5), [cycleIds, graph.edges]);
   const filtered = useMemo(() => filterGraph(graph, filters), [graph, filters]);
   const shown = useMemo(() => {
     if (!selectedKey || focusMode === 'all' || !filtered.issues.some(({ key }) => key === selectedKey)) return filtered;
@@ -280,7 +282,13 @@ export function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand"><span className="brand-icon"><GitMerge size={21} /></span><strong>Jira <span>DAG</span></strong></div>
+        <div className="brand">
+          <span className="brand-icon"><GitMerge size={21} /></span>
+          <div className="brand-wordmark">
+            <strong>Jira <span>DAG</span></strong>
+            <span className="app-version" title={t('Версия приложения', 'Application version')}>v{__APP_VERSION__}</span>
+          </div>
+        </div>
         <div className="topbar-divider" />
         <span className="topbar-section">{t('Граф зависимостей', 'Dependency graph')}</span>
         <div className="topbar-actions">
@@ -367,7 +375,26 @@ export function App() {
             <summary><CircleAlert size={15} /> {t('Граф загружен с ограничениями', 'Graph loaded with limitations')} <ChevronDown size={14} /></summary>
             <ul>{graph.warnings.map((warning) => <li key={warning}>{localizeMessage(warning, language)}</li>)}</ul>
           </details>}
-          <GraphCanvas key={layoutGeneration} graph={shown} basis={graph} direction={direction} groupMode={groupMode}
+          <div className={cycleIds.size > 0 ? 'graph-warning graph-cycle-warning' : undefined}>
+            <div className="graph-cycle-status" role="status">
+              {cycleIds.size > 0 && <>
+                <CircleAlert size={16} aria-hidden="true" />
+                <div>
+                  <strong>{t('Обнаружен цикл блокирующих зависимостей.', 'A blocking dependency cycle was detected.')}</strong>{' '}
+                  {t(`Связей в циклах — ${cycleIds.size}.`, `Links in cycles: ${cycleIds.size}.`)}
+                </div>
+              </>}
+            </div>
+            {cycleIds.size > 0 && <details>
+              <summary>{t('Посмотреть связи', 'View affected links')}</summary>
+              <ul>{cycleExamples.map(({ id, source, target }) => <li key={id}>{source} → {target}</li>)}</ul>
+              {cycleIds.size > cycleExamples.length && <span>{t(
+                `Ещё связей в циклах — ${cycleIds.size - cycleExamples.length}.`,
+                `More links in cycles: ${cycleIds.size - cycleExamples.length}.`,
+              )}</span>}
+            </details>}
+          </div>
+          <GraphCanvas key={layoutGeneration} graph={shown} basis={graph} cycleIds={cycleIds} direction={direction} groupMode={groupMode}
             fields={fields} showEdgePoints={showEdgePoints} connected={Boolean(connection)} noteCounts={noteCounts}
             selectedKey={selected?.key} selectedEdge={edge?.id} editable={Boolean(connection && !busy && graph.linkTypes.length)}
             onSelectIssue={selectIssue} onSelectEdge={selectEdge} onOpenIssue={launchIssue}
