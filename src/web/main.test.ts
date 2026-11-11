@@ -8,6 +8,7 @@ import { createWebServer } from './main.js';
 
 const origin = 'http://127.0.0.1:5173';
 const graphRequest: ApiRequest = { method: 'loadGraph', input: { jql: 'project = MIG', depth: 0 } };
+const connectionRequest: ApiRequest = { method: 'getConnection', input: null };
 
 async function listen(t: TestContext, server: Server): Promise<string> {
   server.listen(0, '127.0.0.1');
@@ -47,7 +48,7 @@ test('web RPC checks the request origin and exact Jira context path, then isolat
     response.setHeader('Content-Type', 'application/json');
     switch (request.url) {
       case '/jira/rest/api/2/myself':
-        response.end(JSON.stringify({ displayName: user }));
+        response.end(JSON.stringify({ displayName: user, key: `${user}-key` }));
         break;
       case '/jira/rest/api/2/field':
         response.end('[]');
@@ -69,6 +70,10 @@ test('web RPC checks the request origin and exact Jira context path, then isolat
   assert.equal(wrongPath.status, 403);
   assert.equal(jiraRequests, 0);
 
+  const guest = await rpc(web, connectionRequest);
+  assert.equal(guest.headers.get('set-cookie'), null);
+  assert.deepEqual(await guest.json(), { ok: true, data: null });
+
   const first = await rpc(web, login(`${jira}/jira`, 'first-secret'));
   const second = await rpc(web, login(`${jira}/jira`, 'second-secret'));
   assert.equal(first.status, 200);
@@ -79,6 +84,11 @@ test('web RPC checks the request origin and exact Jira context path, then isolat
   assert.notEqual(firstCookie, secondCookie);
   assert.doesNotMatch(await first.text(), /first-secret/);
   assert.doesNotMatch(await second.text(), /second-secret/);
+
+  const resumed = await rpc(web, connectionRequest, firstCookie);
+  assert.deepEqual(await resumed.json(), { ok: true, data: {
+    connection: { url: `${jira}/jira`, displayName: 'First', profileId: 'First-key' }, edition: 'data-center',
+  } });
 
   const firstGraph = await (await rpc(web, graphRequest, firstCookie)).json() as ApiResponse<JiraGraph>;
   const secondGraph = await (await rpc(web, graphRequest, secondCookie)).json() as ApiResponse<JiraGraph>;
@@ -91,6 +101,7 @@ test('web RPC checks the request origin and exact Jira context path, then isolat
   assert.match(logout.headers.get('set-cookie') ?? '', /Max-Age=0/);
   const loggedOut = await rpc(web, graphRequest, firstCookie);
   assert.equal(loggedOut.status, 401);
+  assert.deepEqual(await (await rpc(web, connectionRequest, firstCookie)).json(), { ok: true, data: null });
   const otherSession = await rpc(web, graphRequest, secondCookie);
   assert.equal(otherSession.status, 200);
 });
@@ -114,4 +125,5 @@ test('an in-flight login cannot reconnect a disconnected session', async t => {
   const graph = await session.invoke(graphRequest);
   assert.ok(!graph.ok);
   assert.equal(graph.status, 401);
+  assert.deepEqual(await session.invoke(connectionRequest), { ok: true, data: null });
 });

@@ -12,6 +12,7 @@ export interface JiraCredentials {
 export interface JiraConnection {
   url: string;
   displayName: string;
+  profileId?: string;
   rememberFailed?: true;
 }
 
@@ -32,6 +33,7 @@ export interface JiraSprint {
   id: string;
   name: string;
   state?: 'future' | 'active' | 'closed';
+  startDate?: string;
 }
 
 export interface JiraIssue {
@@ -107,6 +109,14 @@ export interface JiraOption {
   name: string;
 }
 
+export interface JiraProjectFilterOptions {
+  statuses: JiraOption[];
+  issueTypes: JiraOption[];
+  versions: JiraOption[];
+  sprints: JiraSprint[];
+  unavailable?: Array<'statuses' | 'issueTypes' | 'versions' | 'sprints'>;
+}
+
 export interface JiraGraph {
   issues: JiraIssue[];
   edges: JiraEdge[];
@@ -145,6 +155,7 @@ export interface JiraLinkInput {
 
 export interface ApiMethods {
   connect: { input: JiraLogin; output: JiraConnection };
+  getConnection: { input: null; output: RestoredJiraConnection | null };
   disconnect: { input: null; output: null };
   loadGraph: { input: GraphQuery; output: JiraGraph };
   getCreateOptions: { input: { projectKey: string; issueTypeId?: string }; output: JiraCreateOptions };
@@ -156,12 +167,14 @@ export interface ApiMethods {
   createLink: { input: JiraLinkInput; output: JiraEdge | null };
   deleteLink: { input: { id: string }; output: null };
   listProjects: { input: null; output: JiraProject[] };
+  getProjectFilterOptions: { input: { project: string }; output: JiraProjectFilterOptions };
   suggestIssues: { input: { query: string }; output: JiraIssueSuggestion[] };
   getAssigneeAvatar: { input: { key: string }; output: string | null };
   listSavedFilters: { input: null; output: JiraSavedFilter[] };
   listGraphNotes: { input: { keys: string[] }; output: Record<string, JiraGraphNote[]> };
   listNotes: { input: { key: string }; output: JiraGraphNote[] };
   createNote: { input: { key: string; text: string }; output: JiraGraphNote };
+  updateNote: { input: { key: string; id: string; text: string }; output: JiraGraphNote };
   deleteNote: { input: { key: string; id: string }; output: null };
 }
 

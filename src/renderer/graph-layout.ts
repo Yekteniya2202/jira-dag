@@ -31,7 +31,7 @@ export interface GraphZone extends GraphPosition, Dimensions {
   points?: number;
 }
 
-interface GroupName { key: string; title: string; epicKey?: string; appearance?: GroupAppearance }
+interface GroupName { key: string; title: string; epicKey?: string; appearance?: GroupAppearance; sprint?: JiraSprint }
 type FieldGroupName = GroupName & { appearance: GroupAppearance };
 
 interface GroupTree {
@@ -39,6 +39,7 @@ interface GroupTree {
   title: string;
   epicKey?: string;
   appearance?: GroupAppearance;
+  sprint?: JiraSprint;
   issues: JiraIssue[];
   children: Map<string, GroupTree>;
 }
@@ -173,15 +174,15 @@ function hierarchyGroups(graph: JiraGraph): Map<string, GroupName[]> {
 }
 
 const sprintRank: Record<NonNullable<JiraSprint['state']>, number> = { active: 0, future: 1, closed: 2 };
-const sprintIdOrder = new Intl.Collator('en', { numeric: true });
+const sprintOrder = new Intl.Collator('en', { numeric: true });
 
 function sprintGroup(issue: JiraIssue, preferred: ReadonlySet<string>, labels: LayoutLabels): FieldGroupName {
   const rank = ({ state }: JiraSprint) => state ? sprintRank[state] : 3;
   const sprint = issue.sprintDetails?.toSorted((left, right) =>
     Number(preferred.has(right.id)) - Number(preferred.has(left.id)) ||
-    rank(left) - rank(right) || sprintIdOrder.compare(right.id, left.id),
+    rank(left) - rank(right) || sprintOrder.compare(right.id, left.id),
   )[0];
-  if (sprint) return { key: `sprint:id:${sprint.id}`, title: sprint.name, appearance: { variant: 'sprint' } };
+  if (sprint) return { key: `sprint:id:${sprint.id}`, title: sprint.name, appearance: { variant: 'sprint' }, sprint };
 
   const name = issue.sprints?.findLast((value) => value.trim());
   if (name) return { key: `sprint:name:${name}`, title: name, appearance: { variant: 'sprint' } };
@@ -217,11 +218,14 @@ function groupTree(issues: JiraIssue[], paths: Map<string, GroupName[]>, id: str
   const root: GroupTree = { id, title: '', issues: [], children: new Map() };
   for (const issue of issues) {
     let group = root;
-    for (const { key, title, epicKey, appearance } of paths.get(issue.key) ?? []) {
+    for (const { key, title, epicKey, appearance, sprint } of paths.get(issue.key) ?? []) {
       let child = group.children.get(key);
       if (!child) {
-        child = { id: `${group.id}/${encodeURIComponent(key)}`, title, epicKey, appearance, issues: [], children: new Map() };
+        child = { id: `${group.id}/${encodeURIComponent(key)}`, title, epicKey, appearance, sprint, issues: [], children: new Map() };
         group.children.set(key, child);
+      } else if (sprint) {
+        if (child.title === sprint.id) child.title = title;
+        if (sprint.startDate && !child.sprint?.startDate) child.sprint = sprint;
       }
       group = child;
     }
@@ -249,7 +253,46 @@ function zone(box: LayoutBox, id: string, title: string, kind: GraphZone['kind']
     issues: box.issues, done: box.done, points: box.points };
 }
 
-function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, cardHeight: number, notes: ReadonlySet<string>, depth = 0): LayoutBox {
+function layoutSprintRow(tree: GroupTree, items: Map<string, LayoutBox>): LayoutBox {
+  const groups = [...tree.children.values()];
+  const named = groups.filter(({ appearance }) => appearance?.variant === 'sprint');
+  const dates = new Map(named.map(({ id, sprint }) => [id, Date.parse(sprint?.startDate ?? '')]));
+  // Use one ordering rule across the row when Jira omits dates for some sprints.
+  const sortByDate = [...dates.values()].every(Number.isFinite);
+  const series = new Map(named.map(({ id, title }) => [id, /^(.*?\D)(\d+)\s*$/u.exec(title)]));
+  const prefixes = new Set([...series.values()].map((parts) => parts?.[1].trim().toLowerCase()));
+  const sortByNumberedName = prefixes.size === 1 && !prefixes.has(undefined);
+  const namedOrder = named.sort((left, right) => {
+    if (sortByDate) {
+      const byDate = dates.get(left.id)! - dates.get(right.id)!;
+      if (byDate) return byDate;
+    }
+    if (sortByNumberedName) {
+      const byNumber = sprintOrder.compare(series.get(left.id)![2], series.get(right.id)![2]);
+      if (byNumber) return byNumber;
+    } else {
+      if (left.sprint && right.sprint) return sprintOrder.compare(left.sprint.id, right.sprint.id);
+      if (left.sprint || right.sprint) return left.sprint ? -1 : 1;
+    }
+    return sprintOrder.compare(left.title, right.title) || sprintOrder.compare(left.id, right.id);
+  });
+  const ordered = [
+    ...namedOrder,
+    ...groups.filter(({ appearance }) => appearance?.variant === 'sprint-unscheduled'),
+    ...groups.filter(({ appearance }) => appearance?.variant === 'sprint-external'),
+  ].map(({ id }) => items.get(id)!);
+  for (const { key } of tree.issues) ordered.push(items.get(key)!);
+  const row: LayoutBox = { width: 0, height: 0, positions: new Map(), zones: [], issues: 0, done: 0 };
+  for (const item of ordered) {
+    const x = row.width ? row.width + gap : 0;
+    moveBox(row, item, x, 0);
+    row.width = x + item.width;
+    row.height = Math.max(row.height, item.height);
+  }
+  return row;
+}
+
+function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, cardHeight: number, notes: ReadonlySet<string>, depth = 0, sprintRow = false): LayoutBox {
   const items = new Map<string, LayoutBox>();
   const memberToGroup = new Map<string, string>();
   const withinGroups = new Map<string, JiraEdge[]>();
@@ -278,6 +321,7 @@ function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, ca
   for (const group of tree.children.values()) {
     items.set(group.id, layoutTree(group, withinGroups.get(group.id)!, direction, cardHeight, notes, depth + 1));
   }
+  if (sprintRow) return layoutSprintRow(tree, items);
   const layout = new dagre.graphlib.Graph().setGraph({
     rankdir: direction, nodesep: 36, ranksep: 82, marginx: depth ? 22 : 0, marginy: depth ? 20 : 0,
   }).setDefaultEdgeLabel(() => ({}));
@@ -316,7 +360,8 @@ interface LayoutOptions {
 export function layoutWorkspace(graph: JiraGraph, direction: Direction, mode: GroupMode, labels: LayoutLabels, cardHeight: number, basis = graph,
   { preferredSprintIds = [], noteKeys = new Set() }: LayoutOptions = {}) {
   const paths = groupPaths(basis, mode, labels, preferredSprintIds);
-  const parts = connectedParts(graph.issues, graph.edges, paths);
+  const sprintRow = mode === 'sprint';
+  const parts = sprintRow ? [graph.issues] : connectedParts(graph.issues, graph.edges, paths);
   const epicKeys = new Set(graph.issues.filter(({ key }) => paths.get(key)?.[0]?.epicKey === key).map(({ key }) => key));
   const byKey = new Map<string, number>();
   const edgesByPart = parts.map((): JiraEdge[] => []);
@@ -332,7 +377,7 @@ export function layoutWorkspace(graph: JiraGraph, direction: Direction, mode: Gr
   }
   const boxes = parts.map((issues, index) => {
     const id = `zone:${index}`;
-    const box = layoutTree(groupTree(issues, paths, id), edgesByPart[index], direction, cardHeight, noteKeys);
+    const box = layoutTree(groupTree(issues, paths, id), edgesByPart[index], direction, cardHeight, noteKeys, 0, sprintRow);
     if (parts.length < 2 || issues.length < 2 || box.zones.some(({ kind }) => kind === 'group' || kind === 'epic')) return box;
     const framed: LayoutBox = {
       width: box.width + 34, height: box.height + 55, positions: new Map(), zones: [], issues: 0, done: 0,

@@ -1,48 +1,50 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import { ChevronDown, Filter, LoaderCircle, Search } from 'lucide-react';
-import type { JiraEdition, JiraGraph, JiraProject, JiraSavedFilter } from '../shared/contracts';
+import type { JiraEdition, JiraGraph, JiraIssue, JiraProject, JiraProjectFilterOptions, JiraSavedFilter } from '../shared/contracts';
 import { request } from './api';
 import {
-  graphFacets, hasHighlightFilters, issueFacetOptions, jiraFacetClause, noFacetValue, queryIssueFacetOptions, scopeJql,
-  sprintFacetId, sprintFacetLabels,
-  type FacetOption, type GraphFacet, type GraphFilters, type ScopePreset,
+  graphFacets, hasHighlightFilters, issueFacetOptions, jiraFacetClause, manualJiraFacetValue, noFacetValue,
+  projectJiraFacetValues, queryIssueFacetOptions, scopeJql, sprintFacetId, sprintFacetLabels,
+  type GraphFacet, type GraphFilters, type ProjectFacetValue,
 } from './filter-model';
 import { usePreferences } from './i18n';
 import './filter-controls.css';
 
 type Translation = readonly [ru: string, en: string];
 
-const scopeOptions: Array<{ id: ScopePreset; label: Translation; prompt?: Translation; example?: string }> = [
-  { id: 'issue', label: ['Задача', 'Issue'], prompt: ['Ключ задачи', 'Issue key'], example: 'PROJ-123' },
-  { id: 'project', label: ['Проект', 'Project'], prompt: ['Ключ или название проекта', 'Project key or name'], example: 'PROJ' },
-  { id: 'epic', label: ['Эпик', 'Epic'], prompt: ['Ключ эпика', 'Epic key'], example: 'PROJ-10' },
-  { id: 'subtasks', label: ['Подзадачи', 'Subtasks'], prompt: ['Ключ родительской задачи', 'Parent issue key'], example: 'PROJ-123' },
-  { id: 'label', label: ['Метка', 'Label'], prompt: ['Метка Jira', 'Jira label'], example: 'deprecation-cleanup' },
-  { id: 'sprint', label: ['Спринт', 'Sprint'], prompt: ['Название или ID спринта', 'Sprint name or ID'], example: 'Sprint 24' },
-  { id: 'release', label: ['Релиз', 'Release'], prompt: ['Название или ID версии', 'Version name or ID'], example: '1.0.0' },
-  { id: 'saved', label: ['Сохранённый фильтр', 'Saved filter'], prompt: ['Название или ID фильтра', 'Filter name or ID'], example: '10001' },
-  { id: 'mine', label: ['Мои задачи', 'My issues'] },
-  { id: 'openSprints', label: ['Активные спринты', 'Active sprints'] },
-];
-
 type ListState<T> = { kind: 'loading' | 'failed' } | { kind: 'ready'; items: T[] };
+type ProjectOptionsState = { project: string; options?: JiraProjectFilterOptions };
+const noIssues: readonly JiraIssue[] = [];
 
-export function GraphScopePresets({ connected, edition, projectKey, onProjectChange, onApply }: {
+export function GraphProjectFilters({
+  connected, edition, projectKey, onProjectChange, graph, queryIssueKeys, storyField, selected, onChange, onApply,
+}: {
   connected: boolean;
-  edition?: JiraEdition;
+  edition: JiraEdition;
   projectKey: string;
   onProjectChange(key: string): void;
-  onApply(jql: string): void;
+  graph?: JiraGraph;
+  queryIssueKeys?: ReadonlySet<string>;
+  storyField?: string;
+  selected: GraphFilters['facets'];
+  onChange(selected: GraphFilters['facets']): void;
+  onApply?(jql: string): void;
 }) {
   const { t, language } = usePreferences();
-  const [presetId, setPresetId] = useState<ScopePreset | ''>('');
-  const [value, setValue] = useState('');
   const [projects, setProjects] = useState<ListState<JiraProject>>({ kind: 'loading' });
   const [projectRetry, setProjectRetry] = useState(0);
-  const [saved, setSaved] = useState<ListState<JiraSavedFilter>>();
-  const [retry, setRetry] = useState(0);
-  const preset = scopeOptions.find(({ id }) => id === presetId);
-  const jql = preset ? scopeJql(preset.id, value, edition) : '';
+  const [metadata, setMetadata] = useState<ProjectOptionsState>();
+  const [metadataRetry, setMetadataRetry] = useState(0);
+  const [typedProject, setTypedProject] = useState('');
+  const projectMetadata = metadata?.project === projectKey ? metadata : undefined;
+  const metadataValues = useMemo<Partial<Record<GraphFacet, ProjectFacetValue[]>>>(() =>
+    projectMetadata?.options ? projectJiraFacetValues(projectMetadata.options) : {}, [projectMetadata]);
+  const observedIssues = useMemo(() => {
+    const issues = graph?.issues ?? noIssues;
+    return projectKey ? issues.filter(({ project }) => project === projectKey) : issues;
+  }, [graph?.issues, projectKey]);
+  const loadedOptions = useIssueOptions(observedIssues, true, queryIssueKeys);
+  const hasSelection = Object.values(selected).some((values) => values.length);
   const projectOptions = useMemo(() => projects.kind === 'ready'
     ? [...projects.items].sort((left, right) => left.name.localeCompare(right.name, language, { numeric: true }))
     : [], [language, projects]);
@@ -60,7 +62,104 @@ export function GraphScopePresets({ connected, edition, projectKey, onProjectCha
   }, [connected, projectRetry]);
 
   useEffect(() => {
-    if (!connected || presetId !== 'saved') return;
+    if (!connected || !projectKey) return;
+    let active = true;
+    setMetadata(undefined);
+    void request('getProjectFilterOptions', { project: projectKey }).then((options) => {
+      if (active) setMetadata({ project: projectKey, options });
+    }).catch(() => {
+      if (active) setMetadata({ project: projectKey });
+    });
+    return () => { active = false; };
+  }, [connected, metadataRetry, projectKey]);
+
+  const manualProject = typedProject.trim().toUpperCase();
+  const validProject = /^(?:[A-Z][A-Z0-9_]*|\d+)$/.test(manualProject);
+  function chooseTypedProject() {
+    if (validProject) onProjectChange(manualProject);
+  }
+
+  function renderFacet(facet: GraphFacet) {
+    const values = selected[facet] ?? [];
+    const manual = manualFields[facet];
+    const allows = (value: string) => Boolean(jiraFacetClause(facet, [value], edition, storyField));
+    const observed = loadedOptions.options(facet, []).filter(({ value }) => allows(value));
+    const options = combineChoices(observed, metadataValues[facet] ?? [], values);
+    const available = new Map(options.map((option) => [option.value, option]));
+    for (const value of [...Object.keys(localValueLabels[facet] ?? {}), noFacetValue, ...values]) {
+      if (!available.has(value) && (values.includes(value) || allows(value))) {
+        available.set(value, { value, label: loadedOptions.label(facet, value) });
+      }
+    }
+    if (!available.size && !manual) return null;
+    const sorted = [...available.values()].sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }));
+    return <Facet key={facet} title={t(...facetTitles[facet])} options={sorted} selected={values} queryCounts
+      manual={manual && { label: t(...manual), parse: (input) => manualJiraFacetValue(facet, input) }}
+      onChange={(next) => onChange({ ...selected, [facet]: next })} />;
+  }
+
+  if (!connected) return null;
+  return <section className="project-filters" aria-label={t('Условия выборки Jira', 'Jira query conditions')}>
+    <label>{t('Проект Jira', 'Jira project')}
+      <select value={projectKey} onChange={(event) => onProjectChange(event.target.value)}>
+        <option value="">{t('Все доступные проекты', 'All accessible projects')}</option>
+        {projectKey && !projectOptions.some(({ key }) => key === projectKey) && <option value={projectKey}>{projectKey}</option>}
+        {projectOptions.map(({ id, key, name }) => <option value={key} key={id}>{name} ({key})</option>)}
+      </select>
+    </label>
+    {projects.kind === 'loading' && <p className="form-hint" role="status">
+      <LoaderCircle size={13} className="spin" aria-hidden="true" /> {t('Загрузка проектов Jira…', 'Loading Jira projects…')}
+    </p>}
+    {(projects.kind === 'failed' || (projects.kind === 'ready' && !projectOptions.length)) && <>
+      <p className="form-hint">{projects.kind === 'failed'
+        ? t('Список проектов Jira недоступен.', 'The Jira project list is unavailable.')
+        : t('Jira не вернула доступные проекты.', 'Jira returned no accessible projects.')}
+      </p>
+      <div className="facet-manual">
+        <label>{t('Ключ проекта Jira', 'Jira project key')}
+          <input value={typedProject} placeholder="PROJ" spellCheck={false} onChange={(event) => setTypedProject(event.target.value)}
+            onKeyDown={(event) => onEnter(event, chooseTypedProject)} />
+        </label>
+        <button className="text-button" type="button" onClick={chooseTypedProject} disabled={!validProject}>{t('Выбрать', 'Select')}</button>
+      </div>
+      {projects.kind === 'failed' && <button type="button" className="text-button project-filter-retry"
+        onClick={() => setProjectRetry((previous) => previous + 1)}>{t('Обновить список проектов', 'Retry project list')}</button>}
+    </>}
+    {projectKey && !projectMetadata && <p className="form-hint" role="status">
+      <LoaderCircle size={13} className="spin" aria-hidden="true" /> {t('Загрузка значений проекта…', 'Loading project values…')}
+    </p>}
+    {projectMetadata && (!projectMetadata.options || Boolean(projectMetadata.options.unavailable?.length)) && <div className="form-hint">
+      {t('Часть списков Jira недоступна. Значения можно ввести вручную.', 'Some Jira lists are unavailable. You can enter values manually.')}
+      <button type="button" className="text-button" onClick={() => setMetadataRetry((previous) => previous + 1)}>
+        {t('Повторить', 'Retry')}
+      </button>
+    </div>}
+    <div className="facet-grid">{primaryFacets.map(renderFacet)}</div>
+    <details className="filter-facet project-filter-more">
+      <summary><span>{t('Другие условия', 'More conditions')}</span>
+        {extraFacets.some((facet) => selected[facet]?.length) && <span className="facet-count">
+          {extraFacets.reduce((count, facet) => count + (selected[facet]?.length ?? 0), 0)}
+        </span>}
+        <ChevronDown size={14} aria-hidden="true" />
+      </summary>
+      <div className="facet-grid">{extraFacets.map(renderFacet)}</div>
+    </details>
+    {hasSelection && <button type="button" className="text-button project-filter-retry" onClick={() => onChange({})}>
+      {t('Сбросить условия', 'Reset conditions')}
+    </button>}
+    {onApply && <FavoriteJiraFilters onApply={onApply} />}
+  </section>;
+}
+
+function FavoriteJiraFilters({ onApply }: { onApply(jql: string): void }) {
+  const { t } = usePreferences();
+  const [open, setOpen] = useState(false);
+  const [saved, setSaved] = useState<ListState<JiraSavedFilter>>({ kind: 'loading' });
+  const [value, setValue] = useState('');
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    if (!open) return;
     let active = true;
     setSaved({ kind: 'loading' });
     void request('listSavedFilters', null).then((items) => {
@@ -69,84 +168,39 @@ export function GraphScopePresets({ connected, edition, projectKey, onProjectCha
       if (active) setSaved({ kind: 'failed' });
     });
     return () => { active = false; };
-  }, [connected, presetId, retry]);
+  }, [open, retry]);
 
-  function applyOnEnter(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
-    event.preventDefault();
-    if (jql) onApply(jql);
-  }
-
-  return <section className="scope-presets" aria-label={t('Шаблоны JQL', 'JQL presets')}>
-    {connected && <>
-      <label>{t('Проект Jira', 'Jira project')}
-        <select value={projectKey} onChange={(event) => onProjectChange(event.target.value)}>
-          <option value="">{t('Все доступные проекты', 'All accessible projects')}</option>
-          {projectKey && !projectOptions.some(({ key }) => key === projectKey) && <option value={projectKey}>{projectKey}</option>}
-          {projectOptions.map(({ id, key, name }) => <option value={key} key={id}>{name} ({key})</option>)}
+  const clause = scopeJql('saved', value);
+  return <details className="filter-facet project-filter-more" onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary><span>{t('Избранные фильтры Jira', 'Favorite Jira filters')}</span><ChevronDown size={14} aria-hidden="true" /></summary>
+    <div className="facet-grid">
+      {saved.kind === 'loading' && <p className="form-hint" role="status">{t('Загрузка избранного…', 'Loading favorites…')}</p>}
+      {saved.kind === 'ready' && saved.items.length > 0 && <label>{t('Фильтр Jira', 'Jira filter')}
+        <select value={saved.items.some(({ id }) => id === value) ? value : ''} onChange={(event) => setValue(event.target.value)}>
+          <option value="">{t('Выбрать фильтр', 'Choose a filter')}</option>
+          {saved.items.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
         </select>
-      </label>
-      {projects.kind === 'loading' && <p className="form-hint" role="status">
-        <LoaderCircle size={13} className="spin" /> {t('Загрузка проектов Jira…', 'Loading Jira projects…')}
-      </p>}
-      {projects.kind === 'ready' && projects.items.length === 0 && <p className="form-hint">
-        {t('Нет доступных проектов. Ключ можно ввести в JQL.', 'No accessible projects. You can enter a key in JQL.')}
-      </p>}
-      {projects.kind === 'failed' && <p className="form-hint">
-        {t('Список проектов Jira недоступен.', 'The Jira project list is unavailable.')}
-        <button type="button" className="text-button" onClick={() => setProjectRetry((previous) => previous + 1)}>
-          {t('Повторить', 'Retry')}
-        </button>
-      </p>}
-    </>}
-    <label>{t('Шаблон выборки', 'Scope preset')}
-      <select value={presetId} onChange={(event) => {
-        setPresetId(event.target.value as ScopePreset | '');
-        setValue('');
-        setSaved(undefined);
-      }}>
-        <option value="">{t('Выбрать шаблон', 'Choose a preset')}</option>
-        {scopeOptions.map(({ id, label }) => <option key={id} value={id}>{t(...label)}</option>)}
-      </select>
-    </label>
-    {preset && <div className="preset-values">
-      {preset.id === 'saved' && connected && <>
-        {saved?.kind === 'loading' && <p className="form-hint" role="status">
-          <LoaderCircle size={13} className="spin" /> {t('Загрузка избранных фильтров…', 'Loading favorite filters…')}
-        </p>}
-        {saved?.kind === 'ready' && saved.items.length > 0 && <label>
-          {t('Избранные фильтры Jira', 'Favorite Jira filters')}
-          <select value={saved.items.some(({ id }) => id === value) ? value : ''} onChange={(event) => setValue(event.target.value)}>
-            <option value="">{t('Выбрать фильтр', 'Choose a filter')}</option>
-            {saved.items.map(({ id, name }) => <option value={id} key={id}>{name}</option>)}
-          </select>
-        </label>}
-        {saved?.kind === 'ready' && saved.items.length === 0 && <p className="form-hint">
-          {t('Избранных фильтров нет. Можно ввести название или ID.', 'There are no favorite filters. You can enter a name or ID.')}
-        </p>}
-        {saved?.kind === 'failed' && <p className="form-hint">
-          {t('Избранные фильтры недоступны.', 'Favorite filters are unavailable.')}
-          <button type="button" className="text-button" onClick={() => setRetry((previous) => previous + 1)}>
-            {t('Повторить', 'Retry')}
-          </button>
-        </p>}
-      </>}
-      {preset.prompt && <label>{t(...preset.prompt)}
-        <input value={value} placeholder={preset.example} onChange={(event) => setValue(event.target.value)} onKeyDown={applyOnEnter} />
       </label>}
-      <button type="button" className="button secondary full" disabled={!jql} onClick={() => onApply(jql)}>
-        {t('Добавить в JQL', 'Add to JQL')}
-      </button>
-    </div>}
-  </section>;
+      {saved.kind === 'failed' && <button type="button" className="text-button project-filter-retry" onClick={() => setRetry((previous) => previous + 1)}>
+        {t('Повторить загрузку избранного', 'Retry favorite filters')}
+      </button>}
+      <label>{t('Имя или ID фильтра', 'Filter name or ID')}
+        <input value={value} onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => onEnter(event, () => { if (clause) onApply(clause); })} />
+      </label>
+      <button type="button" className="button secondary full" disabled={!clause} onClick={() => onApply(clause)}>{t('Добавить в JQL', 'Add to JQL')}</button>
+    </div>
+  </details>;
 }
 
 const facetTitles: Record<GraphFacet, Translation> = {
   statusCategory: ['Категория статуса', 'Status category'],
   status: ['Статус Jira', 'Jira status'],
   project: ['Проект', 'Project'],
+  key: ['Ключ задачи', 'Issue key'],
   epic: ['Эпик', 'Epic'],
   parent: ['Родительская задача', 'Parent issue'],
+  subtaskParent: ['Задача с подзадачами', 'Issue and its subtasks'],
   issueType: ['Тип задачи', 'Issue type'],
   hierarchy: ['Уровень иерархии', 'Hierarchy level'],
   labels: ['Метки', 'Labels'],
@@ -174,21 +228,75 @@ const localValueLabels: Partial<Record<GraphFacet, Record<string, Translation>>>
   dueDate: { present: ['Со сроком', 'Has due date'], missing: ['Без срока', 'No due date'] },
 };
 
+const primaryFacets: readonly GraphFacet[] = ['status', 'sprints', 'issueType', 'fixVersions', 'labels'];
+const extraFacets: readonly GraphFacet[] = ['key', 'epic', 'subtaskParent', 'parent', 'assignee', 'priority', 'statusCategory', 'hierarchy', 'dueDate', 'estimate'];
+
+const manualFields: Partial<Record<GraphFacet, Translation>> = {
+  key: ['Ключ задачи, например PROJ-123', 'Issue key, e.g. PROJ-123'],
+  epic: ['Ключ эпика, например PROJ-123', 'Epic key, e.g. PROJ-123'],
+  parent: ['Ключ родительской задачи', 'Parent issue key'],
+  subtaskParent: ['Ключ задачи с подзадачами', 'Issue key with subtasks'],
+  status: ['Название или ID статуса', 'Status name or ID'],
+  issueType: ['Название или ID типа задачи', 'Issue type name or ID'],
+  labels: ['Метка Jira', 'Jira label'],
+  assignee: ['Имя, email или ID', 'Name, email, or ID'],
+  priority: ['Название приоритета', 'Priority name'],
+  sprints: ['Название или ID спринта', 'Sprint name or ID'],
+  fixVersions: ['Название или ID версии', 'Version name or ID'],
+};
+
+interface FacetChoice {
+  value: string;
+  label: string;
+  count?: number;
+}
+
+function combineChoices(observed: FacetChoice[], metadata: ProjectFacetValue[], selected: string[]): FacetChoice[] {
+  const observedByValue = new Map(observed.map((option) => [option.value, option]));
+  const nameCounts = new Map<string, number>();
+  for (const { name } of metadata) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  const options = metadata.map(({ value, name, label }) => {
+    const uniqueName = nameCounts.get(name) === 1;
+    const count = observedByValue.get(value)?.count ?? (uniqueName ? observedByValue.get(name)?.count : undefined);
+    observedByValue.delete(value);
+    if (uniqueName) observedByValue.delete(name);
+    const keepManualChoice = uniqueName && selected.includes(name) && !selected.includes(value);
+    return { value: keepManualChoice ? name : value, label, count };
+  });
+  return [...options, ...observedByValue.values()];
+}
+
+function onEnter(event: KeyboardEvent<HTMLInputElement>, action: () => void) {
+  if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+  event.preventDefault();
+  action();
+}
+
 function toggle(values: string[], value: string): string[] {
   return values.includes(value) ? values.filter((current) => current !== value) : [...values, value];
 }
 
-function Facet({ title, options, selected, onChange, queryCounts }: {
+function Facet({ title, options, selected, onChange, queryCounts, manual }: {
   title: string;
-  options: Array<FacetOption & { label: string }>;
+  options: FacetChoice[];
   selected: string[];
   onChange(values: string[]): void;
   queryCounts?: boolean;
+  manual?: { label: string; parse(input: string): string };
 }) {
   const { t, language } = usePreferences();
   const [search, setSearch] = useState('');
+  const [typed, setTyped] = useState('');
   const query = search.trim().toLowerCase();
   const visible = query ? options.filter(({ label }) => label.toLowerCase().includes(query)) : options;
+  const parsed = manual?.parse(typed) ?? '';
+  function addTypedValue() {
+    if (!parsed) return;
+    const choice = options.find(({ label }) => label === typed.trim())?.value ?? parsed;
+    if (!selected.includes(choice)) onChange([...selected, choice]);
+    setTyped('');
+    setSearch('');
+  }
   return <details className="filter-facet">
     <summary><span>{title}</span>
       {selected.length > 0 && <span className="facet-count">{selected.length}</span>}
@@ -196,25 +304,32 @@ function Facet({ title, options, selected, onChange, queryCounts }: {
     </summary>
     {options.length > 8 && <input className="facet-search" type="search" value={search}
       aria-label={t('Найти значение', 'Find a value')} placeholder={t('Найти значение', 'Find a value')}
-      onChange={(event) => setSearch(event.target.value)} />}
-    <div className="facet-options">
+      onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => onEnter(event, () => {})} />}
+    {(options.length > 0 || !manual) && <div className="facet-options">
       {visible.map(({ value, label, count }) => <label className="facet-option" key={value} title={label}>
         <input type="checkbox" checked={selected.includes(value)} onChange={() => onChange(toggle(selected, value))} />
-        <span>{label}</span><small title={queryCounts ? t('Задачи в загруженной выборке JQL', 'Issues in the loaded JQL selection') : undefined}>
+        <span>{label}</span>{count !== undefined && <small title={queryCounts ? t('Задачи в загруженной выборке JQL', 'Issues in the loaded JQL selection') : undefined}>
           {count.toLocaleString(language)}
-        </small>
+        </small>}
       </label>)}
       {!visible.length && <span className="facet-empty">{t('Совпадений нет', 'No matches')}</span>}
-    </div>
+    </div>}
+    {manual && <div className="facet-manual">
+      <label>{manual.label}
+        <input value={typed} maxLength={200} spellCheck={false} onChange={(event) => setTyped(event.target.value)}
+          onKeyDown={(event) => onEnter(event, addTypedValue)} />
+      </label>
+      <button type="button" className="text-button" onClick={addTypedValue} disabled={!parsed}>{t('Добавить', 'Add')}</button>
+    </div>}
   </details>;
 }
 
-function useIssueOptions(graph: JiraGraph, queryOnly = false, queryIssueKeys?: ReadonlySet<string>) {
+function useIssueOptions(issues: readonly JiraIssue[], queryOnly = false, queryIssueKeys?: ReadonlySet<string>) {
   const { t, language } = usePreferences();
-  const facets = useMemo(() => queryOnly ? queryIssueFacetOptions(graph.issues, queryIssueKeys)
-    : issueFacetOptions(graph.issues), [graph.issues, queryIssueKeys, queryOnly]);
-  const summaries = useMemo(() => new Map(graph.issues.map(({ key, summary }) => [key, summary])), [graph.issues]);
-  const sprintLabels = useMemo(() => sprintFacetLabels(graph.issues), [graph.issues]);
+  const facets = useMemo(() => queryOnly ? queryIssueFacetOptions(issues, queryIssueKeys)
+    : issueFacetOptions(issues), [issues, queryIssueKeys, queryOnly]);
+  const summaries = useMemo(() => new Map(issues.map(({ key, summary }) => [key, summary])), [issues]);
+  const sprintLabels = useMemo(() => sprintFacetLabels(issues), [issues]);
 
   function optionLabel(facet: GraphFacet, value: string): string {
     if (value === noFacetValue) return t(...(missingLabels[facet] ?? ['Без значения', 'No value']));
@@ -224,49 +339,18 @@ function useIssueOptions(graph: JiraGraph, queryOnly = false, queryIssueKeys?: R
       const id = sprintFacetId(value);
       return sprintLabels.get(value) ?? (id ? t(`Спринт #${id}`, `Sprint #${id}`) : value);
     }
-    const summary = (facet === 'epic' || facet === 'parent') && summaries.get(value);
+    const id = sprintFacetId(value);
+    if (id) return `#${id}`;
+    const summary = (facet === 'epic' || facet === 'parent' || facet === 'key' || facet === 'subtaskParent') && summaries.get(value);
     return summary && summary !== value ? `${value} · ${summary}` : value;
   }
-  return (facet: GraphFacet, selected: string[]) => {
+  function optionsFor(facet: GraphFacet, selected: string[]) {
     const options = [...facets[facet]];
     for (const value of selected) if (!options.some((option) => option.value === value)) options.push({ value, count: 0 });
     return options.map((option) => ({ ...option, label: optionLabel(facet, option.value) }))
       .sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }));
-  };
-}
-
-export function GraphJqlFilters({ graph, edition, storyField, queryIssueKeys, selected, onChange }: {
-  graph: JiraGraph;
-  edition: JiraEdition;
-  storyField?: string;
-  queryIssueKeys?: ReadonlySet<string>;
-  selected: GraphFilters['facets'];
-  onChange(selected: GraphFilters['facets']): void;
-}) {
-  const { t } = usePreferences();
-  const issueOptions = useIssueOptions(graph, true, queryIssueKeys);
-  const hasSelection = Object.values(selected).some((values) => values.length);
-
-  if (!graph.issues.length && !hasSelection) return null;
-  return <section className="filters" aria-label={t('Фильтры Jira в JQL', 'Jira filters in JQL')}>
-    <div className="filter-heading">
-      <h2><Filter size={16} /> {t('Выборка Jira', 'Jira selection')}</h2>
-      {hasSelection && <button type="button" className="text-button" onClick={() => onChange({})}>
-        {t('Сбросить', 'Reset')}
-      </button>}
-    </div>
-    <p className="form-hint">{t('Счётчики относятся к загруженной выборке JQL. Чтобы применить новый запрос, загрузи граф.',
-      'Counts refer to the loaded JQL selection. Load the graph to apply the new query.')}</p>
-    <div className="facet-grid">
-      {graphFacets.filter((facet) => facet !== 'project').map((facet) => {
-        const values = selected[facet] ?? [];
-        const options = issueOptions(facet, values).filter(({ value }) => jiraFacetClause(facet, [value], edition, storyField));
-        if (!options.some(({ value }) => value !== noFacetValue) && !values.length) return null;
-        return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={values} queryCounts
-          onChange={(next) => onChange({ ...selected, [facet]: next })} />;
-      })}
-    </div>
-  </section>;
+  }
+  return { options: optionsFor, label: optionLabel };
 }
 
 export function GraphFilterPanel({ graph, filters, onChange }: {
@@ -276,7 +360,7 @@ export function GraphFilterPanel({ graph, filters, onChange }: {
   onChange(filters: GraphFilters): void;
 }) {
   const { t } = usePreferences();
-  const issueOptions = useIssueOptions(graph);
+  const issueOptions = useIssueOptions(graph.issues);
   const hasSelection = hasHighlightFilters(filters);
   const heading = t('Подсветка задач', 'Highlight issues');
   return <details className="highlight-filters filter-facet">
@@ -295,9 +379,9 @@ export function GraphFilterPanel({ graph, filters, onChange }: {
         onChange={(event) => onChange({ ...filters, search: event.target.value })} />
     </label>
     <div className="facet-grid">
-      {graphFacets.map((facet) => {
+      {graphFacets.filter((facet) => facet !== 'key' && facet !== 'subtaskParent').map((facet) => {
         const selected = filters.facets[facet] ?? [];
-        const options = issueOptions(facet, selected);
+        const options = issueOptions.options(facet, selected);
         if (!options.some(({ value }) => value !== noFacetValue) && !selected.length) return null;
         return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={selected}
           onChange={(values) => onChange({ ...filters, facets: { ...filters.facets, [facet]: values } })} />;

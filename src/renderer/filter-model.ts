@@ -1,7 +1,7 @@
-import type { JiraEdge, JiraEdition, JiraGraph, JiraIssue } from '../shared/contracts.js';
+import type { JiraEdge, JiraEdition, JiraGraph, JiraIssue, JiraOption, JiraProjectFilterOptions } from '../shared/contracts.js';
 
 export const graphFacets = [
-  'statusCategory', 'status', 'project', 'epic', 'parent', 'issueType', 'hierarchy', 'labels',
+  'statusCategory', 'status', 'project', 'key', 'epic', 'parent', 'subtaskParent', 'issueType', 'hierarchy', 'labels',
   'assignee', 'priority', 'sprints', 'fixVersions', 'estimate', 'dueDate',
 ] as const;
 
@@ -50,6 +50,57 @@ export function sprintFacetId(value: string): string | undefined {
   return /^id:(\d+)$/.exec(value)?.[1];
 }
 
+export function selectedSprintIds(values: readonly string[], issues: readonly JiraIssue[]): string[] {
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  for (const value of values) {
+    const id = sprintFacetId(value);
+    if (id) ids.add(id);
+    else names.add(value.toLowerCase());
+  }
+  if (names.size) for (const { sprintDetails } of issues) {
+    for (const sprint of sprintDetails ?? []) if (names.has(sprint.name.toLowerCase())) ids.add(sprint.id);
+  }
+  return [...ids];
+}
+
+const idJiraFacets = new Set<GraphFacet>(['status', 'issueType', 'sprints', 'fixVersions']);
+
+export function manualJiraFacetValue(facet: GraphFacet, input: string): string {
+  const value = input.trim();
+  if (!value || /[\x00-\x1F\x7F]/.test(value)) return '';
+  if (facet === 'key' || facet === 'epic' || facet === 'parent' || facet === 'subtaskParent') {
+    return /^[A-Z][A-Z0-9_]*-\d+$/i.test(value) ? value.toUpperCase() : '';
+  }
+  return idJiraFacets.has(facet) && /^\d+$/.test(value) ? `id:${value}` : value;
+}
+
+export interface ProjectFacetValue {
+  value: string;
+  name: string;
+  label: string;
+}
+
+function projectFacetValues(facet: GraphFacet, options: readonly JiraOption[]): ProjectFacetValue[] {
+  const names = new Map<string, number>();
+  for (const { name } of options) names.set(name, (names.get(name) ?? 0) + 1);
+  return options.map(({ id, name }) => {
+    const hasNumericId = /^\d+$/.test(id);
+    const value = hasNumericId ? `id:${id}` : name;
+    const showId = hasNumericId && (facet === 'sprints' || (names.get(name) ?? 0) > 1);
+    return { value, name, label: showId ? `${name} · #${id}` : name };
+  });
+}
+
+export function projectJiraFacetValues(metadata: JiraProjectFilterOptions): Partial<Record<GraphFacet, ProjectFacetValue[]>> {
+  return {
+    status: projectFacetValues('status', metadata.statuses),
+    issueType: projectFacetValues('issueType', metadata.issueTypes),
+    fixVersions: projectFacetValues('fixVersions', metadata.versions),
+    sprints: projectFacetValues('sprints', metadata.sprints),
+  };
+}
+
 export function sprintFacetLabels(issues: readonly JiraIssue[]): Map<string, string> {
   return new Map(issues.flatMap(({ sprintDetails }) => (sprintDetails ?? []).map(({ id, name }) => [`id:${id}`, `${name} · #${id}`])));
 }
@@ -65,6 +116,7 @@ export function facetValues(issue: JiraIssue, facet: GraphFacet): string[] {
     case 'statusCategory': return [statusCategory(issue)];
     case 'epic': return [epicKey(issue) ?? noFacetValue];
     case 'parent': return [issue.parentKey ?? noFacetValue];
+    case 'subtaskParent': return [issue.isSubtask ? issue.parentKey ?? noFacetValue : noFacetValue];
     case 'hierarchy': return [issue.isSubtask ? 'subtask' : issue.isEpic ? 'epic' : 'issue'];
     case 'estimate': return [issue.storyPoints === undefined ? 'missing' : 'present'];
     case 'dueDate': return [issue.dueDate ? 'present' : 'missing'];
@@ -157,9 +209,6 @@ export function filterGraph(graph: JiraGraph, filters: VisibilityFilters): JiraG
   return { ...graph, issues: issues.filter(({ key }) => connected.has(key)), edges };
 }
 
-export type ScopePreset =
-  'issue' | 'project' | 'epic' | 'subtasks' | 'label' | 'sprint' | 'release' | 'saved' | 'mine' | 'openSprints';
-
 function jqlLiteral(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
@@ -199,28 +248,15 @@ function epicField(edition: JiraEdition): string {
   return edition === 'data-center' ? '"Epic Link"' : 'parentEpic';
 }
 
-export function scopeJql(scope: ScopePreset, value: string, edition: JiraEdition = 'cloud'): string {
-  if (scope === 'mine') return 'assignee = currentUser()';
-  if (scope === 'openSprints') return 'sprint in openSprints()';
+export function scopeJql(scope: 'project' | 'saved', value: string): string {
   const input = value.trim();
   if (!input || /[\x00-\x1F\x7F]/.test(input)) return '';
-
-  const quoted = jqlLiteral(input);
-  const reference = /^\d+$/.test(input) ? input : quoted;
-  switch (scope) {
-    case 'issue': return `key = ${quoted}`;
-    case 'project': return `project = ${reference}`;
-    case 'epic': return `(key = ${quoted} OR ${epicField(edition)} = ${quoted})`;
-    case 'subtasks': return `(key = ${quoted} OR (parent = ${quoted} AND issuetype in subtaskIssueTypes()))`;
-    case 'label': return `labels = ${quoted}`;
-    case 'sprint': return `sprint = ${reference}`;
-    case 'release': return `fixVersion = ${reference}`;
-    case 'saved': return `filter = ${reference}`;
-  }
+  const reference = /^\d+$/.test(input) ? input : jqlLiteral(input);
+  return `${scope === 'project' ? 'project' : 'filter'} = ${reference}`;
 }
 
 const jiraFields: Partial<Record<GraphFacet, string>> = {
-  statusCategory: 'statusCategory', status: 'status', project: 'project', parent: 'parent', issueType: 'issuetype',
+  statusCategory: 'statusCategory', status: 'status', project: 'project', key: 'key', parent: 'parent', issueType: 'issuetype',
   labels: 'labels', assignee: 'assignee', priority: 'priority', sprints: 'sprint', fixVersions: 'fixVersion',
 };
 
@@ -256,11 +292,15 @@ export function jiraFacetClause(facet: GraphFacet, selected: readonly string[], 
     const keys = values.map(jqlLiteral);
     return anyOf([matchJiraValues('key', keys), ...keys.map((key) => `${epicField(edition)} = ${key}`)].filter(Boolean));
   }
+  if (facet === 'subtaskParent') {
+    const keys = values.map(jqlLiteral);
+    return keys.length ? `(${matchJiraValues('key', keys)} OR (${matchJiraValues('parent', keys)} AND issuetype in subtaskIssueTypes()))` : '';
+  }
   const field = jiraFields[facet];
   if (!field) return '';
   const references = values.flatMap((value) => {
     if (facet === 'statusCategory') return Object.hasOwn(categoryNames, value) ? [jqlLiteral(categoryNames[value]!)] : [];
-    if (facet === 'sprints') return [sprintFacetId(value) ?? jqlLiteral(value)];
+    if (idJiraFacets.has(facet)) return [sprintFacetId(value) ?? jqlLiteral(value)];
     return [jqlLiteral(value)];
   });
   const missing = emptyJiraFields.has(facet) && selected.includes(noFacetValue) ? `${field} IS EMPTY` : '';

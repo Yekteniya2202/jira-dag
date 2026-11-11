@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MarkerType, MiniMap,
   Position, ReactFlow, useReactFlow,
-  type Edge, type EdgeProps, type Node, type NodeHandle, type NodeProps, type OnConnect, type OnNodesChange,
+  type Edge, type EdgeProps, type Node, type NodeHandle, type NodeProps, type OnConnect, type OnNodesChange, type Viewport,
 } from '@xyflow/react';
 import {
   ArrowRight, ArrowUpRight, CalendarDays, CalendarX2, CheckSquare2, CircleDot, ClipboardList, Flag,
@@ -151,13 +151,17 @@ function JiraLink({ id, source, target, data, sourceX, sourceY, targetX, targetY
   const dx = across ? 0 : offset;
   const dy = across ? offset : 0;
   const self = source === target;
+  const returnsLeft = across && !self && sourceX > targetX;
+  const returnY = Math.min(sourceY, targetY) - 128 + offset * 0.55;
   const path = self
     ? across
       ? `M ${sourceX},${sourceY} C ${sourceX + 95},${sourceY - 165} ${targetX - 95},${targetY - 165} ${targetX},${targetY}`
       : `M ${sourceX},${sourceY} C ${sourceX - 200},${sourceY + 70} ${targetX - 200},${targetY - 70} ${targetX},${targetY}`
-    : `M ${sourceX},${sourceY} C ${sourceX + horizontal + dx},${sourceY + vertical + dy} ${targetX - horizontal + dx},${targetY - vertical + dy} ${targetX},${targetY}`;
+    : returnsLeft
+      ? `M ${sourceX},${sourceY} C ${sourceX + 28},${sourceY} ${sourceX + 28},${returnY} ${sourceX},${returnY} L ${targetX},${returnY} C ${targetX - 28},${returnY} ${targetX - 28},${targetY} ${targetX},${targetY}`
+      : `M ${sourceX},${sourceY} C ${sourceX + horizontal + dx},${sourceY + vertical + dy} ${targetX - horizontal + dx},${targetY - vertical + dy} ${targetX},${targetY}`;
   const labelX = (sourceX + targetX) / 2 + (self && !across ? -150 : dx * 0.75);
-  const labelY = (sourceY + targetY) / 2 + (self && across ? -124 : dy * 0.75);
+  const labelY = returnsLeft ? returnY : (sourceY + targetY) / 2 + (self && across ? -124 : dy * 0.75);
   const active = selected || data?.active;
   const muted = data?.muted && !selected;
   return (
@@ -201,6 +205,8 @@ interface Props {
   connected: boolean;
   editable: boolean;
   notesByIssue: Readonly<Record<string, readonly JiraGraphNote[]>>;
+  manualPositions: Readonly<Record<string, GraphPosition>>;
+  viewport?: Viewport;
   highlightedKeys?: ReadonlySet<string>;
   preferredSprintIds?: readonly string[];
   onSelectIssue(key?: string): void;
@@ -208,14 +214,18 @@ interface Props {
   onOpenIssue(issue: JiraIssue): void;
   onNoteIssue(key: string, focusInput: boolean): void;
   onCreateRelated?(issue: JiraIssue): void;
+  onManualPositionsChange(positions: Record<string, GraphPosition>): void;
+  onViewportChange(viewport: Viewport): void;
   onConnect: OnConnect;
 }
 
 export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
-  notesByIssue, highlightedKeys, preferredSprintIds, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated, onConnect }: Props) {
+  notesByIssue, manualPositions, viewport, highlightedKeys, preferredSprintIds, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated,
+  onManualPositionsChange, onViewportChange, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
-  const [positions, setPositions] = useState<Record<string, GraphPosition>>({});
+  const [dragPositions, setDragPositions] = useState<Record<string, GraphPosition>>({});
+  const userMovedViewport = useRef(false);
   const cardHeight = CARD_HEIGHT + (fields.assignee ? 22 : 0) + (fields.priority || fields.labels || fields.dueDate || fields.estimate ? 19 : 0);
   const across = direction === 'LR';
   // The cards have fixed dimensions. Keep edge anchors available even before the DOM observer runs.
@@ -266,7 +276,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     if (!position) return [];
     return [{
       id: issue.key, type: 'issue',
-      position: (groupMode === 'none' ? positions[issue.key] : undefined) ?? position,
+      position: (groupMode === 'none' ? dragPositions[issue.key] ?? manualPositions[issue.key] : undefined) ?? position,
       width: CARD_WIDTH, height: cardHeight, zIndex: 2,
       measured: { width: CARD_WIDTH, height: cardHeight }, handles,
       selected: issue.key === selectedKey,
@@ -322,25 +332,36 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
   }) : [];
 
   useEffect(() => {
+    if (viewport) return;
     const id = requestAnimationFrame(() => void flow.fitView({ padding: 0.14, maxZoom: 1.05, duration: 240 }));
     return () => cancelAnimationFrame(id);
-  }, [flow, layout]);
+  }, [flow, layout, viewport]);
 
   const onNodesChange: OnNodesChange<CanvasNode> = (changes) => {
     const selection = changes.find((change) => change.type === 'select' && change.selected);
     if (selection?.type === 'select' && visibleKeys.has(selection.id)) onSelectIssue(selection.id);
-    const moved = changes.filter((change) => change.type === 'position');
+    const moved = changes.filter((change) => change.type === 'position').filter(({ id, position }) => position && visibleKeys.has(id));
     if (moved.length && groupMode === 'none') {
-      setPositions((previous) => {
-        const next = { ...previous };
-        for (const change of moved) if (change.position) next[change.id] = change.position;
-        return next;
-      });
+      const next = Object.fromEntries(moved.flatMap(({ id, position }) => position ? [[id, position]] : []));
+      if (moved.some(({ dragging }) => dragging)) setDragPositions(next);
+      else {
+        setDragPositions({});
+        onManualPositionsChange({ ...manualPositions, ...next });
+      }
     }
   };
 
+  function markMinimapMove(target: EventTarget) {
+    if (target instanceof Element && target.closest('.react-flow__minimap')) userMovedViewport.current = true;
+  }
+
+  function markControlMove() {
+    userMovedViewport.current = true;
+  }
+
   return (
-    <div className="canvas" data-show-links={showLinks}>
+    <div className="canvas" data-show-links={showLinks}
+      onPointerDownCapture={(event) => markMinimapMove(event.target)} onWheelCapture={(event) => markMinimapMove(event.target)}>
       {cards.length === 0 && zones.length === 0 ? <div className="empty-canvas">
         <GitBranch size={26} /><h2>{t('Задачи не найдены', 'No issues found')}</h2>
         <p>{t('Измени JQL или сбрось фильтры.', 'Change the JQL query or clear the filters.')}</p>
@@ -353,8 +374,12 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
         nodesDraggable={groupMode === 'none'} nodesConnectable={editable && showLinks} onConnect={onConnect}
         onNodeClick={(_, node) => { if (node.type === 'issue') onSelectIssue(node.id); }}
         onEdgeClick={(_, edge) => onSelectEdge(edge.id)}
+        onMoveEnd={(event, next) => {
+          if (event) userMovedViewport.current = true;
+          if (userMovedViewport.current) onViewportChange(next);
+        }}
         onPaneClick={() => onSelectIssue()} deleteKeyCode={null} minZoom={0.07} maxZoom={2}
-        fitView fitViewOptions={{ padding: 0.14, maxZoom: 1.05 }}
+        defaultViewport={viewport} fitView={!viewport} fitViewOptions={{ padding: 0.14, maxZoom: 1.05 }}
         ariaLabelConfig={{
           'controls.ariaLabel': t('Управление масштабом', 'Zoom controls'),
           'controls.zoomIn.ariaLabel': t('Увеличить', 'Zoom in'),
@@ -364,7 +389,8 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
         }}
       >
         <Background gap={23} size={1.25} color="var(--canvas-dot)" />
-        <Controls position="bottom-left" showInteractive={false} />
+        <Controls position="bottom-left" showInteractive={false}
+          onZoomIn={markControlMove} onZoomOut={markControlMove} onFitView={markControlMove} />
         <MiniMap<CanvasNode>
           position="bottom-right"
           nodeColor={(node) => node.type === 'issue' ? `var(--minimap-${statusTone(node.data.issue) === 'done' ? 'done' : 'node'})` : 'transparent'}

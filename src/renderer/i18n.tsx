@@ -69,6 +69,7 @@ const applicationMessages: [ru: string, en: string][] = [
   ['Сервер Jira DAG недоступен.', 'The Jira DAG server is unavailable.'],
   ['Не удалось выполнить запрос.', 'The request could not be completed.'],
   ['Не удалось восстановить сохранённое подключение Jira.', 'Could not restore the saved Jira connection.'],
+  ['Не удалось сохранить рабочую область на этом устройстве.', 'Could not save the workspace locally.'],
   ['Jira отклонила сохранённый вход. Подключись заново.', 'Jira rejected the saved login. Sign in again.'],
   ['Подключено. Не удалось обновить сохранённый вход.', 'Connected. Could not update the saved Jira connection.'],
   ['Не удалось удалить сохранённое подключение Jira.', 'Could not remove the saved Jira connection.'],
@@ -98,6 +99,8 @@ const applicationMessages: [ru: string, en: string][] = [
   ['Часть связанных задач недоступна для этой учётной записи.', 'Some linked issues are unavailable to this account.'],
   ['Jira вернула слишком много страниц комментариев или некорректную пагинацию.', 'Jira returned too many comment pages or invalid pagination.'],
   ['Jira не подтвердила создание заметки. Обнови заметки перед повторной отправкой.', 'Jira did not confirm creation. Refresh notes before submitting again.'],
+  ['Jira не подтвердила изменение заметки. Обнови заметки перед повторной попыткой.', 'Jira did not confirm the edit. Refresh notes before trying again.'],
+  ['Не удалось проверить видимость заметки в Jira.', 'Could not verify the note visibility in Jira.'],
   ['Неверный идентификатор заметки.', 'Invalid note ID.'],
   ['Этот комментарий не является заметкой Jira DAG.', 'This comment is not a Jira DAG note.'],
 ];

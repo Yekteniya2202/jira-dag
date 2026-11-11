@@ -53,7 +53,7 @@ test('scoped Cloud credentials use the original Jira site only for Cloud ID look
     'https://team.atlassian.net/_edge/tenant_info',
     `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/myself`,
   ]);
-  assert.deepEqual(connection, { url: 'https://team.atlassian.net', displayName: 'Jira User' });
+  assert.deepEqual(connection, { url: 'https://team.atlassian.net', displayName: 'Jira User', profileId: 'abc' });
   assert.equal(client.getIssueUrl('APP-1'), 'https://team.atlassian.net/browse/APP-1');
 });
 
@@ -135,7 +135,7 @@ test('Data Center requests preserve the Jira context path and use offset paging 
         return json({ total: 2, issues: [query.startAt ? rawIssue('APP-2') : rawIssue('APP-1', {
           customfield_10002: 'APP-2',
           customfield_10003: [
-            'com.atlassian.greenhopper.service.sprint.Sprint@1bf75fd[id=1,rapidViewId=1,state=CLOSED,name=Спринт, ноябрь,goal=Цель,sequence=1]',
+            'com.atlassian.greenhopper.service.sprint.Sprint@1bf75fd[id=1,rapidViewId=1,state=CLOSED,name=Спринт, ноябрь,goal=Цель,startDate=2026-11-01T12:00:00.000+00:00,sequence=1]',
           ],
         })] });
       }
@@ -149,7 +149,9 @@ test('Data Center requests preserve the Jira context path and use offset paging 
   assert.equal(graph.issues[0]?.parentKey, 'APP-2');
   assert.equal(graph.issues[0]?.epicKey, 'APP-2');
   assert.deepEqual(graph.issues[0]?.sprints, ['Спринт, ноябрь']);
-  assert.deepEqual(graph.issues[0]?.sprintDetails, [{ id: '1', name: 'Спринт, ноябрь', state: 'closed' }]);
+  assert.deepEqual(graph.issues[0]?.sprintDetails, [{
+    id: '1', name: 'Спринт, ноябрь', state: 'closed', startDate: '2026-11-01T12:00:00.000+00:00',
+  }]);
   assert.equal(graph.issues[1]?.isEpic, true);
   assert.deepEqual(graph.edges[0], { id: 'parent:APP-2:APP-1', source: 'APP-2', target: 'APP-1', label: 'Родительская задача', kind: 'parent' });
   assert.match(graph.warnings.join(' '), /типов связей/);
@@ -407,6 +409,95 @@ test('issue suggestions treat the search as text and return only plain distinct 
   assert.equal(calls, 1);
 });
 
+test('scoped Cloud project options page visible boards and sprints and enrich issue sprint metadata', async (t) => {
+  const cloudId = '12345678-abcd-abcd-abcd-1234567890ab';
+  const startDate = '2026-11-01T12:00:00.000Z';
+  const sprint = { id: 30, name: 'Sprint 30', state: 'active', startDate };
+  mockFetch(t, (url, init) => {
+    if (url.pathname === '/_edge/tenant_info') return json({ cloudId });
+    assert.equal(url.origin, 'https://api.atlassian.com');
+    assert.equal(new Headers(init.headers).get('Authorization'), basic);
+    assert.ok(url.pathname.startsWith(`/ex/jira/${cloudId}/rest/`));
+    const path = url.pathname.slice(`/ex/jira/${cloudId}`.length);
+    const startAt = Number(url.searchParams.get('startAt'));
+    switch (path) {
+      case '/rest/api/3/myself': return profile();
+      case '/rest/api/3/project/APP/statuses': return json([
+        { id: '10001', name: 'Task', statuses: [{ id: '1', name: 'Open' }, { id: 2, name: 'Done' }] },
+        { id: 10002, name: 'Bug', statuses: [{ id: 1, name: 'Open' }] },
+      ]);
+      case '/rest/api/3/project/APP/versions': return json([{ id: '10020', name: '2.0' }]);
+      case '/rest/agile/1.0/board': {
+        assert.equal(url.searchParams.get('projectKeyOrId'), 'APP');
+        return startAt === 0 ? json({ startAt, isLast: false, values: [{ id: 51, type: 'scrum' }, { id: 52, type: 'kanban' }] })
+          : json({ startAt: 2, isLast: true, values: [{ id: '53', type: 'simple' }] });
+      }
+      case '/rest/agile/1.0/board/51/sprint':
+        return startAt === 0 ? json({ startAt, isLast: false, values: [sprint] })
+          : json({ startAt: 1, isLast: true, values: [{ id: 32, name: 'Sprint 32', state: 'future' }] });
+      case '/rest/agile/1.0/board/53/sprint':
+        return json({ isLast: true, values: [{ id: '30', name: 'Sprint 30' }] });
+      case '/rest/api/3/field': return json([{ id: 'customfield_10020', name: 'Sprint' }]);
+      case '/rest/api/3/issueLinkType': return json({ issueLinkTypes: [] });
+      case '/rest/api/3/search/jql': return json({ isLast: true, issues: [rawIssue('APP-1', { customfield_10020: [30] })] });
+      default: assert.fail(`Unexpected Jira URL ${path}`);
+    }
+  });
+  const { client } = await connectJira({ ...cloud, scopedToken: true }, () => {});
+  const options = await client.getProjectFilterOptions('APP');
+  assert.deepEqual(options, {
+    statuses: [{ id: '1', name: 'Open' }, { id: '2', name: 'Done' }],
+    issueTypes: [{ id: '10001', name: 'Task' }, { id: '10002', name: 'Bug' }],
+    versions: [{ id: '10020', name: '2.0' }],
+    sprints: [{ ...sprint, id: '30' }, { id: '32', name: 'Sprint 32', state: 'future' }],
+  });
+  const graph = await client.loadGraph({ jql: 'project = APP', depth: 0 });
+  assert.deepEqual(graph.issues[0]?.sprintDetails, [{ ...sprint, id: '30' }]);
+  assert.deepEqual(graph.issues[0]?.sprints, ['Sprint 30']);
+});
+
+test('Data Center project filters retain core options when Jira Software is unavailable', async (t) => {
+  let agileAvailable = true;
+  mockFetch(t, (url, init) => {
+    assert.equal(new Headers(init.headers).get('Authorization'), `Bearer ${cloud.token}`);
+    switch (url.pathname) {
+      case '/jira/rest/api/2/myself': return json({ displayName: 'Jira User', key: 'JIRAUSER10100', name: 'jira-user' });
+      case '/jira/rest/api/2/project/APP/statuses': return json([{ id: '10001', name: 'Task', statuses: [{ id: '1', name: 'Open' }] }]);
+      case '/jira/rest/api/2/project/APP/versions': return json([{ id: '10020', name: '2.0' }]);
+      case '/jira/rest/agile/1.0/board':
+        assert.equal(url.searchParams.get('projectKeyOrId'), 'APP');
+        return agileAvailable ? json({ total: 1, values: [{ id: 42, type: 'scrum' }] }) : json({}, 404);
+      case '/jira/rest/agile/1.0/board/42/sprint':
+        return json({ total: 1, values: [{ id: 12, name: 'Sprint 12', state: 'CLOSED', startDate: '2026-11-01T12:00:00.000Z' }] });
+      default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+    }
+  });
+  const session = createApiSession();
+  const getConnection = { method: 'getConnection', input: null };
+  assert.deepEqual(await session.invoke(getConnection), { ok: true, data: null });
+  assert.equal((await session.invoke({
+    method: 'connect', input: { ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' },
+  })).ok, true);
+  assert.deepEqual(await session.invoke(getConnection), { ok: true, data: {
+    connection: { url: 'https://jira.example.com/jira', displayName: 'Jira User', profileId: 'JIRAUSER10100' }, edition: 'data-center',
+  } });
+  const action = { method: 'getProjectFilterOptions', input: { project: 'APP' } };
+  const data = {
+    statuses: [{ id: '1', name: 'Open' }], issueTypes: [{ id: '10001', name: 'Task' }],
+    versions: [{ id: '10020', name: '2.0' }],
+  };
+  assert.deepEqual(await session.invoke(action), { ok: true, data: {
+    ...data, sprints: [{ id: '12', name: 'Sprint 12', state: 'closed', startDate: '2026-11-01T12:00:00.000Z' }],
+  } });
+  agileAvailable = false;
+  assert.deepEqual(await session.invoke(action), { ok: true, data: {
+    ...data, sprints: [], unavailable: ['sprints'],
+  } });
+  assert.equal((await session.invoke({ ...action, input: { project: '../APP' } })).ok, false);
+  await session.invoke({ method: 'disconnect', input: null });
+  assert.deepEqual(await session.invoke(getConnection), { ok: true, data: null });
+});
+
 test('Data Center project listing uses the session PAT and propagates Jira permissions', async (t) => {
   let forbidden = false;
   mockFetch(t, (url, init) => {
@@ -545,6 +636,50 @@ test('Cloud graph notes read all pages and refuse to delete comments outside the
   assert.deepEqual(methods, [
     `GET ${path}`, `GET ${path}`, `POST ${path}`, `GET ${path}/2`, `GET ${path}/4`, `DELETE ${path}/4`,
   ]);
+});
+
+test('note updates preserve Jira comment visibility and use the correct body format for each edition', async (t) => {
+  const writes: string[] = [];
+  let refused = false;
+  mockFetch(t, (url, init) => {
+    if (url.pathname.endsWith('/myself')) return profile();
+    const cloudNote = url.pathname.startsWith('/rest/api/3/');
+    const prefix = cloudNote ? '/rest/api/3' : '/jira/rest/api/2';
+    const id = url.pathname.endsWith('/1') ? '1' : '2';
+    assert.equal(url.pathname, `${prefix}/issue/APP-1/comment/${id}`);
+    const visibility = { type: 'role', value: 'Developers', ...(cloudNote ? { identifier: '10000' } : {}) };
+    if (init.method === 'GET') {
+      const lines = id === '1' ? [noteMarker, 'Old note'] : ['Ordinary comment', noteMarker];
+      return json({ ...rawComment(id, cloudNote ? adf(...lines) : lines.join('\n')), visibility });
+    }
+    assert.equal(init.method, 'PUT');
+    assert.equal(id, '1');
+    writes.push(prefix);
+    if (refused) return json({ errorMessages: ['No Edit Own Comments permission'] }, 403);
+    const body = cloudNote ? adf(noteMarker, 'Updated note', 'Second line') : `${noteMarker}\nUpdated note\nSecond line`;
+    assert.deepEqual(JSON.parse(String(init.body)), { body, visibility });
+    return json({ ...rawComment(id, body), visibility });
+  });
+  const cloudSession = createApiSession();
+  const dcSession = createApiSession();
+  assert.equal((await cloudSession.invoke({ method: 'connect', input: cloud })).ok, true);
+  assert.equal((await dcSession.invoke({ method: 'connect', input: {
+    ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira',
+  } })).ok, true);
+  const action = { method: 'updateNote', input: { key: 'APP-1', id: '1', text: ' Updated note\r\nSecond line ' } };
+  const expected = { ok: true, data: {
+    id: '1', text: 'Updated note\nSecond line', author: 'Jira User', createdAt: '2026-11-11T12:00:00.000Z',
+  } };
+  assert.deepEqual(await cloudSession.invoke(action), expected);
+  assert.deepEqual(await dcSession.invoke(action), expected);
+  const ordinary = await cloudSession.invoke({ ...action, input: { ...action.input, id: '2' } });
+  assert.equal(ordinary.ok ? null : ordinary.status, 409);
+  const invalid = await dcSession.invoke({ ...action, input: { ...action.input, text: ' ' } });
+  assert.equal(invalid.ok ? null : invalid.status, 400);
+  refused = true;
+  const denied = await dcSession.invoke(action);
+  assert.equal(denied.ok ? null : denied.status, 403);
+  assert.deepEqual(writes, ['/rest/api/3', '/jira/rest/api/2', '/jira/rest/api/2']);
 });
 
 test('graph note discovery batches keys and reads comments only for matching visible issues', async (t) => {

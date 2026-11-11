@@ -1,4 +1,4 @@
-import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition } from '../shared/contracts.js';
+import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition, RestoredJiraConnection } from '../shared/contracts.js';
 import { connectJira, JiraError, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
@@ -104,6 +104,7 @@ export function parseJiraCredentials(value: unknown): JiraCredentials {
 function parseRequest(value: unknown): ApiRequest {
   const { method, input: raw } = object(value, 'Request');
   if (method === 'disconnect' && raw === null) return { method, input: null };
+  if (method === 'getConnection' && raw === null) return { method, input: null };
   if (method === 'listProjects' && raw === null) return { method, input: null };
   if (method === 'listSavedFilters' && raw === null) return { method, input: null };
   const input = object(raw, 'Input');
@@ -134,6 +135,8 @@ function parseRequest(value: unknown): ApiRequest {
         projectKey: identifier(input.projectKey, 'Project'),
         issueTypeId: optionalIdentifier(input.issueTypeId, 'Issue type'),
       } };
+    case 'getProjectFilterOptions':
+      return { method, input: { project: identifier(input.project, 'Project') } };
     case 'createIssue':
       return { method, input: {
         projectKey: identifier(input.projectKey, 'Project'),
@@ -174,6 +177,12 @@ function parseRequest(value: unknown): ApiRequest {
         key: identifier(input.key, 'Issue key'),
         text: text(input.text, 'Note', MAX_NOTE_LENGTH).trim(),
       } };
+    case 'updateNote':
+      return { method, input: {
+        key: identifier(input.key, 'Issue key'),
+        id: identifier(input.id, 'Note id'),
+        text: text(input.text, 'Note', MAX_NOTE_LENGTH).trim(),
+      } };
     case 'deleteNote':
       return { method, input: {
         key: identifier(input.key, 'Issue key'),
@@ -197,7 +206,7 @@ function failure(error: unknown): ApiResponse {
   return { ok: false, error: 'The Jira request failed.', status: 500 };
 }
 
-type JiraOperation = Exclude<ApiRequest, { method: 'connect' | 'disconnect' }>;
+type JiraOperation = Exclude<ApiRequest, { method: 'connect' | 'disconnect' | 'getConnection' }>;
 
 async function execute(client: JiraClient, request: JiraOperation): Promise<unknown> {
   switch (request.method) {
@@ -207,12 +216,14 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'updateIssue': return client.updateIssue(request.input);
     case 'createLink': return client.createLink(request.input);
     case 'listProjects': return client.listProjects();
+    case 'getProjectFilterOptions': return client.getProjectFilterOptions(request.input.project);
     case 'suggestIssues': return client.suggestIssues(request.input.query);
     case 'getAssigneeAvatar': return client.getAssigneeAvatar(request.input.key);
     case 'listSavedFilters': return client.listSavedFilters();
     case 'listGraphNotes': return client.listGraphNotes(request.input.keys);
     case 'listNotes': return client.listNotes(request.input.key);
     case 'createNote': return client.createNote(request.input.key, request.input.text);
+    case 'updateNote': return client.updateNote(request.input.key, request.input.id, request.input.text);
     case 'deleteNote':
       await client.deleteNote(request.input.key, request.input.id);
       return null;
@@ -224,11 +235,13 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
 
 export function createApiSession(validateSite: ValidateSite = validateJiraSite) {
   let client: JiraClient | undefined;
+  let connection: RestoredJiraConnection | null = null;
   let generation = 0;
 
   function disconnect(): void {
     generation++;
     client = undefined;
+    connection = null;
   }
 
   function connectedClient(): JiraClient {
@@ -247,6 +260,7 @@ export function createApiSession(validateSite: ValidateSite = validateJiraSite) 
       disconnect();
       return { ok: true, data: null };
     }
+    if (request.method === 'getConnection') return { ok: true, data: connection };
     if (request.method === 'connect') disconnect();
     const started = generation;
     try {
@@ -254,6 +268,7 @@ export function createApiSession(validateSite: ValidateSite = validateJiraSite) 
         const result = await connectJira(request.input, validateSite);
         if (started === generation) {
           client = result.client;
+          connection = { connection: result.connection, edition: request.input.edition };
           return { ok: true, data: result.connection };
         }
       } else {

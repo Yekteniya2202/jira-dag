@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   appendJqlClauses, emptyGraphFilters, filterGraph, highlightedIssueKeys, issueFacetOptions, jiraFacetClause,
-  noFacetValue, queryIssueFacetOptions, scopeJql, sprintFacetLabels,
+  manualJiraFacetValue, noFacetValue, projectJiraFacetValues, queryIssueFacetOptions, scopeJql, selectedSprintIds, sprintFacetLabels,
 } from '../renderer/filter-model.js';
 import type { JiraGraph, JiraIssue } from '../shared/contracts.js';
 
@@ -75,13 +75,15 @@ test('cross-epic and edge-type filtering does not introduce links to hidden issu
   assert.deepEqual(internal.edges, []);
 });
 
-test('scope presets quote names and switch to the Data Center Epic Link field', () => {
-  assert.equal(scopeJql('epic', 'APP-9'), '(key = "APP-9" OR parentEpic = "APP-9")');
-  assert.equal(scopeJql('epic', 'APP-9', 'data-center'), '(key = "APP-9" OR "Epic Link" = "APP-9")');
-  assert.equal(scopeJql('label', 'x" OR labels = "other'), String.raw`labels = "x\" OR labels = \"other"`);
+test('direct query fields quote literals and handle issue hierarchy on both Jira editions', () => {
+  assert.equal(jiraFacetClause('epic', ['APP-9'], 'cloud'), '(key = "APP-9" OR parentEpic = "APP-9")');
+  assert.equal(jiraFacetClause('epic', ['APP-9'], 'data-center'), '(key = "APP-9" OR "Epic Link" = "APP-9")');
+  assert.equal(jiraFacetClause('subtaskParent', ['APP-9', 'APP-10'], 'cloud'),
+    '(key in ("APP-9", "APP-10") OR (parent in ("APP-9", "APP-10") AND issuetype in subtaskIssueTypes()))');
+  assert.equal(jiraFacetClause('key', ['APP-9', 'APP-10'], 'cloud'), 'key in ("APP-9", "APP-10")');
+  assert.equal(jiraFacetClause('labels', ['x" OR labels = "other'], 'cloud'), String.raw`labels = "x\" OR labels = \"other"`);
   assert.equal(scopeJql('saved', '10001'), 'filter = 10001');
-  assert.equal(scopeJql('sprint', 'Sprint 24'), 'sprint = "Sprint 24"');
-  assert.equal(scopeJql('mine', ''), 'assignee = currentUser()');
+  assert.equal(scopeJql('project', 'APP'), 'project = "APP"');
   assert.equal(scopeJql('project', 'A\nB'), '');
 });
 
@@ -126,5 +128,37 @@ test('sprint IDs separate duplicate names and counters exclude expanded and pinn
     { value: 'id:30', count: 1 }, { value: 'id:31', count: 1 },
   ]);
   assert.deepEqual(sprintFacetLabels(issues), new Map([['id:30', 'Sprint 30 · #30'], ['id:31', 'Sprint 30 · #31']]));
+  assert.deepEqual(selectedSprintIds(['id:42', 'sprint 30'], issues), ['42', '30', '31']);
   assert.equal(jiraFacetClause('sprints', ['id:30', 'id:31', 'Sprint 29'], 'cloud'), 'sprint in (30, 31, "Sprint 29")');
+});
+
+test('project metadata produces query filters before a graph loads', () => {
+  const options = projectJiraFacetValues({
+    statuses: [{ id: '101', name: 'Review' }, { id: '102', name: 'Review' }],
+    issueTypes: [{ id: '10008', name: 'Story' }],
+    versions: [{ id: '24', name: '24' }],
+    sprints: [{ id: '30', name: 'Sprint 30' }],
+  });
+  assert.deepEqual(options.status, [
+    { value: 'id:101', name: 'Review', label: 'Review · #101' },
+    { value: 'id:102', name: 'Review', label: 'Review · #102' },
+  ]);
+  assert.equal(appendJqlClauses('', [scopeJql('project', 'APP'),
+    jiraFacetClause('status', [options.status![0].value], 'cloud'),
+    jiraFacetClause('issueType', [options.issueType![0].value], 'cloud'),
+    jiraFacetClause('fixVersions', [options.fixVersions![0].value], 'cloud'),
+    jiraFacetClause('sprints', [options.sprints![0].value], 'cloud'),
+  ]), 'project = "APP" AND status = 101 AND issuetype = 10008 AND fixVersion = 24 AND sprint = 30');
+});
+
+test('manual filter entry handles names and IDs without metadata', () => {
+  assert.equal(manualJiraFacetValue('epic', ' app-42 '), 'APP-42');
+  assert.equal(manualJiraFacetValue('key', 'APP-x'), '');
+  assert.equal(manualJiraFacetValue('subtaskParent', ' app-17 '), 'APP-17');
+  assert.equal(manualJiraFacetValue('sprints', ' 44 '), 'id:44');
+  assert.equal(manualJiraFacetValue('sprints', ' Sprint 44 '), 'Sprint 44');
+  assert.equal(jiraFacetClause('sprints', [manualJiraFacetValue('sprints', '44')], 'cloud'), 'sprint = 44');
+  assert.equal(jiraFacetClause('sprints', [manualJiraFacetValue('sprints', 'Sprint 44')], 'cloud'), 'sprint = "Sprint 44"');
+  assert.equal(manualJiraFacetValue('labels', ' 44 '), '44');
+  assert.equal(manualJiraFacetValue('labels', 'broken\nvalue'), '');
 });

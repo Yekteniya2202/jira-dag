@@ -164,6 +164,51 @@ test('sprint zones respect selected IDs and keep named, unscheduled, and externa
   assert.equal(new Set(['APP-1', 'APP-2', 'APP-3'].map((key) => groupOf(focused, key).appearance?.color)).size, 3);
 });
 
+test('sprint zones stay left to right in sprint order despite reverse edges and disconnected issues', () => {
+  const data = graph([
+    issue('EXT-1', { external: true }),
+    issue('APP-1', { sprints: ['Sprint 32'] }),
+    issue('APP-2', { sprintDetails: [{ id: '1599', name: 'Sprint 30' }] }),
+    issue('APP-3', { sprints: ['Sprint31'] }),
+    issue('APP-4', { sprintDetails: [{ id: '1599', name: 'Sprint 30' }] }),
+    issue('APP-5'),
+  ], [blocks('reverse', 'APP-1', 'APP-2'), blocks('within', 'APP-2', 'APP-4')]);
+  for (const direction of ['LR', 'TB'] as const) {
+    const layout = layoutWorkspace(data, direction, 'sprint', labels, CARD_HEIGHT, data, { noteKeys: new Set(['APP-2']) });
+    const groups = layout.zones.filter(({ kind }) => kind === 'group');
+    assert.deepEqual(groups.map(({ title }) => title), ['Sprint 30', 'Sprint31', 'Sprint 32', labels.unscheduledSprint, labels.externalSprint]);
+    assert.equal(layout.parts, 4);
+    assert.deepEqual(layout.visibleEdges, data.edges);
+    for (const [index, group] of groups.entries()) {
+      assert.equal(group.y, 0);
+      if (index > 0) assert.ok(group.x > groups[index - 1].x + groups[index - 1].width);
+    }
+    const card = position(layout, 'APP-2');
+    const successor = position(layout, 'APP-4');
+    const axis = direction === 'LR' ? 'x' : 'y';
+    assert.ok(card[axis] < successor[axis]);
+    const sticker = notePosition({ ...card, width: CARD_WIDTH, height: CARD_HEIGHT }, direction);
+    assert.ok(contains(groups[0], sticker, NOTE_WIDTH, NOTE_HEIGHT));
+  }
+});
+
+test('sprint order uses complete start dates and falls back deterministically when dates are unavailable', () => {
+  const dated = graph([
+    issue('APP-1', { sprintDetails: [{ id: '2', name: 'Sprint 2', startDate: '2026-11-14T08:00:00Z' }] }),
+    issue('APP-2', { sprintDetails: [{ id: '10', name: 'Sprint 10' }] }),
+    issue('APP-3', { sprintDetails: [{ id: '10', name: 'Sprint 10', startDate: '2026-11-01T08:00:00Z' }] }),
+  ], []);
+  const titles = (data: JiraGraph) => layoutWorkspace(data, 'LR', 'sprint', labels, CARD_HEIGHT).zones.map(({ title }) => title);
+  assert.deepEqual(titles(dated), ['Sprint 10', 'Sprint 2']);
+  assert.deepEqual(titles(graph(dated.issues.slice(0, 2), [])), ['Sprint 2', 'Sprint 10']);
+  assert.deepEqual(titles(graph([
+    issue('APP-1', { sprintDetails: [{ id: '10', name: 'Alpha' }] }),
+    issue('APP-2', { sprintDetails: [{ id: '2', name: 'Zeta' }] }),
+    issue('APP-3', { sprints: ['Release 10'] }),
+    issue('APP-4', { sprints: ['Release 2'] }),
+  ], [])), ['Zeta', 'Alpha', 'Release 2', 'Release 10']);
+});
+
 test('stickers fit next to their issues without covering adjacent cards or spilling out of their zones', () => {
   const data = graph([
     issue('APP-1', { isEpic: true }), issue('APP-2', { epicKey: 'APP-1' }), issue('APP-3', { epicKey: 'APP-1' }),
