@@ -188,11 +188,11 @@ export function highlightedIssueKeys(graph: JiraGraph, filters: HighlightFilters
   return new Set(matching.map(({ key }) => key));
 }
 
-export function filterGraph(graph: JiraGraph, filters: VisibilityFilters): JiraGraph {
+export function filterGraph(graph: JiraGraph, filters: VisibilityFilters, alwaysVisible?: ReadonlySet<string>): JiraGraph {
   if (filters.edgeTypes === undefined && !filters.hideExternal && !filters.hideIsolated && !filters.crossProject && !filters.crossEpic) {
     return graph;
   }
-  const issues = filters.hideExternal ? graph.issues.filter((issue) => !issue.external) : graph.issues;
+  const issues = filters.hideExternal ? graph.issues.filter(({ external, key }) => !external || alwaysVisible?.has(key)) : graph.issues;
   const byKey = new Map(issues.map((issue) => [issue.key, issue]));
   const edgeTypes = filters.edgeTypes && new Set(filters.edgeTypes);
   const edges = graph.edges.filter((edge) => {
@@ -206,7 +206,7 @@ export function filterGraph(graph: JiraGraph, filters: VisibilityFilters): JiraG
 
   if (!filters.hideIsolated) return { ...graph, issues, edges };
   const connected = new Set(edges.flatMap(({ source, target }) => [source, target]));
-  return { ...graph, issues: issues.filter(({ key }) => connected.has(key)), edges };
+  return { ...graph, issues: issues.filter(({ key }) => connected.has(key) || alwaysVisible?.has(key)), edges };
 }
 
 function jqlLiteral(value: string): string {

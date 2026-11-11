@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
 import { downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
-import { assigneeInitials, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
+import { assigneeInitials, blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
 import './graph-canvas.css';
 
@@ -28,6 +28,7 @@ type Card = Node<{
   direction: Direction;
   muted: boolean;
   highlighted?: boolean;
+  analysisMatch?: boolean;
   fields: CardFields;
   noteCount?: number;
   onOpen?: (issue: JiraIssue) => void;
@@ -41,6 +42,7 @@ type Zone = Node<{
   onOpen?: (issue: JiraIssue) => void;
   onCreateRelated?: (issue: JiraIssue) => void;
   selected: boolean;
+  analysisMatch?: boolean;
 }, 'zone'>;
 type Sticky = Node<{
   issueKey: string;
@@ -50,11 +52,11 @@ type Sticky = Node<{
   onOpen(key: string, focusInput: boolean): void;
 }, 'note'>;
 type CanvasNode = Card | Zone | Sticky;
-type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: boolean; cycle: boolean; points?: number }, 'jiraLink'>;
+type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: boolean; cycle: boolean; analysisMatch?: boolean; points?: number }, 'jiraLink'>;
 
 function IssueCard({ data, selected }: NodeProps<Card>) {
   const { language, t } = usePreferences();
-  const { issue, direction, muted, highlighted, fields, onOpen, onNote, noteCount, onCreateRelated } = data;
+  const { issue, direction, muted, highlighted, analysisMatch, fields, onOpen, onNote, noteCount, onCreateRelated } = data;
   const across = direction === 'LR';
   const hours = issue.remainingEstimateSeconds ?? issue.originalEstimateSeconds;
   const assignee = fields.assignee && issue.assignee?.trim();
@@ -66,7 +68,7 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
   ].filter(Boolean).join(' · ');
   return (
     <div className={`issue-card tone-${statusTone(issue)} ${selected ? 'is-selected' : ''} ${muted ? 'is-muted' : ''} ${issue.external ? 'is-external' : ''}`}
-      data-filter-match={highlighted}>
+      data-filter-match={highlighted} data-analysis-match={analysisMatch}>
       <Handle type="target" position={across ? Position.Left : Position.Top} aria-label={t('Входящая зависимость', 'Incoming dependency')} />
       <div className="issue-card-key">
         <CheckSquare2 size={14} /><span>{issue.key}</span>
@@ -106,12 +108,12 @@ const groupIcons = {
   level: ListTree, 'open-level': ListTree, 'sprint-unscheduled': CalendarX2, 'sprint-external': Link2,
 };
 
-function GroupZone({ data: { zone, epic, onSelect, onOpen, onCreateRelated, selected } }: NodeProps<Zone>) {
+function GroupZone({ data: { zone, epic, onSelect, onOpen, onCreateRelated, selected, analysisMatch } }: NodeProps<Zone>) {
   const { t } = usePreferences();
   const GroupIcon = zone.appearance ? groupIcons[zone.appearance.variant] : zone.kind === 'nested' ? ClipboardList : Layers3;
   const title = <><GroupIcon size={15} aria-hidden="true" /><span>{zone.title}</span></>;
   return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`} data-export-zone={zone.id}
-    data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color}>
+    data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color} data-analysis-match={analysisMatch}>
     <div className="graph-zone-heading">
       {epic && onSelect
         ? <button type="button" className="graph-zone-title graph-zone-action nodrag nopan" title={zone.title}
@@ -169,8 +171,8 @@ function JiraLink({ id, source, target, data, sourceX, sourceY, targetX, targetY
       <BaseEdge
         id={id} path={path} markerEnd={markerEnd}
         style={{
-          stroke: data?.cycle ? 'var(--edge-cycle)' : active ? 'var(--edge-active)' : data?.hierarchy ? 'var(--edge-hierarchy)' : 'var(--edge-default)',
-          strokeWidth: active ? 2.3 : 1.6,
+          stroke: data?.cycle ? 'var(--edge-cycle)' : data?.analysisMatch ? 'var(--green)' : active ? 'var(--edge-active)' : data?.hierarchy ? 'var(--edge-hierarchy)' : 'var(--edge-default)',
+          strokeWidth: active || data?.analysisMatch ? 2.3 : 1.6,
           strokeDasharray: data?.hierarchy || data?.cycle ? '6 5' : undefined,
           opacity: muted ? 0.28 : 1,
         }}
@@ -208,6 +210,8 @@ interface Props {
   manualPositions: Readonly<Record<string, GraphPosition>>;
   viewport?: Viewport;
   highlightedKeys?: ReadonlySet<string>;
+  analysisKeys?: ReadonlySet<string>;
+  analysisNavigation?: readonly string[];
   preferredSprintIds?: readonly string[];
   onSelectIssue(key?: string): void;
   onSelectEdge(id: string): void;
@@ -216,12 +220,14 @@ interface Props {
   onCreateRelated?(issue: JiraIssue): void;
   onManualPositionsChange(positions: Record<string, GraphPosition>): void;
   onViewportChange(viewport: Viewport): void;
+  onAnalysisNavigationEnd(keys: readonly string[]): void;
   onConnect: OnConnect;
 }
 
 export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
-  notesByIssue, manualPositions, viewport, highlightedKeys, preferredSprintIds, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated,
-  onManualPositionsChange, onViewportChange, onConnect }: Props) {
+  notesByIssue, manualPositions, viewport, highlightedKeys, analysisKeys, analysisNavigation, preferredSprintIds,
+  onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated, onManualPositionsChange,
+  onViewportChange, onAnalysisNavigationEnd, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
   const [dragPositions, setDragPositions] = useState<Record<string, GraphPosition>>({});
@@ -252,6 +258,8 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     return layout.visibleEdges.filter(({ id }) => edgeIds.has(id));
   }, [graph, layout.visibleEdges, layoutGraph]);
   const estimates = useMemo(() => showLinks && showEdgePoints ? downstreamPoints(graph) : undefined, [graph, showLinks, showEdgePoints]);
+  const highlightedEdges = useMemo(() => analysisKeys && new Set(blockingEdges(graph)
+    .filter(({ source, target }) => analysisKeys.has(source) && analysisKeys.has(target)).map(({ id }) => id)), [analysisKeys, graph]);
   const basisIssues = useMemo(() => new Map(basis.issues.map((issue) => [issue.key, issue])), [basis.issues]);
   const lanes = useMemo(() => {
     const groups = new Map<string, string[]>();
@@ -283,6 +291,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
       ariaLabel: `${issue.key} ${issue.summary}`,
       data: {
         issue, direction, fields, noteCount: notesByIssue[issue.key]?.length, highlighted: highlightedKeys?.has(issue.key),
+        analysisMatch: analysisKeys?.has(issue.key),
         onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined, onCreateRelated,
         muted: !highlightedKeys?.has(issue.key) && Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
       },
@@ -293,6 +302,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     data: {
       zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
       selected: Boolean(zone.epicKey && zone.epicKey === selectedKey), onSelect: onSelectIssue,
+      analysisMatch: zone.epicKey ? analysisKeys?.has(zone.epicKey) : undefined,
       onOpen: connected ? onOpenIssue : undefined, onCreateRelated,
     },
     width: zone.width, height: zone.height, zIndex: zone.kind === 'nested' ? -1 : -2,
@@ -321,21 +331,43 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
       (trace.downstream.has(edge.source) && trace.downstream.has(edge.target))
     ));
     const cycle = cycleIds.has(edge.id);
-    const color = cycle ? '#dc5265' : active ? (theme === 'light' ? '#684bc5' : '#ab99ff') : (theme === 'light' ? '#697389' : '#9094b0');
+    const analysisMatch = highlightedEdges?.has(edge.id);
+    const color = cycle ? '#dc5265' : analysisMatch ? (theme === 'light' ? '#176747' : '#71dfb8')
+      : active ? (theme === 'light' ? '#684bc5' : '#ab99ff') : (theme === 'light' ? '#697389' : '#9094b0');
     return {
       id: edge.id, source: edge.source, target: edge.target, label: edge.label, zIndex: 1,
       type: 'jiraLink', selected: edge.id === selectedEdge,
       markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color },
       data: { offset: lanes.get(edge.id) ?? 0, hierarchy: edge.kind === 'parent', active,
-        muted: Boolean(trace && !active), cycle, points: estimates?.get(edge.id) },
+        muted: Boolean(trace && !active && !analysisMatch), cycle, analysisMatch, points: estimates?.get(edge.id) },
     };
   }) : [];
 
   useEffect(() => {
-    if (viewport) return;
+    if (viewport || analysisNavigation) return;
     const id = requestAnimationFrame(() => void flow.fitView({ padding: 0.14, maxZoom: 1.05, duration: 240 }));
     return () => cancelAnimationFrame(id);
-  }, [flow, layout, viewport]);
+  }, [flow, layout, viewport, analysisNavigation]);
+
+  useEffect(() => {
+    if (!analysisNavigation?.length) return;
+    let current = true;
+    const frame = requestAnimationFrame(() => {
+      const keys = new Set(analysisNavigation);
+      const nodes = flow.getNodes().filter((node) => (node.type === 'issue' && keys.has(node.id)) ||
+        (node.type === 'zone' && node.data.zone.epicKey && keys.has(node.data.zone.epicKey)));
+      if (!nodes.length) {
+        onAnalysisNavigationEnd(analysisNavigation);
+        return;
+      }
+      void flow.fitView({ nodes, padding: 0.22, maxZoom: 1.05, duration: 220 }).then((fitted) => {
+        if (!current) return;
+        if (fitted) onViewportChange(flow.getViewport());
+        onAnalysisNavigationEnd(analysisNavigation);
+      });
+    });
+    return () => { current = false; cancelAnimationFrame(frame); };
+  }, [analysisNavigation, flow, onAnalysisNavigationEnd, onViewportChange]);
 
   const onNodesChange: OnNodesChange<CanvasNode> = (changes) => {
     const selection = changes.find((change) => change.type === 'select' && change.selected);

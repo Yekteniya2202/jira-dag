@@ -20,6 +20,7 @@ import type {
   JiraSavedFilter,
   JiraSprint,
 } from '../shared/contracts.js';
+import { isBlockingType } from '../shared/jira-links.js';
 
 type JsonObject = Record<string, unknown>;
 type IssueRef = { key: string; fields?: JsonObject };
@@ -185,6 +186,7 @@ export class JiraClient {
     const issues = new Map(initial.issues.map((issue) => [issue.key, issue]));
     const edges = new Map<string, JiraEdge>();
     const linkTypes = new Map<string, JiraLinkType>();
+    const unloadedBlockers = new Map<string, Set<string>>();
     for (const type of list(record(configuredLinkTypes).issueLinkTypes).flatMap(toLinkType)) {
       linkTypes.set(type.id, type);
     }
@@ -209,7 +211,16 @@ export class JiraClient {
       for (const issue of frontier) {
         for (const link of list(issue.fields?.issuelinks).flatMap(toRawLink)) {
           const other = link.outwardIssue ?? link.inwardIssue;
-          if (!other || !remember(other)) continue;
+          if (!other) continue;
+          if (!remember(other)) {
+            const category = record(record(other.fields?.status).statusCategory);
+            if (!link.outwardIssue && isBlockingType(link.type) && category.key !== 'done') {
+              const keys = unloadedBlockers.get(issue.key) ?? new Set<string>();
+              keys.add(other.key);
+              unloadedBlockers.set(issue.key, keys);
+            }
+            continue;
+          }
           linkTypes.set(link.type.id, link.type);
           edges.set(link.id, toEdge(issue.key, other.key, link));
         }
@@ -246,8 +257,11 @@ export class JiraClient {
     }
 
     const graphEdges = [...edges.values()];
-    const graphIssues = [...issues.values()].map((issue) =>
-      this.toIssue(issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key)));
+    const graphIssues = [...issues.values()].map((issue) => {
+      const data = this.toIssue(issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key));
+      const keys = unloadedBlockers.get(issue.key);
+      return keys ? { ...data, unloadedBlockerKeys: [...keys] } : data;
+    });
     addIssueHierarchy(graphIssues, graphEdges);
     return {
       issues: graphIssues,
@@ -686,6 +700,8 @@ export class JiraClient {
     const fields = issue.fields ?? {};
     const status = record(fields.status);
     const issueType = record(fields.issuetype);
+    const assignee = record(fields.assignee);
+    const assigneeId = this.edition === 'cloud' ? string(assignee.accountId) : string(assignee.key) ?? string(assignee.name);
     const epic = issueType.hierarchyLevel === 1 || ['epic', 'эпик'].includes(string(issueType.name)?.toLowerCase() ?? '');
     const parent = toRef(fields.parent)[0] ??
       [...this.knownHierarchyFields].flatMap((field) => toRef(fields[field]))[0];
@@ -709,7 +725,8 @@ export class JiraClient {
       status: string(status.name) ?? (stub ? 'Вне выборки' : 'Неизвестен'),
       statusCategory: string(record(status.statusCategory).key),
       issueType: string(issueType.name),
-      assignee: string(record(fields.assignee).displayName),
+      assignee: string(assignee.displayName),
+      ...(assigneeId ? { assigneeId } : {}),
       project: string(record(fields.project).key) ?? issue.key.replace(/-\d+$/, ''),
       storyPoints: typeof storyPoints === 'number' ? storyPoints : undefined,
       description: typeof description === 'string' ? description : adfText(description),

@@ -43,6 +43,7 @@ export interface JiraIssue {
   statusCategory?: string;
   issueType?: string;
   assignee?: string;
+  assigneeId?: string;
   project?: string;
   storyPoints?: number;
   description?: string;
@@ -50,6 +51,7 @@ export interface JiraIssue {
   descriptionReadOnly?: true;
   url: string;
   external?: boolean;
+  unloadedBlockerKeys?: string[];
   labels?: string[];
   parentKey?: string;
   epicKey?: string;

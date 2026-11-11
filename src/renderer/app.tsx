@@ -5,6 +5,7 @@ import {
   GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Settings2, Trash2, X,
 } from 'lucide-react';
 import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraGraphNote, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
+import { defaultAnalysisSettings } from './analysis-settings';
 import { errorMessage, IssueCreationUnconfirmed, openIssue, request, RequestError, restoreDesktopConnection } from './api';
 import { makeDemoGraph } from './demo';
 import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
@@ -13,7 +14,7 @@ import { GraphFilterPanel, GraphProjectFilters } from './filters';
 import { GraphCanvas, type CardFields } from './graph-canvas';
 import { exportGraph, type GraphExportFormat } from './graph-export';
 import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
-import { assigneeInitials, blockersFor, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
+import { assigneeInitials, blockersFor, blockingEdges, isBlockingType, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { GraphNotes, type NoteFocus } from './graph-notes';
 import { localizeMessage, PreferenceControls, usePreferences } from './i18n';
 import { PanelSplitter } from './panel-splitter';
@@ -28,18 +29,34 @@ import {
 const emptyGraph: JiraGraph = { issues: [], edges: [], linkTypes: [], storyPointsFields: [], warnings: [] };
 const demoQuery = 'project in (MIG, OPS) ORDER BY key ASC';
 const DescriptionDialog = lazy(() => import('./description-dialog'));
+const AnalysisPanel = lazy(() => import('./analysis-panel').then(({ AnalysisPanel }) => ({ default: AnalysisPanel })));
 
 type Notice = { text: string; error?: boolean; retry?: JiraLinkInput; automatic?: boolean };
 type Modal = { kind: 'create'; source?: JiraIssue } |
   { kind: 'link'; source: string; target: string } | { kind: 'edit'; issue: JiraIssue } |
-  { kind: 'description'; issue: JiraIssue } | { kind: 'delete'; edge: JiraEdge };
+  { kind: 'description'; issue: JiraIssue } | { kind: 'delete'; edge: JiraEdge } | { kind: 'analysis' };
 
 const issueKey = /^[A-Z][A-Z0-9_]*-\d+$/i;
 
-function restrictGraph(graph: JiraGraph, keys: ReadonlySet<string>): JiraGraph {
+function restrictGraph(graph: JiraGraph, keys: ReadonlySet<string>, retainOutsideBlockers = false): JiraGraph {
+  const issues = graph.issues.filter(({ key }) => keys.has(key));
+  if (retainOutsideBlockers) {
+    const completed = new Set(graph.issues.filter((issue) => statusTone(issue) === 'done').map(({ key }) => key));
+    const omitted = new Map<string, Set<string>>();
+    for (const { source, target } of blockingEdges(graph)) {
+      if (keys.has(source) || !keys.has(target) || completed.has(source)) continue;
+      const blockers = omitted.get(target) ?? new Set<string>();
+      blockers.add(source);
+      omitted.set(target, blockers);
+    }
+    for (const [index, issue] of issues.entries()) {
+      const blockers = omitted.get(issue.key);
+      if (blockers) issues[index] = { ...issue, unloadedBlockerKeys: [...new Set([...(issue.unloadedBlockerKeys ?? []), ...blockers])] };
+    }
+  }
   return {
     ...graph,
-    issues: graph.issues.filter(({ key }) => keys.has(key)),
+    issues,
     edges: graph.edges.filter(({ source, target }) => keys.has(source) && keys.has(target)),
   };
 }
@@ -303,6 +320,12 @@ function GraphWorkspace({
   const [viewport, setViewport] = useState<StoredViewport | undefined>(initialState?.viewport);
   const [autoRefresh, setAutoRefresh] = useState(initialState?.autoRefresh ?? false);
   const [refreshMinutes, setRefreshMinutes] = useState<RefreshMinutes>(initialState?.refreshMinutes ?? 5);
+  const [analysis, setAnalysis] = useState(initialState?.analysis ?? defaultAnalysisSettings);
+  const [analysisHighlight, setAnalysisHighlight] = useState(initialState?.analysisHighlight);
+  const [analysisReveal, setAnalysisReveal] = useState<string>();
+  const [analysisNavigation, setAnalysisNavigation] = useState<readonly string[]>();
+  const finishAnalysisNavigation = useCallback((keys: readonly string[]) =>
+    setAnalysisNavigation((current) => current === keys ? undefined : current), []);
   const needsRestore = useRef(Boolean(initialState?.applied || initialState?.includedKeys?.length));
   const loadingQuery = useRef(false);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
@@ -323,9 +346,9 @@ function GraphWorkspace({
     [baseJql, projectKey, jiraFacets, depth, storyField]);
   const snapshot = useMemo<TabSnapshot>(() => ({
     draft, applied, includedKeys, filters, groupMode, fields, showEdgePoints, focusMode, direction, selectedKey, selectedEdge,
-    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes,
+    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes, analysis, analysisHighlight,
   }), [draft, applied, includedKeys, filters, groupMode, fields, showEdgePoints, focusMode, direction, selectedKey, selectedEdge,
-    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes]);
+    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes, analysis, analysisHighlight]);
   useEffect(() => onSave(tabId, snapshot), [onSave, tabId, snapshot]);
 
   const filterStoryField = storyField || (graph.storyPointsFields.length === 1 ? graph.storyPointsFields[0].id : undefined);
@@ -337,16 +360,26 @@ function GraphWorkspace({
   const { search, facets, edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic } = filters;
   const visibility = useMemo(() => ({ edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic }),
     [edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic]);
-  const filtered = useMemo(() => filterGraph(graph, visibility), [graph, visibility]);
+  const analysisKeys = useMemo(() => {
+    if (!analysisHighlight?.length) return undefined;
+    const highlightedKeys = new Set(analysisHighlight);
+    const keys = graph.issues.filter(({ key }) => highlightedKeys.has(key)).map(({ key }) => key);
+    return keys.length ? new Set(keys) : undefined;
+  }, [analysisHighlight, graph.issues]);
+  const alwaysVisible = useMemo(() => {
+    if (!analysisReveal) return analysisKeys;
+    return new Set([...(analysisKeys ?? []), analysisReveal]);
+  }, [analysisKeys, analysisReveal]);
+  const filtered = useMemo(() => filterGraph(graph, visibility, alwaysVisible), [graph, visibility, alwaysVisible]);
   const highlighted = useMemo(() => highlightedIssueKeys(graph, { search, facets }), [graph, search, facets]);
   const showLinks = edgeTypes?.length !== 0;
   const shown = useMemo(() => {
     if (!selectedKey || focusMode === 'all' || !filtered.issues.some(({ key }) => key === selectedKey)) return filtered;
-    const keys = new Set([selectedKey]);
+    const keys = new Set([selectedKey, ...(alwaysVisible ?? [])]);
     if (focusMode !== 'downstream') for (const key of tracePath(filtered.edges, selectedKey, 'up')) keys.add(key);
     if (focusMode !== 'upstream') for (const key of tracePath(filtered.edges, selectedKey, 'down')) keys.add(key);
     return restrictGraph(filtered, keys);
-  }, [filtered, focusMode, selectedKey]);
+  }, [filtered, focusMode, selectedKey, alwaysVisible]);
   const visibleIssueKeys = shown.issues.map(({ key }) => key).join(',');
   const layoutGraph = useMemo(() => restrictGraph(graph, new Set(visibleIssueKeys.split(','))), [graph, visibleIssueKeys]);
   const selected = graph.issues.find(({ key }) => key === selectedKey);
@@ -381,17 +414,34 @@ function GraphWorkspace({
   }
 
   function selectIssue(key?: string) {
+    setAnalysisReveal(undefined);
     setSelectedEdge(undefined);
     setSelectedKey(key);
     setNoteFocus(undefined);
     if (!key) setFocusMode('all');
   }
   function selectEdge(id: string) {
+    setAnalysisReveal(undefined);
     setRightHidden(false);
     setSelectedKey(undefined);
     setSelectedEdge(id);
     setNoteFocus(undefined);
     setFocusMode('all');
+  }
+  function focusAnalysisIssue(key: string) {
+    selectIssue(key);
+    setFocusMode('all');
+    setRightHidden(false);
+    setAnalysisReveal(key);
+    setAnalysisNavigation([key]);
+  }
+  function highlightAnalysis(keys: readonly string[]) {
+    setAnalysisHighlight([...keys]);
+    setAnalysisNavigation(keys);
+  }
+  function clearAnalysisHighlight() {
+    setAnalysisHighlight(undefined);
+    setAnalysisNavigation(undefined);
   }
   function editJql(value: string) {
     setBaseJql(value);
@@ -449,7 +499,7 @@ function GraphWorkspace({
       let result = base;
       const roots = result.issues.filter(({ external }) => !external);
       if (additional) {
-        result = pinned ? mergeGraphs(result, queryDepth === 0 ? restrictGraph(pinned, new Set([...result.issues.map(({ key }) => key), ...pins])) : pinned) : {
+        result = pinned ? mergeGraphs(result, queryDepth === 0 ? restrictGraph(pinned, new Set([...result.issues.map(({ key }) => key), ...pins]), true) : pinned) : {
           ...result, warnings: [...result.warnings, t('Не удалось обновить добавленные вручную задачи.', 'Could not reload the manually included issues.')],
         };
       }
@@ -460,7 +510,11 @@ function GraphWorkspace({
       setIncludedKeys(pins);
       setGraph(result);
       setNoteRefresh((previous) => previous + 1);
-      if (options.replace) resetLayout();
+      if (options.replace) {
+        clearAnalysisHighlight();
+        setAnalysisReveal(undefined);
+        resetLayout();
+      }
       if (selectedKey && !result.issues.some(({ key }) => key === selectedKey)) selectIssue();
       if (selectedEdge && !result.edges.some(({ id }) => id === selectedEdge)) setSelectedEdge(undefined);
       if (options.automatic) setNotice((current) => current?.automatic ? undefined : current);
@@ -504,7 +558,7 @@ function GraphWorkspace({
     try {
       const result = await request('loadGraph', { jql: `key = "${key}"`, depth: Math.max(1, depth), storyPointsField: storyField || undefined });
       if (!result.issues.some((issue) => issue.key === key)) throw new Error(t('Задача не найдена или недоступна.', 'The issue was not found or is unavailable.'));
-      setGraph((previous) => mergeGraphs(previous, depth === 0 ? restrictGraph(result, new Set([...previous.issues.map((issue) => issue.key), key])) : result));
+      setGraph((previous) => mergeGraphs(previous, depth === 0 ? restrictGraph(result, new Set([...previous.issues.map((issue) => issue.key), key]), true) : result));
       setIncludedKeys((previous) => previous.includes(key) ? previous : [...previous, key]);
       setFocusMode('all');
       setRightHidden(false);
@@ -704,7 +758,9 @@ function GraphWorkspace({
           }}
           visibility={visibility} onVisibilityChange={(value) => setFilters((previous) => ({ ...previous, ...value }))}
           focusMode={focusMode} onFocusMode={setFocusMode} selected={Boolean(selected)}
-          connected={Boolean(connection)} busy={busy} onInclude={includeIssue} />
+          connected={Boolean(connection)} busy={busy} onInclude={includeIssue}
+          onAnalyze={graph.issues.length ? () => setModal({ kind: 'analysis' }) : undefined}
+          onClearAnalysis={analysisKeys ? clearAnalysisHighlight : undefined} />
           {graph.warnings.length > 0 && <details className="graph-warning">
             <summary><CircleAlert size={15} /> {t('Граф загружен с ограничениями', 'Graph loaded with limitations')} <ChevronDown size={14} /></summary>
             <ul>{graph.warnings.map((warning) => <li key={warning}>{localizeMessage(warning, language)}</li>)}</ul>
@@ -734,6 +790,7 @@ function GraphWorkspace({
             manualPositions={manualPositions} viewport={viewport}
             onManualPositionsChange={setManualPositions} onViewportChange={setViewport}
             preferredSprintIds={loadedSprintIds} highlightedKeys={highlighted}
+            analysisKeys={analysisKeys} analysisNavigation={analysisNavigation} onAnalysisNavigationEnd={finishAnalysisNavigation}
             selectedKey={selected?.key} selectedEdge={edge?.id} editable={Boolean(connection && !busy && graph.linkTypes.length)}
             onSelectIssue={selectIssue} onSelectEdge={selectEdge} onOpenIssue={launchIssue}
             onCreateRelated={busy ? undefined : addTask}
@@ -777,6 +834,10 @@ function GraphWorkspace({
       {modal?.kind === 'description' && <Suspense>
         <DescriptionDialog issue={modal.issue} onClose={() => setModal(undefined)} />
       </Suspense>}
+      {modal?.kind === 'analysis' && <Suspense>
+        <AnalysisPanel graph={graph} settings={analysis} onSettingsChange={setAnalysis}
+          onClose={() => setModal(undefined)} onFocusIssue={focusAnalysisIssue} onHighlight={highlightAnalysis} />
+      </Suspense>}
       {modal?.kind === 'link' && <LinkDialog source={modal.source} target={modal.target} types={graph.linkTypes}
         onLink={async (typeId) => { await link({ source: modal.source, target: modal.target, typeId }); setModal(undefined); }}
         onClose={() => setModal(undefined)} />}
@@ -796,7 +857,14 @@ function GraphWorkspace({
       }} />}
       {modal?.kind === 'delete' && <DeleteDialog edge={modal.edge} onClose={() => setModal(undefined)} onDelete={async () => {
         await request('deleteLink', { id: modal.edge.id });
-        setGraph((previous) => ({ ...previous, edges: previous.edges.filter(({ id }) => id !== modal.edge.id) }));
+        setGraph((previous) => {
+          const { id, source, target, typeId } = modal.edge;
+          const next = { ...previous, edges: previous.edges.filter((edge) => edge.id !== id) };
+          if (!isBlockingType(previous.linkTypes.find((type) => type.id === typeId)) ||
+              blockingEdges(next).some((edge) => edge.source === source && edge.target === target)) return next;
+          return { ...next, issues: next.issues.map((issue) => issue.key === target && issue.unloadedBlockerKeys?.includes(source)
+            ? { ...issue, unloadedBlockerKeys: issue.unloadedBlockerKeys.filter((key) => key !== source) } : issue) };
+        });
         setSelectedEdge(undefined);
         setModal(undefined);
         setNotice({ text: t('Связь удалена из Jira.', 'Link deleted from Jira.') });

@@ -263,6 +263,8 @@ select { padding-right: 6px; }
 .view-control, .view-switch {
   display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px;
 }
+.graph-analysis-controls { display: inline-flex; align-items: center; gap: 3px; }
+.graph-analysis-controls > .button { min-height: 28px; padding: 4px 8px; white-space: nowrap; }
 .view-control select { width: auto; min-width: 0; padding: 4px 6px; font-size: 12px; }
 .view-switch input { margin: 0; accent-color: var(--primary); }
 .view-menu { position: relative; font-size: 12px; }

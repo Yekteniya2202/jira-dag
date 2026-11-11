@@ -1,4 +1,7 @@
 import type { JiraEdge, JiraGraph, JiraIssue, JiraLinkType } from '../shared/contracts.js';
+import { isBlockingType } from '../shared/jira-links.js';
+
+export { isBlockingType };
 
 export const CARD_WIDTH = 240;
 export const CARD_HEIGHT = 112;
@@ -13,12 +16,6 @@ export function statusTone(issue: JiraIssue): 'done' | 'active' | 'waiting' {
   if (issue.statusCategory === 'done') return 'done';
   if (issue.statusCategory === 'indeterminate' || issue.statusCategory === 'in-progress') return 'active';
   return 'waiting';
-}
-
-export function isBlockingType(type?: JiraLinkType): boolean {
-  return Boolean(type && (
-    /^blocks?$/i.test(type.name) || /^blocks?$/i.test(type.outward) || /^блокирует$/i.test(type.outward)
-  ));
 }
 
 export function tracePath(edges: JiraEdge[], initial: string, direction: 'up' | 'down'): Set<string> {

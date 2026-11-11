@@ -32,6 +32,8 @@ test('workspace restores applied and draft queries, graph view and refresh per t
     showEdgePoints: true, focusMode: 'upstream', direction: 'TB', selectedKey: 'APP-27', selectedEdge: undefined,
     leftWidth: 300, rightWidth: 280, leftHidden: true, rightHidden: false, viewport: { x: -200, y: 35, zoom: 1.5 },
     manualPositions: { 'APP-27': { x: 15, y: 20 } }, autoRefresh: true, refreshMinutes: 1,
+    analysis: { capacity: '25', people: [{ id: 'member-a', name: 'Developer', capacity: '10' }], strategy: 'fit' },
+    analysisHighlight: ['APP-27'],
   };
   assert.ok(saveWorkspace(store, scope, { activeTab: 8, tabs: [{ id: 1, state }, { id: 8 }] }));
   const restored = readWorkspace(store, workspaceScope({ ...connection, displayName: 'Renamed' }, 'cloud'));

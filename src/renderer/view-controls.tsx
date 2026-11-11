@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { Columns3, Focus, GitBranch, Layers3, LoaderCircle, Plus, Search } from 'lucide-react';
+import { ChartNoAxesCombined, Columns3, Focus, GitBranch, Layers3, LoaderCircle, Plus, Search, X } from 'lucide-react';
 import type { JiraGraph, JiraIssueSuggestion } from '../shared/contracts';
 import { request } from './api';
 import { edgeFacetOptions, hierarchyEdgeType, type GraphFilters } from './filter-model';
@@ -44,6 +44,8 @@ interface ViewControlsProps extends LinkVisibilityProps {
   connected: boolean;
   busy: boolean;
   onInclude(key: string): Promise<void>;
+  onAnalyze?(): void;
+  onClearAnalysis?(): void;
 }
 
 function groupOptions(t: Translate): Record<GroupMode, string> {
@@ -63,7 +65,7 @@ function groupOptions(t: Translate): Record<GroupMode, string> {
 
 export function GraphViewControls({
   groupMode, onGroupMode, fields, onFields, showLinks, showEdgePoints, onShowEdgePoints,
-  focusMode, onFocusMode, selected, connected, busy, onInclude, ...linkVisibility
+  focusMode, onFocusMode, selected, connected, busy, onInclude, onAnalyze, onClearAnalysis, ...linkVisibility
 }: ViewControlsProps) {
   const { t } = usePreferences();
   const fieldOptions: Record<keyof CardFields, string> = {
@@ -82,6 +84,13 @@ export function GraphViewControls({
   };
 
   return <div className="graph-viewbar" role="group" aria-label={t('Вид графа', 'Graph view')}>
+    <div className="graph-analysis-controls">
+      <button type="button" className="button secondary" aria-haspopup="dialog" disabled={busy || !onAnalyze} onClick={onAnalyze}>
+        <ChartNoAxesCombined size={15} aria-hidden="true" /> {t('Анализ графа', 'Graph analysis')}
+      </button>
+      {onClearAnalysis && <button type="button" className="icon-button" title={t('Снять подсветку анализа', 'Clear analysis highlighting')}
+        aria-label={t('Снять подсветку анализа', 'Clear analysis highlighting')} onClick={onClearAnalysis}><X size={14} /></button>}
+    </div>
     <label className="view-control">
       <Layers3 size={14} aria-hidden="true" />
       <span>{t('Группировка', 'Group by')}</span>

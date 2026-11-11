@@ -77,6 +77,7 @@ test('Cloud search preserves link direction, convergent links, hierarchy, zero p
           })] });
           return json({ isLast: true, issues: [rawIssue('APP-2', {
             customfield_14000: 3,
+            assignee: { accountId: 'developer-2', displayName: 'Jira developer' },
             parent: rawIssue('APP-4'),
             issuelinks: [
               { id: '200', type: blocks, inwardIssue: rawIssue('APP-1') },
@@ -109,12 +110,42 @@ test('Cloud search preserves link direction, convergent links, hierarchy, zero p
     { id: 'parent:APP-4:APP-2', source: 'APP-4', target: 'APP-2', label: 'Родительская задача' },
   ]);
   assert.deepEqual(graph.warnings, []);
+  assert.equal(graph.issues[1]?.assigneeId, 'developer-2');
+  assert.equal(graph.issues[1]?.unloadedBlockerKeys, undefined);
   const selection = await client.loadGraph({ jql: 'project = APP', depth: 0 });
   assert.deepEqual(selection.issues.map(({ key, external }) => ({ key, external })), [
     { key: 'APP-1', external: false }, { key: 'APP-2', external: false },
   ]);
   assert.deepEqual(selection.edges.map(({ id }) => id), ['200']);
+  assert.deepEqual(selection.issues[1]?.unloadedBlockerKeys, ['EXT-3']);
   assert.deepEqual(externalJql, ['key in ("EXT-3", "APP-4")']);
+});
+
+test('query-only graph records open inward blockers without adding their cards or arrows', async (t) => {
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/rest/api/3/myself': return profile();
+      case '/rest/api/3/field': return json([]);
+      case '/rest/api/3/issueLinkType': return json({ issueLinkTypes: [blocks, reviews] });
+      case '/rest/api/3/search/jql':
+        assert.equal(JSON.parse(String(init.body)).jql, 'key = APP-1');
+        return json({ isLast: true, issues: [rawIssue('APP-1', {
+          issuelinks: [
+            { id: '201', type: blocks, inwardIssue: rawIssue('EXT-2') },
+            { id: '202', type: blocks, inwardIssue: rawIssue('EXT-3', { status: { statusCategory: { key: 'done' } } }) },
+            { id: '203', type: blocks, outwardIssue: rawIssue('EXT-4') },
+            { id: '204', type: reviews, inwardIssue: rawIssue('EXT-5') },
+          ],
+        })] });
+      default: assert.fail(`Unexpected Jira URL ${url.pathname}`);
+    }
+  });
+  const { client } = await connectJira(cloud, () => {});
+  const graph = await client.loadGraph({ jql: 'key = APP-1', depth: 0 });
+  assert.deepEqual(graph.issues.map(({ key, unloadedBlockerKeys }) => ({ key, unloadedBlockerKeys })), [
+    { key: 'APP-1', unloadedBlockerKeys: ['EXT-2'] },
+  ]);
+  assert.deepEqual(graph.edges, []);
 });
 
 test('Data Center requests preserve the Jira context path and use offset paging and PAT', async (t) => {
@@ -133,6 +164,7 @@ test('Data Center requests preserve the Jira context path and use offset paging 
         offsets.push(query.startAt);
         assert.ok(query.fields.includes('customfield_10003'));
         return json({ total: 2, issues: [query.startAt ? rawIssue('APP-2') : rawIssue('APP-1', {
+          assignee: { key: 'DEV1000', name: 'developer', displayName: 'Jira developer' },
           customfield_10002: 'APP-2',
           customfield_10003: [
             'com.atlassian.greenhopper.service.sprint.Sprint@1bf75fd[id=1,rapidViewId=1,state=CLOSED,name=Спринт, ноябрь,goal=Цель,startDate=2026-11-01T12:00:00.000+00:00,sequence=1]',
@@ -146,6 +178,7 @@ test('Data Center requests preserve the Jira context path and use offset paging 
   const graph = await client.loadGraph({ jql: 'project = APP', depth: 0 });
   assert.deepEqual(offsets, [0, 1]);
   assert.equal(graph.issues[0]?.url, 'https://jira.example.com/jira/browse/APP-1');
+  assert.equal(graph.issues[0]?.assigneeId, 'DEV1000');
   assert.equal(graph.issues[0]?.parentKey, 'APP-2');
   assert.equal(graph.issues[0]?.epicKey, 'APP-2');
   assert.deepEqual(graph.issues[0]?.sprints, ['Спринт, ноябрь']);

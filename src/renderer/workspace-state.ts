@@ -1,4 +1,5 @@
 import type { JiraConnection, JiraEdition } from '../shared/contracts.js';
+import type { AnalysisSettings } from './analysis-settings.js';
 import { graphFacets, type GraphFilters } from './filter-model.js';
 import type { GroupMode } from './graph-layout.js';
 import type { Direction, GraphPosition } from './graph-model.js';
@@ -42,6 +43,8 @@ export interface TabSnapshot {
   manualPositions: Record<string, GraphPosition>;
   autoRefresh: boolean;
   refreshMinutes: RefreshMinutes;
+  analysis?: AnalysisSettings;
+  analysisHighlight?: string[];
 }
 
 export type WorkspaceTab = { id: number; query?: string; project?: string; state?: Partial<TabSnapshot> };
@@ -120,6 +123,23 @@ function position(value: unknown): GraphPosition | undefined {
   return x !== undefined && y !== undefined ? { x, y } : undefined;
 }
 
+function analysisSettings(value: unknown): AnalysisSettings | undefined {
+  const data = record(value);
+  const capacity = text(data.capacity, 32);
+  if (capacity === undefined) return undefined;
+  const seen = new Set<string>();
+  const people = Array.isArray(data.people) ? data.people.slice(0, 1500).flatMap((item) => {
+    const row = record(item);
+    const id = text(row.id, 320);
+    const name = text(row.name, 256);
+    if (!id?.trim() || !name?.trim() || seen.has(id)) return [];
+    seen.add(id);
+    return [{ id, name, capacity: text(row.capacity, 32) ?? '' }];
+  }) : [];
+  const strategy = oneOf(['unblock', 'priority', 'fit'] as const, data.strategy);
+  return { capacity, people, ...(strategy ? { strategy } : {}) };
+}
+
 function tabSnapshot(value: unknown): Partial<TabSnapshot> | undefined {
   const data = record(value);
   const draft = queryDraft(data.draft);
@@ -128,6 +148,7 @@ function tabSnapshot(value: unknown): Partial<TabSnapshot> | undefined {
   const fields = record(data.fields);
   const viewport = position(data.viewport);
   const zoom = coordinate(record(data.viewport).zoom);
+  const analysis = analysisSettings(data.analysis);
   return {
     draft, applied: appliedQuery(data.applied), includedKeys: texts(data.includedKeys).filter((key) => issueKey.test(key)),
     filters: {
@@ -151,6 +172,9 @@ function tabSnapshot(value: unknown): Partial<TabSnapshot> | undefined {
     })),
     autoRefresh: data.autoRefresh === true,
     refreshMinutes: oneOf(refreshIntervals, data.refreshMinutes),
+    ...(analysis ? { analysis } : {}),
+    ...(Array.isArray(data.analysisHighlight)
+      ? { analysisHighlight: texts(data.analysisHighlight).filter((key) => issueKey.test(key)) } : {}),
   };
 }
 

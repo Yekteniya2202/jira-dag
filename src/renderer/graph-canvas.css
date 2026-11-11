@@ -27,6 +27,10 @@
 }
 .issue-card[data-filter-match='false']:not(.is-selected) { opacity: .38; }
 .issue-card[data-filter-match='true'] { outline: 2px solid var(--accent); outline-offset: 3px; }
+.issue-card[data-analysis-match='false']:not(.is-selected):not([data-filter-match='true']) { opacity: .48; }
+.issue-card[data-analysis-match='true'], .graph-zone[data-analysis-match='true'] {
+  opacity: 1; outline: 2px solid var(--green); outline-offset: 3px;
+}
 
 .issue-card-create {
   display: inline-grid;

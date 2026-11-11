@@ -65,5 +65,10 @@ export function makeDemoGraph(t: Translate): JiraGraph {
       label: t('Родительская задача', 'Parent issue'), kind: 'parent',
     }] : []),
   ];
-  return { issues, edges, linkTypes: [blocks], storyPointsFields: [], warnings: [] };
+  return {
+    issues: issues.map((issue) => ({
+      ...issue, assigneeId: issue.assignee === database ? 'demo:data' : 'demo:platform',
+    })),
+    edges, linkTypes: [blocks], storyPointsFields: [], warnings: [],
+  };
 }
