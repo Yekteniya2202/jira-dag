@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MarkerType, MiniMap,
   Position, ReactFlow, useReactFlow,
-  type Edge, type EdgeProps, type Node, type NodeProps, type OnConnect, type OnNodesChange,
+  type Edge, type EdgeProps, type Node, type NodeHandle, type NodeProps, type OnConnect, type OnNodesChange,
 } from '@xyflow/react';
 import { ArrowRight, ArrowUpRight, CheckSquare2, CircleDot, GitBranch, Layers3, MessageSquarePlus } from 'lucide-react';
 import type { JiraGraph, JiraIssue } from '../shared/contracts';
@@ -147,6 +147,14 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
   const flow = useReactFlow<CanvasNode, Link>();
   const [positions, setPositions] = useState<Record<string, GraphPosition>>({});
   const cardHeight = CARD_HEIGHT + (fields.assignee || fields.priority || fields.labels || fields.dueDate || fields.estimate ? 21 : 0);
+  const across = direction === 'LR';
+  // The cards have fixed dimensions. Keep edge anchors available even before the DOM observer runs.
+  const handles: NodeHandle[] = [
+    { id: null, type: 'target', position: across ? Position.Left : Position.Top,
+      x: across ? 0 : CARD_WIDTH / 2, y: across ? cardHeight / 2 : 0, width: 0, height: 0 },
+    { id: null, type: 'source', position: across ? Position.Right : Position.Bottom,
+      x: across ? CARD_WIDTH : CARD_WIDTH / 2, y: across ? cardHeight / 2 : cardHeight, width: 0, height: 0 },
+  ];
   const layout = useMemo(() => layoutWorkspace(graph, direction, groupMode, {
     component: t('Связанный фрагмент', 'Connected component'),
     emptyGroup: t('Без значения', 'Unassigned'),
@@ -181,6 +189,7 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
     id: issue.key, type: 'issue',
     position: (groupMode === 'none' ? positions[issue.key] : undefined) ?? layout.positions.get(issue.key) ?? { x: 0, y: 0 },
     width: CARD_WIDTH, height: cardHeight, zIndex: 2,
+    measured: { width: CARD_WIDTH, height: cardHeight }, handles,
     selected: issue.key === selectedKey,
     ariaLabel: `${issue.key} ${issue.summary}`,
     data: {
@@ -192,6 +201,7 @@ export function GraphCanvas({ graph, basis, direction, groupMode, fields, showEd
   const zones: Zone[] = layout.zones.map((zone) => ({
     id: zone.id, type: 'zone', data: { zone }, position: { x: zone.x, y: zone.y },
     width: zone.width, height: zone.height, zIndex: zone.kind === 'nested' ? -1 : -2,
+    measured: { width: zone.width, height: zone.height },
     selectable: false, focusable: false, draggable: false, connectable: false, style: { pointerEvents: 'none' },
   }));
   const visibleKeys = new Set(cards.map(({ id }) => id));
