@@ -230,7 +230,7 @@ export function App() {
         onPin={(id, pinned) => setTabs((previous) => setWorkspaceTabPinned(previous, id, pinned))}
         onMove={(id, target, side) => setTabs((previous) => moveWorkspaceTab(previous, id, target, side))} />
       <div className="topbar-actions">
-        <SettingsButton />
+        <SettingsButton restartBlocked={restoring || disconnecting || busyTabs.length > 0} />
         <details className="view-menu workspace-menu">
           <summary aria-label={t('Рабочая область', 'Workspace')} title={t('Рабочая область', 'Workspace')}><LayoutGrid size={16} /></summary>
           <div>

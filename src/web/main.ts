@@ -5,7 +5,9 @@ import { extname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JiraError } from '../server/jira.js';
 import { createApiSession, validateJiraSite } from '../server/session.js';
+import { checkRelease } from '../server/update-release.js';
 import type { ApiResponse } from '../shared/contracts.js';
+import type { UpdateCheckResult } from '../shared/updates.js';
 
 const maxBodyBytes = 512 * 1024;
 const idleTimeout = 30 * 60 * 1_000;
@@ -162,6 +164,7 @@ export function createWebServer(options: WebOptions) {
   const origins = acceptedOrigins(options);
   const allowedSites = jiraAllowlist(options.allowedSites);
   const sessions = new Map<string, StoredSession>();
+  let updateLookup: { promise: Promise<UpdateCheckResult>; expires: number } | undefined;
 
   function newSession() {
     return createApiSession(url => {
@@ -180,7 +183,7 @@ export function createWebServer(options: WebOptions) {
     }
   }
 
-  async function handleRpc(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  function requireJsonPost(request: IncomingMessage, response: ServerResponse): string {
     if (request.method !== 'POST') {
       response.setHeader('Allow', 'POST');
       throw new HttpError(405, 'Use POST for this API.');
@@ -190,6 +193,30 @@ export function createWebServer(options: WebOptions) {
     if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) {
       throw new HttpError(415, 'Use application/json.');
     }
+    return origin;
+  }
+
+  async function handleUpdate(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    requireJsonPost(request, response);
+    if (await readBody(request) !== null) throw new HttpError(400, 'Use null for the update check.');
+    const now = Date.now();
+    if (!updateLookup || updateLookup.expires <= now) {
+      const promise = readFile(new URL('../../../package.json', import.meta.url), 'utf8').then((contents) => {
+        const manifest = JSON.parse(contents) as { version: string };
+        return checkRelease(manifest.version);
+      });
+      updateLookup = { promise, expires: now + 60_000 };
+      void promise.then((result) => {
+        if (result.status === 'error' && updateLookup?.promise === promise) updateLookup.expires = now + 5_000;
+      }).catch(() => {
+        if (updateLookup?.promise === promise) updateLookup.expires = now + 5_000;
+      });
+    }
+    respond(response, { ok: true, data: await updateLookup.promise });
+  }
+
+  async function handleRpc(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const origin = requireJsonPost(request, response);
     const body = await readBody(request);
     const method = typeof body === 'object' && body !== null && 'method' in body ? body.method : undefined;
     const secure = origin.startsWith('https:');
@@ -223,6 +250,8 @@ export function createWebServer(options: WebOptions) {
       const path = new URL(request.url ?? '/', 'http://localhost').pathname;
       if (path === '/api/rpc') {
         await handleRpc(request, response);
+      } else if (path === '/api/update') {
+        await handleUpdate(request, response);
       } else if (request.method === 'GET' || request.method === 'HEAD') {
         await serveAsset(path, options.rendererDirectory, response, request.method === 'HEAD');
       } else {

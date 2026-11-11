@@ -76,7 +76,7 @@ const pointsLabelHeight = 37;
 
 function arrowhead(route: RoutedEdge): string | undefined {
   const { arrowTip: tip, points } = route;
-  const previous = points.at(-2);
+  const previous = route.arrowFrom ?? points.at(-2);
   if (!previous) return undefined;
   const length = Math.hypot(tip.x - previous.x, tip.y - previous.y);
   if (!length) return undefined;
@@ -509,7 +509,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
   }
 
   return (
-    <div className="canvas" data-show-links={showLinks}
+    <div className="canvas" data-show-links={showLinks} data-can-connect={editable && showLinks}
       onPointerDownCapture={(event) => markMinimapMove(event.target)} onWheelCapture={(event) => markMinimapMove(event.target)}>
       {cards.length === 0 && zones.length === 0 ? <div className="empty-canvas">
         <GitBranch size={26} /><h2>{t('Задачи не найдены', 'No issues found')}</h2>

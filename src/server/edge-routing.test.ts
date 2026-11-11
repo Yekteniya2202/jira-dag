@@ -20,6 +20,18 @@ function crosses(a: RoutePoint, b: RoutePoint, box: RouteObstacle): boolean {
     Math.min(a.y, b.y) < box.y + box.height && Math.max(a.y, b.y) > box.y;
 }
 
+function chordCrosses(a: RoutePoint, b: RoutePoint, box: RouteObstacle): boolean {
+  const times = (start: number, end: number, low: number, high: number): [number, number] => {
+    if (start === end) return low < start && start < high ? [-Infinity, Infinity] : [Infinity, -Infinity];
+    const left = (low - start) / (end - start);
+    const right = (high - start) / (end - start);
+    return [Math.min(left, right), Math.max(left, right)];
+  };
+  const x = times(a.x, b.x, box.x, box.x + box.width);
+  const y = times(a.y, b.y, box.y, box.y + box.height);
+  return Math.max(0, x[0], y[0]) < Math.min(1, x[1], y[1]);
+}
+
 function assertClear(route: RoutedEdge | undefined, obstacles: readonly RouteObstacle[]): asserts route is RoutedEdge {
   assert.ok(route?.path);
   assert.ok(route.points.length >= 2);
@@ -27,8 +39,7 @@ function assertClear(route: RoutedEdge | undefined, obstacles: readonly RouteObs
   for (let i = 1; i < route.points.length; i++) {
     const a = route.points[i - 1];
     const b = route.points[i];
-    assert.ok(a.x === b.x || a.y === b.y);
-    assert.ok(obstacles.every((box) => !crosses(a, b, box)), `Segment ${i} crosses a card`);
+    assert.ok(obstacles.every((box) => !chordCrosses(a, b, box)), `Segment ${i} crosses a card`);
   }
 }
 
@@ -38,7 +49,35 @@ test('direct edges keep the shaft and tip outside their ports', () => {
   const edge = link('direct', source, target);
   const route = routeEdges('LR', [source, target], [edge]).get(edge.id);
   assertClear(route, [source, target]);
-  assert.deepEqual(route.points, [{ x: 105, y: 40 }, { x: 111, y: 40 }]);
+  assert.deepEqual(route.points, [{ x: 101, y: 40 }, { x: 123, y: 40 }]);
+  assert.deepEqual(route.arrowFrom, route.points[0]);
+});
+
+test('a clear staggered route is a single flowing cubic with an outward tangent at each port', () => {
+  const source = card('source', 0, 0);
+  const target = card('target', 370, 200);
+  const edge = link('slanted', source, target);
+  const route = routeEdges('LR', [source, target], [edge]).get(edge.id);
+  assertClear(route, [source, target]);
+  assert.match(route.path, /^M 101 40 C [\d.]+ 40 [\d.]+ 240 369 240$/);
+  assert.equal(route.arrowFrom?.y, route.arrowTip.y);
+  assert.ok(route.arrowFrom!.x < route.arrowTip.x);
+});
+
+test('a comparable arc can avoid an earlier crossing between independent edges', () => {
+  const earlier: RouteEdge = {
+    id: 'earlier', source: 'upper', target: 'middle',
+    sourcePoint: { x: 125, y: -52 }, targetPoint: { x: 190, y: 12 }, labelWidth: 0, labelHeight: 0,
+  };
+  const following: RouteEdge = {
+    id: 'following', source: 'left', target: 'right',
+    sourcePoint: { x: 0, y: 0 }, targetPoint: { x: 300, y: 0 }, labelWidth: 0, labelHeight: 0,
+  };
+  const original = routeEdges('LR', [], [following]).get(following.id);
+  const rerouted = routeEdges('LR', [], [earlier, following]).get(following.id);
+  assert.match(original!.path, /^M 1 0 L 299 0$/);
+  assert.match(rerouted!.path, /C/);
+  assert.ok(rerouted!.points.some(({ y }) => y >= 20));
 });
 
 test('routes search alternate corridors when a single detour still crosses an obstacle', () => {
@@ -55,8 +94,9 @@ test('routes search alternate corridors when a single detour still crosses an ob
   const route = routeEdges('LR', obstacles, [edge]).get(edge.id);
   assertClear(route, obstacles);
   assert.ok(route.points.length >= 6);
-  assert.deepEqual(route.arrowTip, { x: target.x - 13, y: 230 });
-  assert.ok(route.points.at(-2)!.x < route.arrowTip.x);
+  assert.match(route.path, /Q/);
+  assert.deepEqual(route.arrowTip, { x: target.x - 1, y: 230 });
+  assert.ok(route.arrowFrom!.x < route.arrowTip.x);
 });
 
 test('reverse and self edges stay outside endpoint cards and preserve arrow direction', () => {
@@ -68,8 +108,11 @@ test('reverse and self edges stay outside endpoint cards and preserve arrow dire
   for (const edge of edges) {
     const route = routes.get(edge.id);
     assertClear(route, obstacles);
-    assert.ok(route.points.at(-2)!.x < route.arrowTip.x);
+    assert.match(route.path, /[CQ]/);
+    assert.ok(route.arrowFrom!.x < route.arrowTip.x);
+    assert.equal(route.arrowFrom?.y, route.arrowTip.y);
   }
+  assert.match(routes.get('reverse')!.path, /C/);
 });
 
 test('vertical edges route past intervening cards and keep the arrow above the target handle', () => {
@@ -79,8 +122,9 @@ test('vertical edges route past intervening cards and keep the arrow above the t
   const edge = link('vertical', source, target, 'TB');
   const route = routeEdges('TB', obstacles, [edge]).get(edge.id);
   assertClear(route, obstacles);
-  assert.deepEqual(route.arrowTip, { x: 50, y: 387 });
-  assert.ok(route.points.at(-2)!.y < route.arrowTip.y);
+  assert.deepEqual(route.arrowTip, { x: 50, y: 399 });
+  assert.ok(route.arrowFrom!.y < route.arrowTip.y);
+  assert.equal(route.arrowFrom?.x, route.arrowTip.x);
 });
 
 test('top cards inside titled groups remain reachable on a vertical canvas', () => {
@@ -117,6 +161,8 @@ test('parallel labels fit outside cards and each other, with a leader when the l
     labelBounds.push(card(edge.id, left.x, left.y, edge.labelWidth, edge.labelHeight));
   }
   assert.equal(new Set([...routes.values()].map(({ path }) => path)).size, edges.length);
+  assert.ok(routes.get('lane--1')!.points.some(({ y }) => y <= 20));
+  assert.ok(routes.get('lane-1')!.points.some(({ y }) => y >= 60));
 });
 
 test('overlapping cards with an obscured port never produce an edge through a card', () => {
@@ -129,7 +175,7 @@ test('overlapping cards with an obscured port never produce an edge through a ca
   assert.deepEqual(route.points, []);
 });
 
-test('large orthogonal graphs route deterministically with populated corridors', () => {
+test('large graphs route deterministically with populated corridors', () => {
   const obstacles = Array.from({ length: 1_200 }, (_, i) => card(`node-${i}`, i % 40 * 240, Math.floor(i / 40) * 142));
   const edges = Array.from({ length: 360 }, (_, i) => {
     const row = i % 30;

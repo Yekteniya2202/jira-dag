@@ -1,8 +1,9 @@
 import type { ApiMethod, ApiMethods, ApiRequest, ApiResponse, JiraIssue, RestoredJiraConnection } from '../shared/contracts';
+import type { DesktopUpdaterBridge } from '../shared/updates';
 
 declare global {
   interface Window {
-    jiraDag?: {
+    jiraDag?: DesktopUpdaterBridge & {
       invoke(request: ApiRequest): Promise<ApiResponse>;
       restoreConnection(): Promise<ApiResponse<RestoredJiraConnection | null>>;
       openIssue(key: string): Promise<void>;

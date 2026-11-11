@@ -10,6 +10,11 @@ files:
   - '!**/*.test.js'
   - LICENSE
 artifactName: jira-dag-${version}-${arch}.${ext}
+publish:
+  provider: github
+  owner: Yekteniya2202
+  repo: jira-dag
+  private: false
 asar: true
 electronFuses:
   runAsNode: false

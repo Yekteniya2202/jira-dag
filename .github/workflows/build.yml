@@ -44,11 +44,14 @@ jobs:
       - name: Smoke test packaged Windows app
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
         run: |
+          if (!(Test-Path 'release/win-unpacked/resources/app-update.yml')) { throw 'Missing Windows update configuration' }
           $app = Start-Process -FilePath 'release/win-unpacked/Jira DAG.exe' -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
           exit $app.ExitCode
       - name: Smoke test packaged Linux app
         if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/')
-        run: xvfb-run -a release/linux-unpacked/jira-dag --smoke-test --no-sandbox
+        run: |
+          test -s release/linux-unpacked/resources/app-update.yml
+          xvfb-run -a release/linux-unpacked/jira-dag --smoke-test --no-sandbox
       - name: Package browser server
         if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -64,6 +67,8 @@ jobs:
             release/*.deb
             release/*.AppImage
             release/*.tar.gz
+            release/latest*.yml
+            release/*.blockmap
           if-no-files-found: error
 
   release:
@@ -88,7 +93,15 @@ jobs:
           shopt -s nullglob
           assets=(*.exe *.deb *.AppImage *.tar.gz)
           [[ ${#assets[@]} -eq 4 ]]
-          sha256sum -- "${assets[@]}" > SHA256SUMS
+          [[ -s latest.yml && -s latest-linux.yml ]]
+          version="${GITHUB_REF_NAME#v}"
+          tr -d '\r' < latest.yml | grep -Fqx "version: $version"
+          tr -d '\r' < latest-linux.yml | grep -Fqx "version: $version"
+          grep -Fq -- "jira-dag-$version-x64-setup.exe" latest.yml
+          grep -Fq -- "jira-dag-$version-x86_64.AppImage" latest-linux.yml
+          blockmaps=(*.exe.blockmap)
+          [[ ${#blockmaps[@]} -eq 1 ]]
+          sha256sum -- "${assets[@]}" latest.yml latest-linux.yml *.blockmap > SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         if: ${{ !github.event.repository.private }}
         with:

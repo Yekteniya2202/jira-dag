@@ -5,6 +5,7 @@ import {
   type IpcMainInvokeEvent,
 } from 'electron';
 import { createDesktopConnection, requireProtectedCiphertext } from './connection.js';
+import { createDesktopUpdateController, createNativeUpdateDriver } from './updates.js';
 
 const rendererDirectory = resolve(import.meta.dirname, '../../renderer');
 const productionUrl = 'jira-dag://app/';
@@ -58,14 +59,14 @@ async function serveRenderer(request: Request): Promise<Response> {
   }
 }
 
-function getJiraSession(event: IpcMainInvokeEvent) {
+function getAppWindow(event: IpcMainInvokeEvent) {
   const frame = event.senderFrame;
   if (currentWindow?.browser.webContents !== event.sender || !frame ||
       frame.parent !== null || frame.url.split('#')[0] !== rendererUrl) {
     throw new Error('Unrecognized Jira DAG window');
   }
 
-  return currentWindow.jira;
+  return currentWindow;
 }
 
 async function createWindow(): Promise<BrowserWindow> {
@@ -110,7 +111,8 @@ async function verifyRenderer(browser: BrowserWindow): Promise<void> {
     new Promise(resolve => {
       const ready = () => document.getElementById('root')?.firstElementChild &&
         typeof window.jiraDag?.invoke === 'function' && typeof window.jiraDag?.openIssue === 'function' &&
-        typeof window.jiraDag?.restoreConnection === 'function';
+        typeof window.jiraDag?.restoreConnection === 'function' &&
+        typeof window.jiraDag?.checkForUpdate === 'function' && typeof window.jiraDag?.onUpdateProgress === 'function';
       if (ready()) return resolve(true);
       const observer = new MutationObserver(() => {
         if (ready()) {
@@ -126,8 +128,9 @@ async function verifyRenderer(browser: BrowserWindow): Promise<void> {
   const displayedVersion = await browser.webContents.executeJavaScript("document.querySelector('.app-version')?.textContent");
   if (displayedVersion !== `v${app.getVersion()}`) throw new Error('The displayed version does not match the Electron package');
   const responds = await browser.webContents.executeJavaScript(
-    'Promise.all([window.jiraDag.invoke(null), window.jiraDag.restoreConnection()])' +
-      '.then(([invalid, restored]) => invalid.ok === false && restored.ok && restored.data === null)',
+    'Promise.all([window.jiraDag.invoke(null), window.jiraDag.restoreConnection(), window.jiraDag.installUpdate()])' +
+      '.then(([invalid, restored, update]) => invalid.ok === false && restored.ok && restored.data === null &&' +
+      'update.status === "not-available")',
   );
   if (!responds) throw new Error('Jira DAG IPC validation failed');
 }
@@ -137,19 +140,43 @@ app.whenReady().then(async () => {
   protocol.handle('jira-dag', serveRenderer);
   session.defaultSession.setPermissionCheckHandler(() => false);
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  ipcMain.handle('jira-dag:invoke', (event, request: unknown) => getJiraSession(event).invoke(request));
+  ipcMain.handle('jira-dag:invoke', (event, request: unknown) => getAppWindow(event).jira.invoke(request));
   ipcMain.handle('jira-dag:restore-connection', (event) => {
-    const jira = getJiraSession(event);
+    const { jira } = getAppWindow(event);
     return smokeTest ? { ok: true, data: null } : jira.restore();
   });
   ipcMain.handle('jira-dag:open-issue', async (event, key: unknown) => {
-    const url = new URL(getJiraSession(event).getIssueUrl(key));
+    const url = new URL(getAppWindow(event).jira.getIssueUrl(key));
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) {
       throw new Error('Invalid Jira issue URL');
     }
     await shell.openExternal(url.href);
   });
 
+  const updater = createDesktopUpdateController({
+    currentVersion: app.getVersion(),
+    native: createNativeUpdateDriver(app.isPackaged && !smokeTest, image => {
+      app.relaunch({ execPath: image });
+      setImmediate(() => app.quit());
+    }),
+    openExternal: url => shell.openExternal(url),
+    reportProgress: progress => {
+      const contents = currentWindow?.browser.webContents;
+      if (contents && !contents.isDestroyed()) contents.send('jira-dag:update-progress', progress);
+    },
+  });
+  ipcMain.handle('jira-dag:check-for-update', event => {
+    getAppWindow(event);
+    return updater.checkForUpdate();
+  });
+  ipcMain.handle('jira-dag:download-update', event => {
+    getAppWindow(event);
+    return updater.downloadUpdate();
+  });
+  ipcMain.handle('jira-dag:install-update', event => {
+    getAppWindow(event);
+    return updater.installUpdate();
+  });
   const browser = await createWindow();
   if (smokeTest) {
     await verifyRenderer(browser);

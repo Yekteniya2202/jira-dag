@@ -4,6 +4,7 @@ import { defaultAppearance, findFont, palettes } from './appearance';
 import { Dialog } from './dialogs';
 import { fontOptions } from './font-catalog';
 import { usePreferences } from './i18n';
+import { UpdateSettings, useAppUpdate } from './update-settings';
 import './themes.css';
 import './settings.css';
 
@@ -13,18 +14,21 @@ const fontKinds = [
   ['mono', 'Моноширинные', 'Monospace'],
 ] as const;
 
-export function SettingsButton() {
+export function SettingsButton({ restartBlocked }: { restartBlocked: boolean }) {
   const [open, setOpen] = useState(false);
+  const update = useAppUpdate();
   const { t } = usePreferences();
   const label = t('Настройки', 'Settings');
   return <>
     <button type="button" className="button secondary settings-trigger" aria-label={label} title={label} aria-haspopup="dialog"
       onClick={() => setOpen(true)}><Settings size={16} aria-hidden="true" /><span>{label}</span></button>
-    {open && <SettingsDialog onClose={() => setOpen(false)} />}
+    {open && <SettingsDialog update={update} restartBlocked={restartBlocked} onClose={() => setOpen(false)} />}
   </>;
 }
 
-function SettingsDialog({ onClose }: { onClose(): void }) {
+function SettingsDialog({ update, restartBlocked, onClose }: {
+  update: ReturnType<typeof useAppUpdate>; restartBlocked: boolean; onClose(): void;
+}) {
   const { appearance, language, t, setLanguage, updateAppearance, resetAppearance } = usePreferences();
   const name = useId();
   const custom = appearance.palette !== defaultAppearance.palette || appearance.font !== defaultAppearance.font ||
@@ -37,6 +41,7 @@ function SettingsDialog({ onClose }: { onClose(): void }) {
   });
   return <Dialog title={t('Настройки', 'Settings')} onClose={onClose} className="settings-dialog">
     <div className="settings-content">
+      <UpdateSettings update={update} restartBlocked={restartBlocked} />
       <fieldset className="settings-section">
         <legend>{t('Цветовая тема', 'Color theme')}</legend>
         {(['dark', 'light'] as const).map((theme) => <div className="settings-palette-group" key={theme}>

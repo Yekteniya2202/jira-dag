@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { test, type TestContext } from 'node:test';
 import { createApiSession } from '../server/session.js';
@@ -126,4 +127,46 @@ test('an in-flight login cannot reconnect a disconnected session', async t => {
   assert.ok(!graph.ok);
   assert.equal(graph.status, 401);
   assert.deepEqual(await session.invoke(connectionRequest), { ok: true, data: null });
+});
+
+test('web update checks require the application origin, cache results and link only to the official release', async (t) => {
+  const request = globalThis.fetch;
+  const origin = 'https://dag.example.com';
+  const releaseVersion = '99.0.1';
+  const archive = `jira-dag-web-${releaseVersion}.tar.gz`;
+  const manifest = JSON.parse(await readFile(new URL('../../../package.json', import.meta.url), 'utf8')) as { version: string };
+  const lookup = t.mock.method(globalThis, 'fetch', async (url: string) => {
+    assert.equal(url, 'https://api.github.com/repos/Yekteniya2202/jira-dag/releases/latest');
+    return Response.json({
+      tag_name: `v${releaseVersion}`,
+      draft: false,
+      prerelease: false,
+      assets: [{ name: archive, state: 'uploaded', size: 42, browser_download_url: 'https://example.com/untrusted' }],
+    });
+  });
+  const site = await listen(t, createWebServer({ port: 0, rendererDirectory: '.', publicOrigin: origin }));
+  const url = `${site}/api/update`;
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  assert.equal((await request(url)).status, 405);
+  assert.equal((await request(url, { method: 'POST', headers: { ...headers, Origin: 'https://untrusted.example.com' }, body: 'null' })).status, 403);
+  assert.equal((await request(url, { method: 'POST', headers: { Origin: origin }, body: 'null' })).status, 415);
+  assert.equal((await request(url, { method: 'POST', headers, body: '{}' })).status, 400);
+  assert.equal(lookup.mock.callCount(), 0);
+
+  const responses = await Promise.all(Array.from({ length: 3 }, () =>
+    request(url, { method: 'POST', headers, body: 'null' })));
+  const releases = 'https://github.com/Yekteniya2202/jira-dag/releases';
+  for (const response of responses) {
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('Set-Cookie'), null);
+    assert.deepEqual(await response.json(), { ok: true, data: {
+      status: 'available',
+      currentVersion: manifest.version,
+      version: releaseVersion,
+      mode: 'release',
+      releaseUrl: `${releases}/tag/v${releaseVersion}`,
+      webArchiveUrl: `${releases}/download/v${releaseVersion}/${archive}`,
+    } });
+  }
+  assert.equal(lookup.mock.callCount(), 1);
 });

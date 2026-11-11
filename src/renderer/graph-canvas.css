@@ -71,18 +71,24 @@
   pointer-events: none;
 }
 .graph-edge-label-leader { stroke-width: 1px; stroke-dasharray: 2 3; pointer-events: none; }
-.canvas .react-flow__handle { width: 14px; height: 14px; background: transparent; border: 0; }
+.canvas .react-flow__handle { width: 18px; height: 18px; background: transparent; border: 0; }
 .canvas .react-flow__handle::before {
   content: '';
   position: absolute;
-  inset: 4px;
+  inset: 5px;
   border: 1px solid var(--surface-deep);
   border-radius: 50%;
-  background: var(--edge-default);
-}
-.canvas .react-flow__handle:is(:hover, .connectingfrom, .connectingto, .valid)::before {
-  inset: 2px;
   background: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+}
+.canvas .react-flow__handle-left::before { transform: translateX(6px); }
+.canvas .react-flow__handle-right::before { transform: translateX(-6px); }
+.canvas .react-flow__handle-top::before { transform: translateY(6px); }
+.canvas .react-flow__handle-bottom::before { transform: translateY(-6px); }
+.canvas[data-can-connect='true'] .issue-card:is(:hover, :focus-within) .react-flow__handle::before,
+.canvas[data-can-connect='true'] .react-flow__handle:is(:hover, .connectingfrom, .connectingto)::before {
+  opacity: 1;
 }
 .canvas[data-show-links='false'] .react-flow__handle { visibility: hidden; }
 
