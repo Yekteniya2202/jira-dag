@@ -4,11 +4,15 @@ import {
   Position, ReactFlow, useReactFlow,
   type Edge, type EdgeProps, type Node, type NodeHandle, type NodeProps, type OnConnect, type OnNodesChange,
 } from '@xyflow/react';
-import { ArrowRight, ArrowUpRight, CheckSquare2, CircleDot, GitBranch, Layers3, MessageSquarePlus } from 'lucide-react';
-import type { JiraGraph, JiraIssue } from '../shared/contracts';
-import { downstreamPoints, layoutWorkspace, type GraphZone, type GroupMode } from './graph-layout';
+import {
+  ArrowRight, ArrowUpRight, CalendarDays, CalendarX2, CheckSquare2, CircleDot, ClipboardList, Flag,
+  FolderKanban, GitBranch, Layers3, Link2, ListTree, MessageSquarePlus, Package, Plus, StickyNote, UserRound,
+} from 'lucide-react';
+import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
+import { downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
 import { assigneeInitials, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
+import './graph-canvas.css';
 
 export interface CardFields {
   points: boolean;
@@ -23,24 +27,34 @@ type Card = Node<{
   issue: JiraIssue;
   direction: Direction;
   muted: boolean;
+  highlighted?: boolean;
   fields: CardFields;
   noteCount?: number;
   onOpen?: (issue: JiraIssue) => void;
-  onNote?: (key: string) => void;
+  onNote?: (key: string, focusInput: boolean) => void;
+  onCreateRelated?: (issue: JiraIssue) => void;
 }, 'issue'>;
 type Zone = Node<{
   zone: GraphZone;
   epic?: JiraIssue;
   onSelect?: (key: string) => void;
   onOpen?: (issue: JiraIssue) => void;
+  onCreateRelated?: (issue: JiraIssue) => void;
   selected: boolean;
 }, 'zone'>;
-type CanvasNode = Card | Zone;
+type Sticky = Node<{
+  issueKey: string;
+  note: JiraGraphNote;
+  count: number;
+  direction: Direction;
+  onOpen(key: string, focusInput: boolean): void;
+}, 'note'>;
+type CanvasNode = Card | Zone | Sticky;
 type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: boolean; cycle: boolean; points?: number }, 'jiraLink'>;
 
 function IssueCard({ data, selected }: NodeProps<Card>) {
   const { language, t } = usePreferences();
-  const { issue, direction, muted, fields, onOpen, onNote, noteCount } = data;
+  const { issue, direction, muted, highlighted, fields, onOpen, onNote, noteCount, onCreateRelated } = data;
   const across = direction === 'LR';
   const hours = issue.remainingEstimateSeconds ?? issue.originalEstimateSeconds;
   const assignee = fields.assignee && issue.assignee?.trim();
@@ -51,18 +65,20 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
     fields.estimate && hours !== undefined && `${new Intl.NumberFormat(language, { maximumFractionDigits: 1 }).format(hours / 3600)} ${t('ч', 'h')}`,
   ].filter(Boolean).join(' · ');
   return (
-    <div className={`issue-card tone-${statusTone(issue)} ${selected ? 'is-selected' : ''} ${muted ? 'is-muted' : ''} ${issue.external ? 'is-external' : ''}`}>
+    <div className={`issue-card tone-${statusTone(issue)} ${selected ? 'is-selected' : ''} ${muted ? 'is-muted' : ''} ${issue.external ? 'is-external' : ''}`}
+      data-filter-match={highlighted}>
       <Handle type="target" position={across ? Position.Left : Position.Top} aria-label={t('Входящая зависимость', 'Incoming dependency')} />
       <div className="issue-card-key">
         <CheckSquare2 size={14} /><span>{issue.key}</span>
-        {onNote && <button type="button" className="issue-card-note nodrag nopan" title={t('Заметки на графе', 'Graph notes')}
+        {onNote && <button type="button" className="issue-card-note nodrag nopan" title={t('Заметки на графе', 'Graph notes')} data-export-ignore
           aria-label={`${t('Заметки на графе', 'Graph notes')} ${issue.key}`}
-          onClick={(event) => { event.stopPropagation(); onNote(issue.key); }}>
+          onClick={(event) => { event.stopPropagation(); onNote(issue.key, true); }}>
           <MessageSquarePlus size={13} />{noteCount ? <span>{noteCount}</span> : null}
         </button>}
-        {onOpen && issue.url && <button type="button" className="issue-card-open nodrag nopan" title={t('Открыть в Jira', 'Open in Jira')}
+        {onOpen && issue.url && <button type="button" className="issue-card-open nodrag nopan" title={t('Открыть в Jira', 'Open in Jira')} data-export-ignore
           aria-label={`${t('Открыть в Jira', 'Open in Jira')} ${issue.key}`}
           onClick={(event) => { event.stopPropagation(); onOpen(issue); }}><ArrowUpRight size={15} /></button>}
+        {onCreateRelated && <RelatedIssueButton issue={issue} onCreate={onCreateRelated} />}
       </div>
       <div className="issue-card-title" title={issue.summary}>{issue.summary}</div>
       <div className="issue-card-meta">
@@ -78,24 +94,52 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
   );
 }
 
-function GroupZone({ data: { zone, epic, onSelect, onOpen, selected } }: NodeProps<Zone>) {
+function RelatedIssueButton({ issue, onCreate }: { issue: JiraIssue; onCreate(issue: JiraIssue): void }) {
   const { t } = usePreferences();
-  const title = <><Layers3 size={15} aria-hidden="true" /><span>{zone.title}</span></>;
-  return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`}>
+  const label = t(`Создать задачу со связью с ${issue.key}`, `Create an issue linked to ${issue.key}`);
+  return <button type="button" className="issue-card-create nodrag nopan" title={label} aria-label={label} data-export-ignore
+    onClick={(event) => { event.stopPropagation(); onCreate(issue); }}><Plus size={15} aria-hidden="true" /></button>;
+}
+
+const groupIcons = {
+  project: FolderKanban, status: CircleDot, assignee: UserRound, sprint: CalendarDays, release: Package, priority: Flag,
+  level: ListTree, 'open-level': ListTree, 'sprint-unscheduled': CalendarX2, 'sprint-external': Link2,
+};
+
+function GroupZone({ data: { zone, epic, onSelect, onOpen, onCreateRelated, selected } }: NodeProps<Zone>) {
+  const { t } = usePreferences();
+  const GroupIcon = zone.appearance ? groupIcons[zone.appearance.variant] : zone.kind === 'nested' ? ClipboardList : Layers3;
+  const title = <><GroupIcon size={15} aria-hidden="true" /><span>{zone.title}</span></>;
+  return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`} data-export-zone={zone.id}
+    data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color}>
     <div className="graph-zone-heading">
       {epic && onSelect
         ? <button type="button" className="graph-zone-title graph-zone-action nodrag nopan" title={zone.title}
           aria-label={`${t('Открыть сведения об эпике', 'View epic details')} ${zone.title}`}
           onClick={(event) => { event.stopPropagation(); onSelect(epic.key); }}>{title}</button>
         : <div className="graph-zone-title" title={zone.title}>{title}</div>}
-      {epic?.url && onOpen && <button type="button" className="graph-zone-open graph-zone-action nodrag nopan"
+      {epic?.url && onOpen && <button type="button" className="graph-zone-open graph-zone-action nodrag nopan" data-export-ignore
         title={t('Открыть в Jira', 'Open in Jira')} aria-label={`${t('Открыть в Jira', 'Open in Jira')} ${epic.key}`}
         onClick={(event) => { event.stopPropagation(); onOpen(epic); }}><ArrowUpRight size={15} /></button>}
+      {epic && onCreateRelated && <RelatedIssueButton issue={epic} onCreate={onCreateRelated} />}
     </div>
     <div className="graph-zone-meta" title={t('Выполнено задач / всего', 'Completed issues / total')}>
       {zone.done}/{zone.issues}{zone.points !== undefined && <> · {zone.points} SP</>}
     </div>
   </div>;
+}
+
+function NoteSticker({ data: { issueKey, note, count, direction, onOpen } }: NodeProps<Sticky>) {
+  const { t } = usePreferences();
+  const label = t(`Открыть заметки к ${issueKey}`, `Open notes for ${issueKey}`);
+  return <button type="button" className="graph-note-sticker nodrag nopan" data-export-note={issueKey} data-direction={direction}
+    aria-label={label} aria-description={note.text.slice(0, 240)} title={label}
+    onClick={(event) => { event.stopPropagation(); onOpen(issueKey, false); }}>
+    <span className="graph-note-sticker-heading"><StickyNote size={13} aria-hidden="true" />
+      <span>{note.author || t('Заметка', 'Note')}</span>{count > 1 && <b>{count}</b>}
+    </span>
+    <span className="graph-note-sticker-text">{note.text}</span>
+  </button>;
 }
 
 function JiraLink({ id, source, target, data, sourceX, sourceY, targetX, targetY, sourcePosition, markerEnd, label, selected }: EdgeProps<Link>) {
@@ -138,12 +182,13 @@ function JiraLink({ id, source, target, data, sourceX, sourceY, targetX, targetY
   );
 }
 
-const nodeTypes = { issue: IssueCard, zone: GroupZone };
+const nodeTypes = { issue: IssueCard, zone: GroupZone, note: NoteSticker };
 const edgeTypes = { jiraLink: JiraLink };
 
 interface Props {
   flowId: string;
   graph: JiraGraph;
+  layoutGraph?: JiraGraph;
   basis: JiraGraph;
   cycleIds: ReadonlySet<string>;
   direction: Direction;
@@ -155,16 +200,19 @@ interface Props {
   selectedEdge?: string;
   connected: boolean;
   editable: boolean;
-  noteCounts: Readonly<Record<string, number>>;
+  notesByIssue: Readonly<Record<string, readonly JiraGraphNote[]>>;
+  highlightedKeys?: ReadonlySet<string>;
+  preferredSprintIds?: readonly string[];
   onSelectIssue(key?: string): void;
   onSelectEdge(id: string): void;
   onOpenIssue(issue: JiraIssue): void;
-  onNoteIssue(key: string): void;
+  onNoteIssue(key: string, focusInput: boolean): void;
+  onCreateRelated?(issue: JiraIssue): void;
   onConnect: OnConnect;
 }
 
-export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
-  noteCounts, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onConnect }: Props) {
+export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
+  notesByIssue, highlightedKeys, preferredSprintIds, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onCreateRelated, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
   const [positions, setPositions] = useState<Record<string, GraphPosition>>({});
@@ -177,13 +225,22 @@ export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMo
     { id: null, type: 'source', position: across ? Position.Right : Position.Bottom,
       x: across ? CARD_WIDTH : CARD_WIDTH / 2, y: across ? cardHeight / 2 : cardHeight, width: 0, height: 0 },
   ];
-  const layout = useMemo(() => layoutWorkspace(graph, direction, groupMode, {
+  const noteSignature = Object.keys(notesByIssue).filter((key) => notesByIssue[key].length > 0).sort().join(',');
+  const noteKeys = useMemo(() => new Set(noteSignature ? noteSignature.split(',') : []), [noteSignature]);
+  const layout = useMemo(() => layoutWorkspace(layoutGraph, direction, groupMode, {
     component: t('Связанный фрагмент', 'Connected component'),
     emptyGroup: t('Без значения', 'Unassigned'),
+    unscheduledSprint: t('Без спринта', 'No sprint'),
+    externalSprint: t('Внешние задачи без спринта', 'External issues without a sprint'),
     level: t('Уровень', 'Level'),
     cycle: t('Заблокировано циклом', 'Blocked by a cycle'),
     done: t('Выполнено', 'Done'),
-  }, cardHeight, basis), [basis, cardHeight, direction, graph, groupMode, t]);
+  }, cardHeight, basis, { preferredSprintIds, noteKeys }), [basis, cardHeight, direction, layoutGraph, groupMode, noteKeys, preferredSprintIds, t]);
+  const displayedEdges = useMemo(() => {
+    if (layoutGraph === graph) return layout.visibleEdges;
+    const edgeIds = new Set(graph.edges.map(({ id }) => id));
+    return layout.visibleEdges.filter(({ id }) => edgeIds.has(id));
+  }, [graph, layout.visibleEdges, layoutGraph]);
   const estimates = useMemo(() => showLinks && showEdgePoints ? downstreamPoints(graph) : undefined, [graph, showLinks, showEdgePoints]);
   const basisIssues = useMemo(() => new Map(basis.issues.map((issue) => [issue.key, issue])), [basis.issues]);
   const lanes = useMemo(() => {
@@ -215,9 +272,9 @@ export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMo
       selected: issue.key === selectedKey,
       ariaLabel: `${issue.key} ${issue.summary}`,
       data: {
-        issue, direction, fields, noteCount: noteCounts[issue.key],
-        onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined,
-        muted: Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
+        issue, direction, fields, noteCount: notesByIssue[issue.key]?.length, highlighted: highlightedKeys?.has(issue.key),
+        onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined, onCreateRelated,
+        muted: !highlightedKeys?.has(issue.key) && Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
       },
     }];
   });
@@ -226,14 +283,29 @@ export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMo
     data: {
       zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
       selected: Boolean(zone.epicKey && zone.epicKey === selectedKey), onSelect: onSelectIssue,
-      onOpen: connected ? onOpenIssue : undefined,
+      onOpen: connected ? onOpenIssue : undefined, onCreateRelated,
     },
     width: zone.width, height: zone.height, zIndex: zone.kind === 'nested' ? -1 : -2,
     measured: { width: zone.width, height: zone.height },
     selectable: false, focusable: false, draggable: false, connectable: false, style: { pointerEvents: 'none' },
   }));
+  function sticker(issueKey: string, anchor: GraphPosition & { width: number; height: number }, placement: Direction): Sticky | undefined {
+    const notes = notesByIssue[issueKey];
+    if (!notes?.length) return;
+    const note = notes.reduce((latest, entry) => (Date.parse(entry.createdAt) || 0) >= (Date.parse(latest.createdAt) || 0) ? entry : latest);
+    return {
+      id: `note:${issueKey}`, type: 'note', position: notePosition(anchor, placement), zIndex: 3,
+      width: NOTE_WIDTH, height: NOTE_HEIGHT, measured: { width: NOTE_WIDTH, height: NOTE_HEIGHT },
+      data: { issueKey, note, count: notes.length, direction: placement, onOpen: onNoteIssue },
+      selectable: false, focusable: false, draggable: false, connectable: false,
+    };
+  }
+  const stickers = [
+    ...cards.map(({ id, position }) => sticker(id, { ...position, width: CARD_WIDTH, height: cardHeight }, direction)),
+    ...layout.zones.map((zone) => zone.epicKey ? sticker(zone.epicKey, zone, 'TB') : undefined),
+  ].filter((item) => item !== undefined);
   const visibleKeys = new Set(cards.map(({ id }) => id));
-  const edges: Link[] = showLinks ? layout.visibleEdges.map((edge) => {
+  const edges: Link[] = showLinks ? displayedEdges.map((edge) => {
     const active = Boolean(trace && (
       (trace.upstream.has(edge.source) && trace.upstream.has(edge.target)) ||
       (trace.downstream.has(edge.source) && trace.downstream.has(edge.target))
@@ -273,7 +345,7 @@ export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMo
         <GitBranch size={26} /><h2>{t('Задачи не найдены', 'No issues found')}</h2>
         <p>{t('Измени JQL или сбрось фильтры.', 'Change the JQL query or clear the filters.')}</p>
       </div> : <ReactFlow<CanvasNode, Link>
-        id={flowId} colorMode={theme} nodes={[...zones, ...cards]} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
+        id={flowId} colorMode={theme} nodes={[...zones, ...cards, ...stickers]} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
         onNodesChange={onNodesChange} onEdgesChange={(changes) => {
           const selection = changes.find((change) => change.type === 'select' && change.selected);
           if (selection?.type === 'select') onSelectEdge(selection.id);
@@ -295,11 +367,11 @@ export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMo
         <Controls position="bottom-left" showInteractive={false} />
         <MiniMap<CanvasNode>
           position="bottom-right"
-          nodeColor={(node) => node.type === 'zone' ? 'transparent' : `var(--minimap-${statusTone(node.data.issue) === 'done' ? 'done' : 'node'})`}
+          nodeColor={(node) => node.type === 'issue' ? `var(--minimap-${statusTone(node.data.issue) === 'done' ? 'done' : 'node'})` : 'transparent'}
           maskColor="var(--minimap-mask)" pannable zoomable
         />
       </ReactFlow>}
-      <div className="canvas-legend">{showLinks ? <><ArrowRight size={14} /> {t('Связь Jira', 'Jira link')}</>
+      <div className="canvas-legend" data-export-ignore>{showLinks ? <><ArrowRight size={14} /> {t('Связь Jira', 'Jira link')}</>
         : <span>{t('Связи скрыты', 'Links hidden')}</span>} <Layers3 size={13} /> {t('Иерархия', 'Hierarchy')}
         {layout.parts > 1 && <span>· {t('Частей', 'Components')}: {layout.parts}</span>}
         {edges.some(({ data }) => data?.cycle) && <span className="legend-cycle">↻ {t('Связь в цикле', 'Link in a cycle')}</span>}

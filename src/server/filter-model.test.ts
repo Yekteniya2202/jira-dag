@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  appendJqlClauses, emptyGraphFilters, filterGraph, issueFacetOptions, jiraFacetClause, noFacetValue, scopeJql,
+  appendJqlClauses, emptyGraphFilters, filterGraph, highlightedIssueKeys, issueFacetOptions, jiraFacetClause,
+  noFacetValue, queryIssueFacetOptions, scopeJql, sprintFacetLabels,
 } from '../renderer/filter-model.js';
 import type { JiraGraph, JiraIssue } from '../shared/contracts.js';
 
@@ -31,28 +32,37 @@ const graph: JiraGraph = {
   storyPointsFields: [],
 };
 
-test('filtering removes only edges whose endpoints are excluded and retains disconnected issues', () => {
-  const result = filterGraph(graph, { ...emptyGraphFilters, facets: { labels: ['cleanup'] } });
-  assert.deepEqual(result.issues.map(({ key }) => key), ['APP-1', 'OPS-3', 'APP-4']);
-  assert.deepEqual(result.edges.map(({ id }) => id), ['3']);
+test('highlights match without removing cards or their edges', () => {
+  const filters = { ...emptyGraphFilters, facets: { labels: ['cleanup'] } };
+  assert.deepEqual(highlightedIssueKeys(graph, filters), new Set(['APP-1', 'OPS-3', 'APP-4']));
+  assert.strictEqual(filterGraph(graph, filters), graph);
   assert.equal(graph.issues.length, 5);
   assert.equal(graph.edges.length, 4);
-  assert.strictEqual(filterGraph(graph, emptyGraphFilters), graph);
+  assert.equal(highlightedIssueKeys(graph, emptyGraphFilters), undefined);
+  assert.deepEqual(highlightedIssueKeys(graph, { ...filters, search: 'nothing matches' }), new Set());
 });
 
 test('facet choices are OR within a facet and AND across facets including zero Story Points', () => {
-  const result = filterGraph(graph, {
-    ...emptyGraphFilters,
+  const result = highlightedIssueKeys(graph, {
     search: 'cleanup',
     facets: { project: ['APP', 'OPS'], estimate: ['present'], statusCategory: ['new'] },
   });
-  assert.deepEqual(result.issues.map(({ key }) => key), ['APP-1', 'OPS-3']);
-  assert.deepEqual(result.edges, []);
+  assert.deepEqual(result, new Set(['APP-1', 'OPS-3']));
   assert.ok(issueFacetOptions(graph.issues).epic.some(({ value, count }) => value === 'APP-9' && count === 3));
   assert.deepEqual(
-    filterGraph(graph, { ...emptyGraphFilters, facets: { epic: [noFacetValue] } }).issues.map(({ key }) => key),
-    ['APP-4'],
+    highlightedIssueKeys(graph, { search: '', facets: { epic: [noFacetValue] } }),
+    new Set(['APP-4']),
   );
+});
+
+test('link-type selection keeps all cards and distinguishes all from none', () => {
+  assert.strictEqual(filterGraph(graph, emptyGraphFilters), graph);
+  const filtered = filterGraph(graph, { ...emptyGraphFilters, edgeTypes: ['parent', '10002'] });
+  assert.strictEqual(filtered.issues, graph.issues);
+  assert.deepEqual(filtered.edges.map(({ id }) => id), ['1', '3', '4']);
+  const none = filterGraph(graph, { ...emptyGraphFilters, edgeTypes: [] });
+  assert.strictEqual(none.issues, graph.issues);
+  assert.deepEqual(none.edges, []);
 });
 
 test('cross-epic and edge-type filtering does not introduce links to hidden issues', () => {
@@ -102,4 +112,19 @@ test('Jira facets produce quoted field values, missing values, and native hierar
   assert.equal(jiraFacetClause('dueDate', ['present'], 'cloud'), 'due IS NOT EMPTY');
   assert.equal(jiraFacetClause('estimate', ['missing'], 'cloud', 'customfield_10016'), 'cf[10016] IS EMPTY');
   assert.equal(jiraFacetClause('estimate', ['missing'], 'cloud'), '');
+});
+
+test('sprint IDs separate duplicate names and counters exclude expanded and pinned issues', () => {
+  const sprint = (id: string) => ({ id, name: 'Sprint 30' });
+  const issues = [
+    issue('APP-1', { sprintDetails: [sprint('30')], sprints: ['Sprint 30'] }),
+    issue('APP-2', { sprintDetails: [sprint('31')] }),
+    issue('APP-3', { sprintDetails: [sprint('30')], external: true }),
+    issue('APP-4', { sprintDetails: [sprint('30')] }),
+  ];
+  assert.deepEqual(queryIssueFacetOptions(issues, new Set(['APP-1', 'APP-2'])).sprints, [
+    { value: 'id:30', count: 1 }, { value: 'id:31', count: 1 },
+  ]);
+  assert.deepEqual(sprintFacetLabels(issues), new Map([['id:30', 'Sprint 30 · #30'], ['id:31', 'Sprint 30 · #31']]));
+  assert.equal(jiraFacetClause('sprints', ['id:30', 'id:31', 'Sprint 29'], 'cloud'), 'sprint in (30, 31, "Sprint 29")');
 });

@@ -28,6 +28,12 @@ export interface GraphQuery {
   storyPointsField?: string;
 }
 
+export interface JiraSprint {
+  id: string;
+  name: string;
+  state?: 'future' | 'active' | 'closed';
+}
+
 export interface JiraIssue {
   key: string;
   summary: string;
@@ -38,6 +44,8 @@ export interface JiraIssue {
   project?: string;
   storyPoints?: number;
   description?: string;
+  descriptionMarkdown?: string;
+  descriptionReadOnly?: true;
   url: string;
   external?: boolean;
   labels?: string[];
@@ -47,6 +55,7 @@ export interface JiraIssue {
   isSubtask?: boolean;
   priority?: string;
   sprints?: string[];
+  sprintDetails?: JiraSprint[];
   fixVersions?: string[];
   dueDate?: string;
   originalEstimateSeconds?: number;
@@ -63,6 +72,11 @@ export interface JiraProject {
   id: string;
   key: string;
   name: string;
+}
+
+export interface JiraIssueSuggestion {
+  key: string;
+  summary: string;
 }
 
 export interface JiraGraphNote {
@@ -142,8 +156,10 @@ export interface ApiMethods {
   createLink: { input: JiraLinkInput; output: JiraEdge | null };
   deleteLink: { input: { id: string }; output: null };
   listProjects: { input: null; output: JiraProject[] };
+  suggestIssues: { input: { query: string }; output: JiraIssueSuggestion[] };
   getAssigneeAvatar: { input: { key: string }; output: string | null };
   listSavedFilters: { input: null; output: JiraSavedFilter[] };
+  listGraphNotes: { input: { keys: string[] }; output: Record<string, JiraGraphNote[]> };
   listNotes: { input: { key: string }; output: JiraGraphNote[] };
   createNote: { input: { key: string; text: string }; output: JiraGraphNote };
   deleteNote: { input: { key: string; id: string }; output: null };

@@ -3,11 +3,12 @@ import { ChevronDown, Filter, LoaderCircle, Search } from 'lucide-react';
 import type { JiraEdition, JiraGraph, JiraProject, JiraSavedFilter } from '../shared/contracts';
 import { request } from './api';
 import {
-  edgeFacetOptions, emptyGraphFilters, graphFacets, hasGraphFilters, hierarchyEdgeType,
-  issueFacetOptions, jiraFacetClause, noFacetValue, scopeJql,
+  graphFacets, hasHighlightFilters, issueFacetOptions, jiraFacetClause, noFacetValue, queryIssueFacetOptions, scopeJql,
+  sprintFacetId, sprintFacetLabels,
   type FacetOption, type GraphFacet, type GraphFilters, type ScopePreset,
 } from './filter-model';
 import { usePreferences } from './i18n';
+import './filter-controls.css';
 
 type Translation = readonly [ru: string, en: string];
 
@@ -177,11 +178,12 @@ function toggle(values: string[], value: string): string[] {
   return values.includes(value) ? values.filter((current) => current !== value) : [...values, value];
 }
 
-function Facet({ title, options, selected, onChange }: {
+function Facet({ title, options, selected, onChange, queryCounts }: {
   title: string;
   options: Array<FacetOption & { label: string }>;
   selected: string[];
   onChange(values: string[]): void;
+  queryCounts?: boolean;
 }) {
   const { t, language } = usePreferences();
   const [search, setSearch] = useState('');
@@ -198,32 +200,30 @@ function Facet({ title, options, selected, onChange }: {
     <div className="facet-options">
       {visible.map(({ value, label, count }) => <label className="facet-option" key={value} title={label}>
         <input type="checkbox" checked={selected.includes(value)} onChange={() => onChange(toggle(selected, value))} />
-        <span>{label}</span><small>{count.toLocaleString(language)}</small>
+        <span>{label}</span><small title={queryCounts ? t('Задачи в загруженной выборке JQL', 'Issues in the loaded JQL selection') : undefined}>
+          {count.toLocaleString(language)}
+        </small>
       </label>)}
       {!visible.length && <span className="facet-empty">{t('Совпадений нет', 'No matches')}</span>}
     </div>
   </details>;
 }
 
-const flags: Array<{
-  field: 'hideExternal' | 'hideIsolated' | 'crossProject' | 'crossEpic';
-  label: Translation;
-}> = [
-  { field: 'hideExternal', label: ['Скрыть задачи вне выборки', 'Hide issues outside the query'] },
-  { field: 'hideIsolated', label: ['Скрыть задачи без видимых связей', 'Hide issues without visible links'] },
-  { field: 'crossProject', label: ['Только связи между проектами', 'Only cross-project links'] },
-  { field: 'crossEpic', label: ['Только связи между эпиками', 'Only cross-epic links'] },
-];
-
-function useIssueOptions(graph: JiraGraph) {
+function useIssueOptions(graph: JiraGraph, queryOnly = false, queryIssueKeys?: ReadonlySet<string>) {
   const { t, language } = usePreferences();
-  const facets = useMemo(() => issueFacetOptions(graph.issues), [graph.issues]);
+  const facets = useMemo(() => queryOnly ? queryIssueFacetOptions(graph.issues, queryIssueKeys)
+    : issueFacetOptions(graph.issues), [graph.issues, queryIssueKeys, queryOnly]);
   const summaries = useMemo(() => new Map(graph.issues.map(({ key, summary }) => [key, summary])), [graph.issues]);
+  const sprintLabels = useMemo(() => sprintFacetLabels(graph.issues), [graph.issues]);
 
   function optionLabel(facet: GraphFacet, value: string): string {
     if (value === noFacetValue) return t(...(missingLabels[facet] ?? ['Без значения', 'No value']));
     const translated = localValueLabels[facet]?.[value];
     if (translated) return t(...translated);
+    if (facet === 'sprints') {
+      const id = sprintFacetId(value);
+      return sprintLabels.get(value) ?? (id ? t(`Спринт #${id}`, `Sprint #${id}`) : value);
+    }
     const summary = (facet === 'epic' || facet === 'parent') && summaries.get(value);
     return summary && summary !== value ? `${value} · ${summary}` : value;
   }
@@ -235,69 +235,67 @@ function useIssueOptions(graph: JiraGraph) {
   };
 }
 
-export function GraphJqlFilters({ graph, edition, storyField, selected, onChange }: {
+export function GraphJqlFilters({ graph, edition, storyField, queryIssueKeys, selected, onChange }: {
   graph: JiraGraph;
   edition: JiraEdition;
   storyField?: string;
+  queryIssueKeys?: ReadonlySet<string>;
   selected: GraphFilters['facets'];
   onChange(selected: GraphFilters['facets']): void;
 }) {
   const { t } = usePreferences();
-  const issueOptions = useIssueOptions(graph);
+  const issueOptions = useIssueOptions(graph, true, queryIssueKeys);
   const hasSelection = Object.values(selected).some((values) => values.length);
 
   if (!graph.issues.length && !hasSelection) return null;
   return <section className="filters" aria-label={t('Фильтры Jira в JQL', 'Jira filters in JQL')}>
     <div className="filter-heading">
-      <h2><Filter size={16} /> {t('Фильтры Jira', 'Jira filters')}</h2>
+      <h2><Filter size={16} /> {t('Выборка Jira', 'Jira selection')}</h2>
       {hasSelection && <button type="button" className="text-button" onClick={() => onChange({})}>
         {t('Сбросить', 'Reset')}
       </button>}
     </div>
-    <p className="form-hint">{t('Значения из загруженного графа меняют JQL. Загрузи граф, чтобы применить запрос.',
-      'Values from the loaded graph update JQL. Load the graph to apply the query.')}</p>
+    <p className="form-hint">{t('Счётчики относятся к загруженной выборке JQL. Чтобы применить новый запрос, загрузи граф.',
+      'Counts refer to the loaded JQL selection. Load the graph to apply the new query.')}</p>
     <div className="facet-grid">
       {graphFacets.filter((facet) => facet !== 'project').map((facet) => {
         const values = selected[facet] ?? [];
         const options = issueOptions(facet, values).filter(({ value }) => jiraFacetClause(facet, [value], edition, storyField));
         if (!options.some(({ value }) => value !== noFacetValue) && !values.length) return null;
-        return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={values}
+        return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={values} queryCounts
           onChange={(next) => onChange({ ...selected, [facet]: next })} />;
       })}
     </div>
   </section>;
 }
 
-export function GraphFilterPanel({ graph, filters, connected, onChange }: {
+export function GraphFilterPanel({ graph, filters, onChange }: {
   graph: JiraGraph;
   filters: GraphFilters;
   connected?: boolean;
   onChange(filters: GraphFilters): void;
 }) {
-  const { t, language } = usePreferences();
+  const { t } = usePreferences();
   const issueOptions = useIssueOptions(graph);
-  const edgeTypes = useMemo(() => edgeFacetOptions(graph), [graph]);
-
-  const heading = connected ? t('Отображение графа', 'Graph display') : t('Фильтры графа', 'Graph filters');
-  return <section className="filters" aria-label={heading}>
-    <div className="filter-heading">
-      <h2><Filter size={16} /> {heading}</h2>
-      {hasGraphFilters(filters) && <button type="button" className="text-button" onClick={() => onChange(emptyGraphFilters)}>
+  const hasSelection = hasHighlightFilters(filters);
+  const heading = t('Подсветка задач', 'Highlight issues');
+  return <details className="highlight-filters filter-facet">
+    <summary><Filter size={14} aria-hidden="true" /><span>{heading}</span>
+      {hasSelection && <span className="facet-count">{t('Вкл.', 'On')}</span>}
+      <ChevronDown size={14} aria-hidden="true" />
+    </summary>
+    <section className="filters highlight-fields" aria-label={heading}>
+      {hasSelection && <button type="button" className="text-button highlight-reset"
+        onClick={() => onChange({ ...filters, search: '', facets: {} })}>
         {t('Сбросить', 'Reset')}
       </button>}
-    </div>
     <label className="graph-filter-search">
       <span><Search size={13} /> {t('Поиск в графе', 'Search in graph')}</span>
       <input type="search" value={filters.search} placeholder={t('Ключ, текст или метка', 'Key, text, or label')}
         onChange={(event) => onChange({ ...filters, search: event.target.value })} />
     </label>
     <div className="facet-grid">
-      {edgeTypes.length > 0 && <Facet title={t('Тип связи', 'Link type')}
-        options={edgeTypes.map((option) => ({
-          ...option, label: option.value === hierarchyEdgeType ? t('Иерархия задач', 'Issue hierarchy') : option.label,
-        })).sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }))}
-        selected={filters.edgeTypes} onChange={(values) => onChange({ ...filters, edgeTypes: values })} />}
-      {!connected && graphFacets.map((facet) => {
+      {graphFacets.map((facet) => {
         const selected = filters.facets[facet] ?? [];
         const options = issueOptions(facet, selected);
         if (!options.some(({ value }) => value !== noFacetValue) && !selected.length) return null;
@@ -305,11 +303,6 @@ export function GraphFilterPanel({ graph, filters, connected, onChange }: {
           onChange={(values) => onChange({ ...filters, facets: { ...filters.facets, [facet]: values } })} />;
       })}
     </div>
-    <div className="filter-flags">
-      {flags.map(({ field, label }) => <label className="facet-option" key={field}>
-        <input type="checkbox" checked={filters[field]} onChange={(event) => onChange({ ...filters, [field]: event.target.checked })} />
-        <span>{t(...label)}</span>
-      </label>)}
-    </div>
-  </section>;
+    </section>
+  </details>;
 }

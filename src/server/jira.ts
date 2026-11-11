@@ -11,11 +11,13 @@ import type {
   JiraGraphNote,
   JiraIssue,
   JiraIssueInput,
+  JiraIssueSuggestion,
   JiraLinkInput,
   JiraLinkType,
   JiraOption,
   JiraProject,
   JiraSavedFilter,
+  JiraSprint,
 } from '../shared/contracts.js';
 
 type JsonObject = Record<string, unknown>;
@@ -28,19 +30,20 @@ type RawLink = {
 };
 
 const SEARCH_PAGE_SIZE = 100;
-const MAX_GRAPH_ISSUES = 1_500;
+export const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
 const TIMEOUT_MS = 15_000;
 const MAX_AVATAR_BYTES = 128 * 1024;
 const AVATAR_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const NOTE_MARKER = 'Jira DAG note v1';
+const ISSUE_KEY = /^[a-z][a-z\d_]*-\d+$/i;
 export const MAX_NOTE_LENGTH = 8_000;
 const ISSUE_FIELDS = [
   'summary', 'description', 'status', 'issuetype', 'assignee', 'project', 'issuelinks', 'parent', 'subtasks',
   'labels', 'priority', 'fixVersions', 'duedate', 'timeoriginalestimate', 'timeestimate',
 ];
-const RESERVED_FIELDS = new Set(['key', 'id', 'project', 'issuetype', 'summary', 'description', 'issuelinks']);
+const RESERVED_FIELDS = new Set(['key', 'id', 'project', 'issuetype', 'summary', 'description', 'issuelinks', 'reporter']);
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 export class JiraError extends Error {
@@ -109,6 +112,8 @@ export class JiraClient {
   private readonly knownEpicFields = new Set<string>();
   private readonly knownSprintFields = new Set<string>();
   private readonly adfFieldIds = new Set(['environment']);
+  private readonly editableReporter = new Set<string>();
+  private currentReporter?: { id: string } | { name: string } | { key: string };
 
   constructor(
     private readonly site: URL,
@@ -125,6 +130,12 @@ export class JiraClient {
     if (!string(profile.accountId) && !string(profile.key) && !string(profile.name) && !string(profile.displayName)) {
       throw new JiraError('Jira не вернула профиль пользователя. Проверь адрес и токен.', 401);
     }
+    const accountId = string(profile.accountId);
+    const name = string(profile.name);
+    const key = string(profile.key);
+    this.currentReporter = this.edition === 'cloud'
+      ? (accountId ? { id: accountId } : undefined)
+      : (name ? { name } : key ? { key } : undefined);
     return profile;
   }
 
@@ -153,7 +164,9 @@ export class JiraClient {
     for (const field of storyFields) this.knownStoryFields.add(field);
     const hierarchyFields = fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id);
     const epicFields = fields.filter(isEpicLinkField).flatMap(fieldOption).map((field) => field.id);
-    const sprintFields = fields.filter(isSprintField).flatMap(fieldOption).map((field) => field.id);
+    const sprintFields = Array.isArray(fieldCatalog)
+      ? fields.filter(isSprintField).flatMap(fieldOption).map((field) => field.id)
+      : [...this.knownSprintFields];
     for (const field of hierarchyFields) this.knownHierarchyFields.add(field);
     for (const field of epicFields) this.knownEpicFields.add(field);
     for (const field of sprintFields) this.knownSprintFields.add(field);
@@ -177,6 +190,7 @@ export class JiraClient {
       const neighbors = new Set<string>();
       const remember = (ref: IssueRef) => {
         if (!issues.has(ref.key)) {
+          if (depth === query.depth) return false;
           if (issues.size >= MAX_GRAPH_ISSUES) {
             warnings.add(`Граф ограничен ${MAX_GRAPH_ISSUES} задачами.`);
             return false;
@@ -251,12 +265,12 @@ export class JiraClient {
           this.adfFieldIds.add(id);
         }
       }
-      return { issueTypes: types.flatMap(option), fields: fields.flatMap(toCreateField) };
+      return this.rememberCreateOptions(projectKey, issueTypeId, { issueTypes: types.flatMap(option), fields: fields.flatMap(toCreateField) });
     } catch (error) {
       if (this.edition !== 'data-center' || !(error instanceof JiraError) || error.status !== 404) throw error;
       const fallback = await this.legacyCreateOptions(projectKey.trim(), issueTypeId);
       if (!fallback.issueTypes.length) throw error;
-      return fallback;
+      return this.rememberCreateOptions(projectKey, issueTypeId, fallback);
     }
   }
 
@@ -276,6 +290,10 @@ export class JiraClient {
     fields.issuetype = { id: input.typeId };
     fields.summary = summary;
     if (input.description !== undefined) fields.description = this.description(input.description);
+    if (this.currentReporter && this.editableReporter.has(createOptionsKey(project, input.typeId)) &&
+        await this.canModifyReporter(project)) {
+      fields.reporter = this.currentReporter;
+    }
 
     let created: JsonObject;
     try {
@@ -358,6 +376,23 @@ export class JiraClient {
     throw new JiraError('Jira вернула слишком много страниц проектов или некорректную пагинацию.');
   }
 
+  async suggestIssues(query: string): Promise<JiraIssueSuggestion[]> {
+    const value = query.trim();
+    if (value.length < 2) return [];
+    const parameters = new URLSearchParams({ query: value, currentJQL: 'ORDER BY updated DESC', showSubTasks: 'true' });
+    const response = record(await this.call('GET', `/issue/picker?${parameters}`));
+    const suggestions = new Map<string, JiraIssueSuggestion>();
+    for (const section of list(response.sections).map(record)) {
+      for (const row of list(section.issues).map(record)) {
+        const key = string(row.key);
+        if (!key || !ISSUE_KEY.test(key) || suggestions.has(key)) continue;
+        suggestions.set(key, { key, summary: string(row.summaryText)?.trim() || key });
+        if (suggestions.size === 20) return [...suggestions.values()];
+      }
+    }
+    return [...suggestions.values()];
+  }
+
   async getAssigneeAvatar(key: string): Promise<string | null> {
     const issue = await this.readIssue(key, ['assignee']);
     const urls = record(record(issue.fields?.assignee).avatarUrls);
@@ -386,6 +421,35 @@ export class JiraClient {
       const jql = string(filter.jql)?.trim();
       return id && name ? [{ id, name, jql: jql || undefined }] : [];
     });
+  }
+
+  async listGraphNotes(keys: string[]): Promise<Record<string, JiraGraphNote[]>> {
+    if (keys.length > MAX_GRAPH_ISSUES || keys.some((key) => !ISSUE_KEY.test(key))) {
+      throw new JiraError('Укажи корректные ключи задач Jira для заметок.', 400);
+    }
+    const uniqueKeys = [...new Set(keys.map((key) => key.toUpperCase()))];
+    const matching = new Set<string>();
+    for (let index = 0; index < uniqueKeys.length; index += 50) {
+      const batch = uniqueKeys.slice(index, index + 50);
+      const jql = `key in (${batch.map((key) => JSON.stringify(key)).join(', ')}) AND comment ~ ${JSON.stringify(`"${NOTE_MARKER}"`)}`;
+      const { issues } = await this.search(jql, ['summary'], batch.length);
+      for (const { key } of issues) if (batch.includes(key)) matching.add(key);
+    }
+    const notes: Array<[string, JiraGraphNote[]]> = [];
+    const issueKeys = [...matching];
+    for (let index = 0; index < issueKeys.length; index += 6) {
+      const batch = issueKeys.slice(index, index + 6);
+      const results = await Promise.all(batch.map(async (key): Promise<[string, JiraGraphNote[]]> => {
+        try {
+          return [key, await this.listNotes(key)];
+        } catch (error) {
+          if (error instanceof JiraError && [403, 404].includes(error.status ?? 0)) return [key, []];
+          throw error;
+        }
+      }));
+      notes.push(...results.filter(([, result]) => result.length));
+    }
+    return Object.fromEntries(notes);
   }
 
   async listNotes(key: string): Promise<JiraGraphNote[]> {
@@ -495,6 +559,22 @@ export class JiraClient {
     return { issueTypes: types.flatMap(option), fields };
   }
 
+  private rememberCreateOptions(projectKey: string, issueTypeId: string | undefined, options: JiraCreateOptions): JiraCreateOptions {
+    if (issueTypeId) {
+      const key = createOptionsKey(projectKey, issueTypeId);
+      if (options.fields.some((field) => field.id === 'reporter')) this.editableReporter.add(key);
+      else this.editableReporter.delete(key);
+    }
+    return options;
+  }
+
+  private async canModifyReporter(project: string): Promise<boolean> {
+    const query = new URLSearchParams({ projectKey: project });
+    if (this.edition === 'cloud') query.set('permissions', 'MODIFY_REPORTER');
+    const response = await this.call('GET', `/mypermissions?${query}`).catch(() => undefined);
+    return record(record(record(response).permissions).MODIFY_REPORTER).havePermission === true;
+  }
+
   private async readIssue(key: string, fields = ISSUE_FIELDS): Promise<IssueRef> {
     const query = new URLSearchParams({ fields: fields.join(',') });
     const issue = toRef(await this.call('GET', `/issue/${encodeURIComponent(key)}?${query}`))[0];
@@ -520,12 +600,24 @@ export class JiraClient {
     const parent = toRef(fields.parent)[0] ??
       [...this.knownHierarchyFields].flatMap((field) => toRef(fields[field]))[0];
     const directEpic = [...this.knownEpicFields].flatMap((field) => toRef(fields[field]))[0];
-    const sprints = [...this.knownSprintFields].flatMap((field) => {
+    const sprintValues = [...new Set([...this.knownSprintFields, 'sprint', 'closedSprints'])].flatMap((field) => {
       const value = fields[field];
-      return (Array.isArray(value) ? value : [value]).map(sprintName).filter(isPresent);
+      return (Array.isArray(value) ? value : [value]).flatMap(toSprint);
     });
+    const sprintDetails = new Map<string, JiraSprint>();
+    for (const { sprint } of sprintValues) {
+      if (!sprint) continue;
+      const known = sprintDetails.get(sprint.id);
+      sprintDetails.set(sprint.id, {
+        id: sprint.id,
+        name: known && sprint.name === sprint.id ? known.name : sprint.name,
+        state: sprint.state ?? known?.state,
+      });
+    }
     const storyPoints = storyFields.map((field) => fields[field]).find((value) =>
       typeof value === 'number' && Number.isFinite(value));
+    const description = fields.description;
+    const richDescription = this.edition === 'cloud' && description != null && !isPlainAdf(description);
     return {
       key: issue.key,
       summary: string(fields.summary) ?? issue.key,
@@ -535,7 +627,9 @@ export class JiraClient {
       assignee: string(record(fields.assignee).displayName),
       project: string(record(fields.project).key) ?? issue.key.replace(/-\d+$/, ''),
       storyPoints: typeof storyPoints === 'number' ? storyPoints : undefined,
-      description: typeof fields.description === 'string' ? fields.description : adfText(fields.description),
+      description: typeof description === 'string' ? description : adfText(description),
+      descriptionMarkdown: richDescription ? adfMarkdown(description) : undefined,
+      descriptionReadOnly: richDescription ? true : undefined,
       url: this.getIssueUrl(issue.key),
       external,
       labels: [...new Set(list(fields.labels).map(string).filter(isPresent))],
@@ -544,7 +638,8 @@ export class JiraClient {
       isEpic: epic,
       isSubtask: issueType.subtask === true || issueType.hierarchyLevel === -1,
       priority: string(record(fields.priority).name),
-      sprints: [...new Set(sprints)],
+      sprints: [...new Set(sprintValues.map(({ name }) => name))],
+      sprintDetails: sprintDetails.size ? [...sprintDetails.values()] : undefined,
       fixVersions: [...new Set(list(fields.fixVersions).map((version) => string(record(version).name)).filter(isPresent))],
       dueDate: string(fields.duedate),
       originalEstimateSeconds: integer(fields.timeoriginalestimate),
@@ -581,7 +676,11 @@ export class JiraClient {
 function toRef(value: unknown): IssueRef[] {
   const row = record(value);
   const key = string(row.key) ?? string(value);
-  return key && /^[a-z][a-z\d_]*-\d+$/i.test(key) ? [{ key, fields: record(row.fields) }] : [];
+  return key && ISSUE_KEY.test(key) ? [{ key, fields: record(row.fields) }] : [];
+}
+
+function createOptionsKey(project: string, type: string): string {
+  return `${project.trim().toUpperCase()}/${type}`;
 }
 
 function toLinkType(value: unknown): JiraLinkType[] {
@@ -664,19 +763,28 @@ function isEpicLinkField(field: JsonObject): boolean {
 function isSprintField(field: JsonObject): boolean {
   const name = string(field.name)?.trim().toLowerCase();
   const schema = record(field.schema);
-  return schema.custom === 'com.pyxis.greenhopper.jira:gh-sprint' || name === 'sprint' || name === 'спринт';
+  return string(schema.custom)?.endsWith(':gh-sprint') === true || name === 'sprint' || name === 'спринт' ||
+    list(field.clauseNames).some((clause) => string(clause)?.toLowerCase() === 'sprint');
 }
 
-function sprintName(value: unknown): string | undefined {
-  if (typeof value !== 'string') return string(record(value).name)?.trim() || undefined;
-  if (value.includes('com.atlassian.greenhopper.service.sprint.Sprint@')) {
-    return /(?:\[|,)name=(.*?)(?=,\w+=|\]$)/.exec(value)?.[1]?.trim() || undefined;
+function toSprint(value: unknown): Array<{ name: string; sprint?: JiraSprint }> {
+  const row = record(value);
+  let id = numericId(row.id ?? value);
+  let name = string(row.name) ?? string(value);
+  let state = string(row.state)?.toLowerCase();
+  if (typeof value === 'string' && /(?:^|\.)Sprint@[^[]+\[/.test(value)) {
+    id = /(?:\[|,)id=(\d+)(?=,|\])/.exec(value)?.[1];
+    name = /(?:\[|,)name=(.*?)(?=,(?:goal|startDate|endDate|completeDate|activatedDate|sequence|sprintVersion|autoStartStop|rapidViewId|state|id)=|\]$)/.exec(value)?.[1];
+    state = /(?:\[|,)state=(\w+)(?=,|\])/.exec(value)?.[1]?.toLowerCase();
   }
-  return value.trim() || undefined;
+  const label = name?.trim() || id;
+  if (!label) return [];
+  const status = state === 'future' || state === 'active' || state === 'closed' ? state : undefined;
+  return [{ name: label, sprint: id ? { id, name: label, state: status } : undefined }];
 }
 
 function issueCommentPath(key: string): string {
-  if (!/^[a-z][a-z\d_]*-\d+$/i.test(key)) throw new JiraError('Укажи корректный ключ задачи Jira.', 400);
+  if (!ISSUE_KEY.test(key)) throw new JiraError('Укажи корректный ключ задачи Jira.', 400);
   return `/issue/${encodeURIComponent(key)}/comment`;
 }
 
@@ -728,12 +836,12 @@ function toCreateField(value: unknown): JiraCreateField[] {
   const row = record(value);
   const id = string(row.fieldId) ?? string(row.key);
   if (!id || id === 'issuelinks') return [];
-  const options = list(row.allowedValues).flatMap(option);
+  const options = id === 'reporter' ? [] : list(row.allowedValues).flatMap(option);
   return [{
     id,
     name: string(row.name) ?? id,
     required: row.required === true,
-    hasDefaultValue: row.hasDefaultValue === true,
+    hasDefaultValue: id === 'reporter' || row.hasDefaultValue === true,
     schemaType: string(record(row.schema).type),
     options: options.length ? options : undefined,
   }];
@@ -749,6 +857,94 @@ function adfText(value: unknown): string | undefined {
     return string(content.text) ?? children.join(content.type === 'doc' ? '\n' : '');
   }
   return textFromNode(doc);
+}
+
+function escapeMarkdown(text: string): string {
+  return text.replace(/[\\`*_{}\[\]()#+.!|<>~=-]/g, '\\$&');
+}
+
+function markdownLink(label: string, value: unknown): string {
+  const href = string(value);
+  const url = href ? URL.parse(href) : null;
+  if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password) return label;
+  return `[${label}](<${url.href}>)`;
+}
+
+function backtickFence(value: string, minimum: number): string {
+  const longest = (value.match(/`+/g) ?? []).reduce((max, ticks) => Math.max(max, ticks.length), 0);
+  return '`'.repeat(Math.max(minimum, longest + 1));
+}
+
+function adfMarkdown(value: unknown): string | undefined {
+  const doc = record(value);
+  if (doc.type !== 'doc') return undefined;
+
+  function inline(value: unknown): string {
+    const node = record(value);
+    const attrs = record(node.attrs);
+    switch (node.type) {
+      case 'hardBreak': return '  \n';
+      case 'mention':
+      case 'emoji':
+      case 'status': return escapeMarkdown(string(attrs.text) ?? string(attrs.shortName) ?? '');
+      case 'inlineCard': return markdownLink(escapeMarkdown(string(attrs.url) ?? ''), attrs.url);
+      case 'text': {
+        const text = string(node.text) ?? '';
+        const marks = list(node.marks).map(record);
+        let result = escapeMarkdown(text);
+        if (marks.some((mark) => mark.type === 'code')) {
+          const fence = backtickFence(text, 1);
+          const pad = /^`|`$|^\s.*\s$/s.test(text) ? ' ' : '';
+          result = `${fence}${pad}${text}${pad}${fence}`;
+        }
+        for (const mark of marks) {
+          if (mark.type === 'strong') result = `**${result}**`;
+          if (mark.type === 'em') result = `_${result}_`;
+          if (mark.type === 'strike') result = `~~${result}~~`;
+          if (mark.type === 'link') result = markdownLink(result, record(mark.attrs).href);
+        }
+        return result;
+      }
+      default: return list(node.content).map(inline).join('');
+    }
+  }
+
+  function block(value: unknown): string {
+    const node = record(value);
+    const content = list(node.content);
+    const attrs = record(node.attrs);
+    switch (node.type) {
+      case 'paragraph': return content.map(inline).join('');
+      case 'heading': return `${'#'.repeat(Math.min(integer(attrs.level) || 1, 6))} ${content.map(inline).join('')}`;
+      case 'rule': return '---';
+      case 'blockquote': return content.map(block).join('\n\n').split('\n').map((line) => `> ${line}`).join('\n');
+      case 'bulletList':
+      case 'orderedList': {
+        const start = integer(attrs.order) || 1;
+        return content.map((item, index) => {
+          const prefix = node.type === 'orderedList' ? `${start + index}. ` : '- ';
+          const [first = '', ...rest] = block(item).split('\n');
+          return [prefix + first, ...rest.map((line) => ' '.repeat(prefix.length) + line)].join('\n');
+        }).join('\n');
+      }
+      case 'codeBlock': {
+        const text = content.map((item) => string(record(item).text) ?? '').join('');
+        const language = string(attrs.language) ?? '';
+        const fence = backtickFence(text, 3);
+        return `${fence}${/^[a-z\d_+-]+$/i.test(language) ? language : ''}\n${text}\n${fence}`;
+      }
+      case 'table': {
+        const rows = content.map((row) => list(record(row).content).map((cell) => block(cell).replace(/\s*\n\s*/g, ' ')));
+        const columns = rows[0]?.length ?? 0;
+        if (!columns) return '';
+        const line = (cells: string[]) => `| ${cells.join(' | ')} |`;
+        return [line(rows[0]!), line(Array.from({ length: columns }, () => '---')), ...rows.slice(1).map(line)].join('\n');
+      }
+      default: return content.map(block).filter(Boolean).join('\n\n');
+    }
+  }
+
+  return block(doc).trim() || undefined;
 }
 
 function isPlainAdf(value: unknown): boolean {

@@ -1,31 +1,42 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { ReactFlowProvider } from '@xyflow/react';
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from 'react';
+import { ReactFlowProvider, useReactFlow } from '@xyflow/react';
 import {
-  ArrowDown, ArrowRight, ArrowUpRight, Box, Check, ChevronDown, CircleAlert, CircleDot, Crosshair,
-  GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, Pencil, Plus, RefreshCw, Trash2, X,
+  ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleAlert, CircleDot, Crosshair, Download, FileText,
+  GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Trash2, X,
 } from 'lucide-react';
-import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
+import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraGraphNote, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
 import { errorMessage, IssueCreationUnconfirmed, openIssue, request, RequestError, restoreDesktopConnection } from './api';
 import { makeDemoGraph } from './demo';
 import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
-import { appendJqlClauses, emptyGraphFilters, filterGraph, graphFacets, jiraFacetClause, scopeJql, type GraphFilters } from './filter-model';
+import { appendJqlClauses, emptyGraphFilters, filterGraph, graphFacets, highlightedIssueKeys, jiraFacetClause, scopeJql, sprintFacetId, type GraphFilters } from './filter-model';
 import { GraphFilterPanel, GraphJqlFilters, GraphScopePresets } from './filters';
 import { GraphCanvas, type CardFields } from './graph-canvas';
+import { exportGraph, type GraphExportFormat } from './graph-export';
 import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
 import { assigneeInitials, blockersFor, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction } from './graph-model';
-import { GraphNotes } from './graph-notes';
+import { GraphNotes, type NoteFocus } from './graph-notes';
 import { localizeMessage, PreferenceControls, usePreferences } from './i18n';
+import { PanelSplitter } from './panel-splitter';
 import { defaultCardFields, GraphViewControls, type FocusMode } from './view-controls';
 
 const emptyGraph: JiraGraph = { issues: [], edges: [], linkTypes: [], storyPointsFields: [], warnings: [] };
 const demoQuery = 'project in (MIG, OPS) ORDER BY key ASC';
+const DescriptionDialog = lazy(() => import('./description-dialog'));
 
 type Notice = { text: string; error?: boolean; retry?: JiraLinkInput };
 type Modal = { kind: 'create'; source?: JiraIssue } |
   { kind: 'link'; source: string; target: string } | { kind: 'edit'; issue: JiraIssue } |
-  { kind: 'delete'; edge: JiraEdge };
+  { kind: 'description'; issue: JiraIssue } | { kind: 'delete'; edge: JiraEdge };
 
 const issueKey = /^[A-Z][A-Z0-9_]*-\d+$/i;
+
+function restrictGraph(graph: JiraGraph, keys: ReadonlySet<string>): JiraGraph {
+  return {
+    ...graph,
+    issues: graph.issues.filter(({ key }) => keys.has(key)),
+    edges: graph.edges.filter(({ source, target }) => keys.has(source) && keys.has(target)),
+  };
+}
 
 type GraphTab = { id: number; query?: string; project?: string };
 const initialTabs: GraphTab[] = [{ id: 1 }];
@@ -142,8 +153,20 @@ export function App() {
           <span className="app-version" title={t('Версия приложения', 'Application version')}>v{__APP_VERSION__}</span>
         </div>
       </div>
-      <div className="topbar-divider" />
-      <span className="topbar-section">{t('Граф зависимостей', 'Dependency graph')}</span>
+      <div className="workspace-tabs">
+        <div className="workspace-tablist" role="tablist" aria-label={t('Графы', 'Graphs')}>
+          {tabs.map((tab, index) => <button key={tab.id} type="button" id={graphTabId(tab.id)}
+            role="tab" aria-selected={activeTab === tab.id} aria-controls={graphPanelId(tab.id)}
+            tabIndex={activeTab === tab.id ? 0 : -1} title={tab.query}
+            onClick={() => setActiveTab(tab.id)} onKeyDown={(event) => navigateTabs(event, index)}>
+            {t(`Граф ${tab.id}`, `Graph ${tab.id}`)}{tab.project && ` · ${tab.project}`}
+          </button>)}
+        </div>
+        <button className="icon-button" type="button" aria-label={t('Новая вкладка', 'New graph tab')}
+          title={t('Новая вкладка', 'New graph tab')} disabled={restoring || disconnecting} onClick={openTab}><Plus size={16} /></button>
+        {tabs.length > 1 && <button className="icon-button" type="button" aria-label={t('Закрыть вкладку', 'Close graph tab')}
+          title={t('Закрыть вкладку', 'Close graph tab')} disabled={busyTabs.includes(activeTab)} onClick={closeTab}><X size={15} /></button>}
+      </div>
       <div className="topbar-actions">
         <PreferenceControls />
         {connection ? <>
@@ -161,20 +184,6 @@ export function App() {
         </>}
       </div>
     </header>
-    <div className="workspace-tabs">
-      <div className="workspace-tablist" role="tablist" aria-label={t('Графы', 'Graphs')}>
-        {tabs.map((tab, index) => <button key={tab.id} type="button" id={graphTabId(tab.id)}
-          role="tab" aria-selected={activeTab === tab.id} aria-controls={graphPanelId(tab.id)}
-          tabIndex={activeTab === tab.id ? 0 : -1} title={tab.query}
-          onClick={() => setActiveTab(tab.id)} onKeyDown={(event) => navigateTabs(event, index)}>
-          {t(`Граф ${tab.id}`, `Graph ${tab.id}`)}{tab.project && ` · ${tab.project}`}
-        </button>)}
-      </div>
-      <button className="icon-button" type="button" aria-label={t('Новая вкладка', 'New graph tab')}
-        title={t('Новая вкладка', 'New graph tab')} disabled={restoring || disconnecting} onClick={openTab}><Plus size={16} /></button>
-      {tabs.length > 1 && <button className="icon-button" type="button" aria-label={t('Закрыть вкладку', 'Close graph tab')}
-        title={t('Закрыть вкладку', 'Close graph tab')} disabled={busyTabs.includes(activeTab)} onClick={closeTab}><X size={15} /></button>}
-    </div>
     <main className="workspace-deck">
       {tabs.map((tab) => <ReactFlowProvider key={`${connection?.url ?? 'demo'}:${tab.id}`}>
         <GraphWorkspace tabId={tab.id} active={activeTab === tab.id} connection={connection} edition={edition}
@@ -205,6 +214,8 @@ function GraphWorkspace({
 }) {
   const { language, t } = usePreferences();
   const formId = useId();
+  const graphArea = useRef<HTMLElement>(null);
+  const flow = useReactFlow();
   const [loadedGraph, setGraph] = useState(emptyGraph);
   const demoGraph = useMemo(() => makeDemoGraph(t), [t]);
   const graph = connection ? loadedGraph : demoGraph;
@@ -212,13 +223,14 @@ function GraphWorkspace({
   const [projectKey, setProjectKey] = useState('');
   const [jiraFacets, setJiraFacets] = useState<GraphFilters['facets']>({});
   const [loadedQuery, setLoadedQuery] = useState('');
+  const [queryIssueKeys, setQueryIssueKeys] = useState<ReadonlySet<string>>(new Set());
+  const [loadedSprintIds, setLoadedSprintIds] = useState<string[]>([]);
   const [includedKeys, setIncludedKeys] = useState<string[]>([]);
-  const [depth, setDepth] = useState(1);
+  const [depth, setDepth] = useState(0);
   const [storyField, setStoryField] = useState('');
   const [filters, setFilters] = useState(emptyGraphFilters);
   const [groupMode, setGroupMode] = useState<GroupMode>('hierarchy');
   const [fields, setFields] = useState<CardFields>(defaultCardFields);
-  const [showLinks, setShowLinks] = useState(true);
   const [showEdgePoints, setShowEdgePoints] = useState(false);
   const [focusMode, setFocusMode] = useState<FocusMode>('all');
   const [direction, setDirection] = useState<Direction>('LR');
@@ -229,8 +241,15 @@ function GraphWorkspace({
   const busy = sessionBusy || workspaceBusy;
   const [notice, setNotice] = useState<Notice>();
   const [modal, setModal] = useState<Modal>();
-  const [noteFocus, setNoteFocus] = useState<string>();
-  const [noteCounts, setNoteCounts] = useState<Record<string, number>>({});
+  const [noteFocus, setNoteFocus] = useState<{ key: string; mode: NoteFocus }>();
+  const [notesByIssue, setNotesByIssue] = useState<Record<string, readonly JiraGraphNote[]>>({});
+  const noteVersions = useRef(new Map<string, number>());
+  const [noteRefresh, setNoteRefresh] = useState(0);
+  const [leftWidth, setLeftWidth] = useState(237);
+  const [rightWidth, setRightWidth] = useState(259);
+  const [leftHidden, setLeftHidden] = useState(false);
+  const [rightHidden, setRightHidden] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const visibleNotice = notice ?? sessionNotice;
 
   const filterStoryField = storyField || (graph.storyPointsFields.length === 1 ? graph.storyPointsFields[0].id : undefined);
@@ -239,25 +258,47 @@ function GraphWorkspace({
   const jql = appendJqlClauses(baseJql, [scopeJql('project', projectKey), ...jiraClauses]);
   const cycleIds = useMemo(() => cyclicBlockingEdges(graph), [graph]);
   const cycleExamples = useMemo(() => graph.edges.filter(({ id }) => cycleIds.has(id)).slice(0, 5), [cycleIds, graph.edges]);
-  const filtered = useMemo(() => filterGraph(graph, filters), [graph, filters]);
+  const { search, facets, edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic } = filters;
+  const visibility = useMemo(() => ({ edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic }),
+    [edgeTypes, hideExternal, hideIsolated, crossProject, crossEpic]);
+  const filtered = useMemo(() => filterGraph(graph, visibility), [graph, visibility]);
+  const highlighted = useMemo(() => highlightedIssueKeys(graph, { search, facets }), [graph, search, facets]);
+  const showLinks = edgeTypes?.length !== 0;
   const shown = useMemo(() => {
     if (!selectedKey || focusMode === 'all' || !filtered.issues.some(({ key }) => key === selectedKey)) return filtered;
     const keys = new Set([selectedKey]);
     if (focusMode !== 'downstream') for (const key of tracePath(filtered.edges, selectedKey, 'up')) keys.add(key);
     if (focusMode !== 'upstream') for (const key of tracePath(filtered.edges, selectedKey, 'down')) keys.add(key);
-    return {
-      ...filtered, issues: filtered.issues.filter(({ key }) => keys.has(key)),
-      edges: filtered.edges.filter(({ source, target }) => keys.has(source) && keys.has(target)),
-    };
+    return restrictGraph(filtered, keys);
   }, [filtered, focusMode, selectedKey]);
-  const selected = shown.issues.find(({ key }) => key === selectedKey);
+  const visibleIssueKeys = shown.issues.map(({ key }) => key).join(',');
+  const layoutGraph = useMemo(() => restrictGraph(graph, new Set(visibleIssueKeys.split(','))), [graph, visibleIssueKeys]);
+  const selected = graph.issues.find(({ key }) => key === selectedKey);
   const edge = shown.edges.find(({ id }) => id === selectedEdge);
   const points = shown.issues.reduce((sum, issue) => sum + (issue.storyPoints ?? 0), 0);
   const hasPoints = shown.issues.some(({ storyPoints }) => storyPoints !== undefined);
   const completed = shown.issues.filter((issue) => statusTone(issue) === 'done').length;
-  const updateNoteCount = useCallback((key: string, count: number) => {
-    setNoteCounts((previous) => previous[key] === count ? previous : { ...previous, [key]: count });
+  const updateNotes = useCallback((key: string, notes: readonly JiraGraphNote[]) => {
+    noteVersions.current.set(key, (noteVersions.current.get(key) ?? 0) + 1);
+    setNotesByIssue((previous) => ({ ...previous, [key]: notes }));
   }, []);
+  const noteKeyList = useMemo(() => graph.issues.map(({ key }) => key).join(','), [graph.issues]);
+  useEffect(() => {
+    if (!active || !connection || !noteKeyList) return;
+    let current = true;
+    const versions = new Map(noteVersions.current);
+    void request('listGraphNotes', { keys: noteKeyList.split(',') }).then((discovered) => {
+      if (!current) return;
+      setNotesByIssue((previous) => {
+        const next = { ...previous };
+        for (const [key, notes] of Object.entries(discovered)) {
+          if (versions.get(key) === noteVersions.current.get(key)) next[key] = notes;
+        }
+        return next;
+      });
+    }).catch(() => undefined);
+    return () => { current = false; };
+  }, [active, connection, noteKeyList, noteRefresh]);
   useEffect(() => {
     if (!connection) setFilters(emptyGraphFilters);
   }, [connection, language]);
@@ -268,20 +309,16 @@ function GraphWorkspace({
   }
 
   function selectIssue(key?: string) {
-    if (key && !filtered.issues.some((issue) => issue.key === key)) setFilters(emptyGraphFilters);
     setSelectedEdge(undefined);
     setSelectedKey(key);
     setNoteFocus(undefined);
     if (!key) setFocusMode('all');
   }
   function selectEdge(id: string) {
+    setRightHidden(false);
     setSelectedKey(undefined);
     setSelectedEdge(id);
     setNoteFocus(undefined);
-    setFocusMode('all');
-  }
-  function resetFilters() {
-    setFilters(emptyGraphFilters);
     setFocusMode('all');
   }
   function editJql(value: string) {
@@ -306,20 +343,24 @@ function GraphWorkspace({
       const graphOptions = { depth, storyPointsField: storyField.trim() || undefined };
       const pins = normalized === loadedQuery ? includedKeys : [];
       const additional = pins.length
-        ? request('loadGraph', { ...graphOptions, jql: `key in (${pins.map((key) => `"${key}"`).join(', ')})` }).catch(() => null)
+        ? request('loadGraph', { ...graphOptions, depth: Math.max(1, depth), jql: `key in (${pins.map((key) => `"${key}"`).join(', ')})` }).catch(() => null)
         : undefined;
       let result = await request('loadGraph', { ...graphOptions, jql: normalized });
+      const roots = result.issues.filter(({ external }) => !external);
       if (additional) {
         const pinned = await additional;
-        result = pinned ? mergeGraphs(result, pinned) : {
+        result = pinned ? mergeGraphs(result, depth === 0 ? restrictGraph(pinned, new Set([...result.issues.map(({ key }) => key), ...pins])) : pinned) : {
           ...result, warnings: [...result.warnings, t('Не удалось обновить добавленные вручную задачи.', 'Could not reload the manually included issues.')],
         };
       }
       setLoadedQuery(normalized);
-      const projects = new Set(result.issues.flatMap(({ project, external }) => project && !external ? [project] : []));
+      setQueryIssueKeys(new Set(roots.map(({ key }) => key)));
+      setLoadedSprintIds((jiraFacets.sprints ?? []).flatMap((value) => sprintFacetId(value) ?? []));
+      const projects = new Set(roots.flatMap(({ project }) => project ? [project] : []));
       onLoad(normalized, projectKey || (projects.size === 1 ? projects.values().next().value : undefined));
       setIncludedKeys(pins);
       setGraph(result);
+      setNoteRefresh((previous) => previous + 1);
       setLayoutGeneration((previous) => previous + 1);
       if (!result.issues.some(({ key }) => key === selectedKey)) selectIssue();
     } catch (cause) { setNotice({ text: errorMessage(cause), error: true }); }
@@ -330,13 +371,23 @@ function GraphWorkspace({
     const key = raw.trim().toUpperCase();
     if (!connection || busy) return;
     if (!issueKey.test(key)) throw new Error(t('Введи ключ Jira, например PROJ-123.', 'Enter a Jira key such as PROJ-123.'));
+    if (graph.issues.some((issue) => issue.key === key)) {
+      selectIssue(key);
+      setRightHidden(false);
+      setFocusMode('all');
+      const node = flow.getNode(key);
+      if (node) void flow.setCenter(node.position.x + (node.width ?? 0) / 2, node.position.y + (node.height ?? 0) / 2,
+        { zoom: Math.max(flow.getZoom(), 0.75), duration: 220 });
+      return;
+    }
     setBusy(true);
     try {
-      const result = await request('loadGraph', { jql: `key = "${key}"`, depth, storyPointsField: storyField || undefined });
+      const result = await request('loadGraph', { jql: `key = "${key}"`, depth: Math.max(1, depth), storyPointsField: storyField || undefined });
       if (!result.issues.some((issue) => issue.key === key)) throw new Error(t('Задача не найдена или недоступна.', 'The issue was not found or is unavailable.'));
-      setGraph((previous) => mergeGraphs(previous, result));
+      setGraph((previous) => mergeGraphs(previous, depth === 0 ? restrictGraph(result, new Set([...previous.issues.map((issue) => issue.key), key])) : result));
       setIncludedKeys((previous) => previous.includes(key) ? previous : [...previous, key]);
-      resetFilters();
+      setFocusMode('all');
+      setRightHidden(false);
       selectIssue(key);
       setNotice({ text: t(`${key} добавлена на граф.`, `${key} added to the graph.`) });
     } finally { setBusy(false); }
@@ -358,7 +409,6 @@ function GraphWorkspace({
     } satisfies JiraEdge;
     setGraph((previous) => previous.edges.some(({ id }) => id === edge.id)
       ? previous : { ...previous, edges: [...previous.edges, edge] });
-    setFilters((previous) => ({ ...previous, edgeTypes: [] }));
     if (!saved) setNotice({ text: t('Связь сохранена в Jira. Обнови граф, чтобы получить её идентификатор.', 'The link was saved in Jira. Reload the graph to get its ID.') });
   }
   async function create(input: JiraIssueInput, source?: JiraIssue, typeId?: string) {
@@ -385,7 +435,8 @@ function GraphWorkspace({
     selectIssue(issue.key);
     if (issueKey.test(issue.key)) setIncludedKeys((previous) => previous.includes(issue.key) ? previous : [...previous, issue.key]);
     setModal(undefined);
-    resetFilters();
+    setFocusMode('all');
+    setRightHidden(false);
     setNotice({ text: t(`Задача ${issue.key} создана в Jira.`, `Issue ${issue.key} created in Jira.`) });
     if (source && typeId) {
       const retry = { source: source.key, target: issue.key, typeId };
@@ -417,12 +468,25 @@ function GraphWorkspace({
   function launchIssue(issue: JiraIssue) {
     void openIssue(issue).catch((cause: unknown) => setNotice({ text: errorMessage(cause), error: true }));
   }
+  async function saveGraph(format: GraphExportFormat) {
+    const canvas = graphArea.current?.querySelector<HTMLElement>('.canvas');
+    if (!canvas || exporting) return;
+    setExporting(true);
+    try {
+      await exportGraph(canvas, format, `jira-dag-graph-${tabId}`, direction, shown.edges, t('Родительская задача', 'Parent issue'));
+    } catch {
+      setNotice({ text: t('Не удалось экспортировать граф.', 'Could not export the graph.'), error: true });
+    } finally {
+      setExporting(false);
+    }
+  }
   const project = selected?.project ?? (projectKey || /\bproject\s*=\s*"?([A-Z][A-Z0-9_]*)/i.exec(jql)?.[1] || '');
 
   return (
     <section className={active ? 'workspace' : 'workspace workspace-inactive'} role="tabpanel"
+      style={{ '--left-panel-width': `${leftWidth}px`, '--right-panel-width': `${rightWidth}px` } as CSSProperties}
       id={graphPanelId(tabId)} aria-labelledby={graphTabId(tabId)} aria-hidden={!active} inert={!active}>
-        <aside className="sidebar" aria-label={t('Настройки графа', 'Graph settings')}>
+        <aside className="sidebar" hidden={leftHidden} aria-label={t('Настройки графа', 'Graph settings')}>
           <div className="sidebar-scroll">
             <form className="scope-form" onSubmit={(event) => void load(event)}>
               <h2><Crosshair size={16} /> {t('Область графа', 'Graph scope')}</h2>
@@ -455,16 +519,19 @@ function GraphWorkspace({
                 {connection ? t('Загрузить граф', 'Load graph') : t('Подключить для загрузки', 'Connect to load')}
               </button>
               {connection && <GraphJqlFilters graph={graph} edition={edition}
-                storyField={filterStoryField} selected={jiraFacets} onChange={setJiraFacets} />}
+                storyField={filterStoryField} selected={jiraFacets} onChange={setJiraFacets} queryIssueKeys={queryIssueKeys} />}
             </form>
             <div className="sidebar-line" />
             <GraphFilterPanel graph={graph} filters={filters} connected={Boolean(connection)} onChange={setFilters} />
           </div>
-          <div className="sidebar-foot"><Box size={15} /> {window.jiraDag ? t('Десктоп', 'Desktop') : t('Веб-версия', 'Web')}</div>
         </aside>
-        <section className="graph-area" aria-label={t('Граф', 'Graph')}>
+        {!leftHidden && <PanelSplitter side="left" width={leftWidth} onWidthChange={setLeftWidth} />}
+        <section className="graph-area" ref={graphArea} aria-label={t('Граф', 'Graph')}>
           <div className="graph-header">
             <div>
+              <button className="icon-button" type="button" aria-label={t('Панель фильтров', 'Filters panel')}
+                title={leftHidden ? t('Показать фильтры', 'Show filters') : t('Скрыть фильтры', 'Hide filters')}
+                aria-expanded={!leftHidden} onClick={() => setLeftHidden(!leftHidden)}><PanelLeft size={17} /></button>
               <h1>{connection ? t('Граф зависимостей', 'Dependency graph') : t('Миграция базы данных', 'Database migration')}</h1>
               <div className="graph-stats">
                 <span><Layers3 size={14} /> {t(`Задачи ${shown.issues.length}`, `Issues ${shown.issues.length}`)}</span>
@@ -483,17 +550,32 @@ function GraphWorkspace({
               </button>
               <button className="icon-button outline" title={t('Обновить граф', 'Reload graph')} aria-label={t('Обновить граф', 'Reload graph')}
                 disabled={!connection || busy || !jql.trim()} onClick={() => void load()}><RefreshCw size={17} /></button>
+              <details className="view-menu graph-export-menu">
+                <summary><Download size={15} aria-hidden="true" /> {t('Экспорт', 'Export')}</summary>
+                <div>
+                  {(['pdf', 'png', 'mermaid'] as const).map((format) => <button type="button" className="button secondary"
+                    key={format} disabled={exporting || !shown.issues.length} onClick={(event) => {
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                      void saveGraph(format);
+                    }}>{format === 'mermaid' ? 'Mermaid' : format.toUpperCase()}</button>)}
+                </div>
+              </details>
               <button className="button primary" disabled={busy} onClick={() => addTask()}><Plus size={18} /> {t('Новая задача', 'New issue')}</button>
+              {(selected || edge) && <button className="icon-button" type="button" aria-label={t('Панель сведений', 'Details panel')}
+                title={rightHidden ? t('Показать сведения', 'Show details') : t('Скрыть сведения', 'Hide details')}
+                aria-expanded={!rightHidden} onClick={() => setRightHidden(!rightHidden)}><PanelRight size={17} /></button>}
             </div>
           </div>
           <GraphViewControls groupMode={groupMode} onGroupMode={(mode) => {
             setGroupMode(mode);
             setLayoutGeneration((generation) => generation + 1);
           }} fields={fields} onFields={setFields} showEdgePoints={showEdgePoints} onShowEdgePoints={setShowEdgePoints}
-          showLinks={showLinks} onShowLinks={(value) => {
-            setShowLinks(value);
-            if (!value) setSelectedEdge(undefined);
+          graph={graph} showLinks={showLinks} linkTypes={edgeTypes}
+          onLinkTypes={(value) => {
+            setFilters((previous) => ({ ...previous, edgeTypes: value }));
+            setSelectedEdge(undefined);
           }}
+          visibility={visibility} onVisibilityChange={(value) => setFilters((previous) => ({ ...previous, ...value }))}
           focusMode={focusMode} onFocusMode={setFocusMode} selected={Boolean(selected)}
           connected={Boolean(connection)} busy={busy} onInclude={includeIssue} />
           {graph.warnings.length > 0 && <details className="graph-warning">
@@ -519,12 +601,18 @@ function GraphWorkspace({
               )}</span>}
             </details>}
           </div>
-          <GraphCanvas key={layoutGeneration} flowId={`graph-canvas-${tabId}`} graph={shown} basis={graph} cycleIds={cycleIds}
+          <GraphCanvas key={layoutGeneration} flowId={`graph-canvas-${tabId}`} graph={shown} layoutGraph={layoutGraph} basis={graph} cycleIds={cycleIds}
             direction={direction} groupMode={groupMode}
-            fields={fields} showLinks={showLinks} showEdgePoints={showEdgePoints} connected={Boolean(connection)} noteCounts={noteCounts}
+            fields={fields} showLinks={showLinks} showEdgePoints={showEdgePoints} connected={Boolean(connection)} notesByIssue={notesByIssue}
+            preferredSprintIds={loadedSprintIds} highlightedKeys={highlighted}
             selectedKey={selected?.key} selectedEdge={edge?.id} editable={Boolean(connection && !busy && graph.linkTypes.length)}
             onSelectIssue={selectIssue} onSelectEdge={selectEdge} onOpenIssue={launchIssue}
-            onNoteIssue={(key) => { selectIssue(key); setNoteFocus(key); }}
+            onCreateRelated={busy ? undefined : addTask}
+            onNoteIssue={(key, focusInput) => {
+              selectIssue(key);
+              setRightHidden(false);
+              setNoteFocus({ key, mode: focusInput ? 'input' : 'list' });
+            }}
             onConnect={({ source, target }) => {
               if (source !== target) setModal({ kind: 'link', source, target });
             }} />
@@ -536,11 +624,13 @@ function GraphWorkspace({
               notice ? setNotice(undefined) : onDismissSessionNotice()}><X size={15} /></button>
           </div>}
         </section>
-        {selected && <IssueInspector key={selected.key} issue={selected} graph={graph} connected={Boolean(connection)} active={active} busy={busy}
-          noteFocus={noteFocus === selected.key} onNoteCount={updateNoteCount}
+        {(selected || edge) && !rightHidden && <PanelSplitter side="right" width={rightWidth} onWidthChange={setRightWidth} />}
+        {selected && <IssueInspector key={selected.key} issue={selected} graph={graph} connected={Boolean(connection)} active={active && !rightHidden}
+          hidden={rightHidden} busy={busy} noteFocus={noteFocus?.key === selected.key ? noteFocus.mode : undefined} onNotes={updateNotes}
           onClose={() => selectIssue()} onSelect={selectIssue} onAdd={() => addTask(selected)} onEdit={() => editIssue(selected)}
+          onDescription={() => setModal({ kind: 'description', issue: selected })}
           onOpen={() => launchIssue(selected)} />}
-        {edge && <aside className="inspector" aria-label={t('Связь', 'Link')}>
+        {edge && <aside className="inspector" hidden={rightHidden} aria-label={t('Связь', 'Link')}>
           <div className="inspector-heading"><h2><GitBranch size={16} /> {t('Связь', 'Link')}</h2>
             <button className="icon-button" aria-label={t('Закрыть сведения о связи', 'Close link details')} onClick={() => selectIssue()}><X size={17} /></button></div>
           <div className="inspector-content">
@@ -553,7 +643,11 @@ function GraphWorkspace({
           </div>
         </aside>}
       {modal?.kind === 'create' && <CreateDialog project={modal.source?.project ?? project} source={modal.source} types={graph.linkTypes}
+        currentUser={connection?.displayName}
         onCreate={(input, typeId) => create(input, modal.source, typeId)} onClose={() => setModal(undefined)} />}
+      {modal?.kind === 'description' && <Suspense>
+        <DescriptionDialog issue={modal.issue} onClose={() => setModal(undefined)} />
+      </Suspense>}
       {modal?.kind === 'link' && <LinkDialog source={modal.source} target={modal.target} types={graph.linkTypes}
         onLink={async (typeId) => { await link({ source: modal.source, target: modal.target, typeId }); setModal(undefined); }}
         onClose={() => setModal(undefined)} />}
@@ -564,6 +658,8 @@ function GraphWorkspace({
           issues: previous.issues.map((item) => item.key !== input.key ? item : {
             ...item, summary: issue.summary,
             description: input.description === undefined ? item.description : issue.description ?? input.description,
+            descriptionMarkdown: input.description === undefined ? item.descriptionMarkdown : issue.descriptionMarkdown,
+            descriptionReadOnly: input.description === undefined ? item.descriptionReadOnly : issue.descriptionReadOnly,
           }),
         }));
         setModal(undefined);
@@ -580,10 +676,10 @@ function GraphWorkspace({
   );
 }
 
-function IssueInspector({ issue, graph, connected, active, busy, noteFocus, onNoteCount, onClose, onSelect, onAdd, onEdit, onOpen }: {
-  issue: JiraIssue; graph: JiraGraph; connected: boolean; active: boolean; busy: boolean;
-  noteFocus: boolean; onNoteCount(key: string, count: number): void;
-  onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onOpen(): void;
+function IssueInspector({ issue, graph, connected, active, hidden, busy, noteFocus, onNotes, onClose, onSelect, onAdd, onEdit, onDescription, onOpen }: {
+  issue: JiraIssue; graph: JiraGraph; connected: boolean; active: boolean; hidden: boolean; busy: boolean;
+  noteFocus?: NoteFocus; onNotes(key: string, notes: readonly JiraGraphNote[]): void;
+  onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onDescription(): void; onOpen(): void;
 }) {
   const { t } = usePreferences();
   const { assignee, key } = issue;
@@ -599,7 +695,7 @@ function IssueInspector({ issue, graph, connected, active, busy, noteFocus, onNo
   const avatarUrl = avatar?.name === assignee ? avatar?.url : undefined;
   const blockers = blockersFor(graph, issue.key);
   const linked = graph.edges.filter(({ source, target }) => source === issue.key || target === issue.key);
-  return <aside className="inspector" aria-label={t('Сведения о задаче', 'Issue details')}>
+  return <aside className="inspector" hidden={hidden} aria-label={t('Сведения о задаче', 'Issue details')}>
     <div className="inspector-heading"><h2><Layers3 size={16} /> {t('Задача', 'Issue')}</h2>
       <button className="icon-button" aria-label={t('Закрыть сведения о задаче', 'Close issue details')} onClick={onClose}><X size={17} /></button>
     </div>
@@ -615,7 +711,8 @@ function IssueInspector({ issue, graph, connected, active, busy, noteFocus, onNo
         <div><small>{t('Исполнитель', 'Assignee')}</small>{assignee}</div>
       </div>}
       {!!issue.labels?.length && <p className="assignee">{issue.labels.map((label) => `#${label}`).join(' ')}</p>}
-      {issue.description && <p className="issue-description">{issue.description}</p>}
+      {(issue.descriptionMarkdown || issue.description) && <button type="button" className="button secondary full issue-description-button"
+        onClick={onDescription}><FileText size={15} /> {t('Открыть описание', 'View description')}</button>}
       <section className="inspector-block">
         <h4>{t('Открытые блокеры', 'Open blockers')} <b>{blockers.length}</b></h4>
         {blockers.length ? blockers.map((blocker) => <button className="related" key={blocker.key} onClick={() => onSelect(blocker.key)}>
@@ -642,7 +739,7 @@ function IssueInspector({ issue, graph, connected, active, busy, noteFocus, onNo
         </button>}
         <button className="button secondary full" onClick={onOpen}><ArrowUpRight size={15} /> {t('Открыть в Jira', 'Open in Jira')}</button>
       </div>}
-      {connected && <GraphNotes key={issue.key} issueKey={issue.key} focus={noteFocus} onCount={onNoteCount} />}
+      {connected && <GraphNotes key={issue.key} issueKey={issue.key} focus={noteFocus} onNotes={onNotes} />}
     </div>
   </aside>;
 }
@@ -675,7 +772,9 @@ function EditDialog({ issue, onSave, onClose }: {
     <form className="dialog-form" onSubmit={submit}>
       <fieldset disabled={busy}>
         <label>{t('Название', 'Summary')}<input name="summary" defaultValue={issue.summary} required maxLength={255} /></label>
-        {!issue.external && <label>{t('Описание', 'Description')}<textarea name="description" defaultValue={issue.description} rows={5} /></label>}
+      {!issue.external && (issue.descriptionReadOnly
+        ? <p className="form-hint">{t('Форматированное описание можно редактировать в Jira.', 'Edit the rich description in Jira.')}</p>
+        : <label>{t('Описание', 'Description')}<textarea name="description" defaultValue={issue.description} rows={5} /></label>)}
       </fieldset>
       {error && <p className="form-error" role="alert">{localizeMessage(error, language)}</p>}
       <div className="dialog-actions">

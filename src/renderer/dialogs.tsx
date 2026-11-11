@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ArrowRight, CircleHelp, GitBranch, LoaderCircle, LockKeyhole, X } from 'lucide-react';
 import type {
   JiraCreateField, JiraCreateOptions, JiraEdition, JiraIssue, JiraIssueInput, JiraLinkType, JiraLogin,
@@ -12,17 +12,19 @@ interface DialogProps {
   children: ReactNode;
   onClose(): void;
   busy?: boolean;
+  className?: string;
 }
 
-export function Dialog({ title, children, onClose, busy }: DialogProps) {
+export function Dialog({ title, children, onClose, busy, className }: DialogProps) {
   const { t } = usePreferences();
+  const titleId = useId();
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => { ref.current?.showModal(); }, []);
   return (
-    <dialog ref={ref} className="dialog" aria-labelledby="dialog-title"
+    <dialog ref={ref} className={className ? `dialog ${className}` : 'dialog'} aria-labelledby={titleId}
       onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}>
       <header className="dialog-heading">
-        <h2 id="dialog-title">{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button type="button" className="icon-button" aria-label={t('Закрыть', 'Close')} disabled={busy} onClick={onClose}><X size={18} /></button>
       </header>
       {children}
@@ -150,12 +152,13 @@ function RequiredField({ field }: { field: JiraCreateField }) {
   return <label>{field.name}{control}</label>;
 }
 
-const standardFields = new Set(['project', 'issuetype', 'summary', 'description']);
+const standardFields = new Set(['project', 'issuetype', 'summary', 'description', 'reporter']);
 
-export function CreateDialog({ project, source, types, onCreate, onClose }: {
+export function CreateDialog({ project, source, types, currentUser, onCreate, onClose }: {
   project: string;
   source?: JiraIssue;
   types: JiraLinkType[];
+  currentUser?: string;
   onCreate(input: JiraIssueInput, linkTypeId?: string): Promise<void>;
   onClose(): void;
 }) {
@@ -263,6 +266,9 @@ export function CreateDialog({ project, source, types, onCreate, onClose }: {
           {options && !options.issueTypes.length && <p className="form-hint">{t('В проекте нет доступных типов задач.', 'This project has no available issue types.')}</p>}
           <label>{t('Название', 'Summary')}<input name="summary" placeholder={t('Например, удалить старую колонку', 'For example, remove the old column')} required maxLength={255} /></label>
           <label>{t('Описание', 'Description')}<textarea name="description" rows={3} placeholder={t('Что нужно сделать', 'What needs to be done')} required={requiresDescription} /></label>
+          {currentUser && fieldOptions?.fields.some(({ id }) => id === 'reporter') && <div className="create-reporter">
+            <span>{t('Автор', 'Reporter')}</span><strong>{currentUser}</strong>
+          </div>}
           {fieldsError && <p className="form-error" role="alert">{localizeMessage(fieldsError, language)}</p>}
           {required.map((field) => <RequiredField field={field} key={field.id} />)}
           {source && <label>{t('Тип связи', 'Link type')}

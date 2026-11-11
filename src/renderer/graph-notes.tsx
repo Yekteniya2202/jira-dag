@@ -4,10 +4,12 @@ import type { JiraGraphNote } from '../shared/contracts';
 import { errorMessage, request, RequestError } from './api';
 import { localizeMessage, usePreferences } from './i18n';
 
-export function GraphNotes({ issueKey, focus, onCount }: {
+export type NoteFocus = 'input' | 'list';
+
+export function GraphNotes({ issueKey, focus, onNotes }: {
   issueKey: string;
-  focus: boolean;
-  onCount(issueKey: string, count: number): void;
+  focus?: NoteFocus;
+  onNotes(issueKey: string, notes: readonly JiraGraphNote[]): void;
 }) {
   const { language, t } = usePreferences();
   const noteInputId = useId();
@@ -20,6 +22,7 @@ export function GraphNotes({ issueKey, focus, onCount }: {
   const [refreshRequired, setRefreshRequired] = useState(false);
   const [deleteId, setDeleteId] = useState<string>();
   const input = useRef<HTMLTextAreaElement>(null);
+  const section = useRef<HTMLElement>(null);
   const date = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
 
   useEffect(() => {
@@ -40,15 +43,16 @@ export function GraphNotes({ issueKey, focus, onCount }: {
   }, [issueKey, reload]);
 
   useEffect(() => {
-    if (focus && input.current) {
+    if (focus === 'input' && input.current) {
       input.current.focus();
       input.current.scrollIntoView({ block: 'nearest' });
     }
+    if (focus === 'list') section.current?.scrollIntoView({ block: 'start' });
   }, [focus, issueKey]);
 
   useEffect(() => {
-    if (!loading && !error) onCount(issueKey, notes.length);
-  }, [error, issueKey, loading, notes.length, onCount]);
+    if (!loading && !error) onNotes(issueKey, notes);
+  }, [error, issueKey, loading, notes, onNotes]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -86,7 +90,7 @@ export function GraphNotes({ issueKey, focus, onCount }: {
     }
   }
 
-  return <section className="inspector-block graph-notes" aria-label={t('Заметки на графе', 'Graph notes')}>
+  return <section ref={section} className="inspector-block graph-notes" aria-label={t('Заметки на графе', 'Graph notes')}>
     <h4><MessageSquareText size={14} /> {t('Заметки на графе', 'Graph notes')} <b>{notes.length}</b></h4>
     {loading && <p role="status">{t('Загрузка заметок…', 'Loading notes…')}</p>}
     {!loading && !error && !notes.length && <p>{t('Заметок пока нет.', 'No notes yet.')}</p>}

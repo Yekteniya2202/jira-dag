@@ -1,12 +1,18 @@
 import dagre from '@dagrejs/dagre';
-import type { JiraEdge, JiraGraph, JiraIssue } from '../shared/contracts.js';
+import type { JiraEdge, JiraGraph, JiraIssue, JiraSprint } from '../shared/contracts.js';
 import { blockingEdges, CARD_WIDTH, statusTone, type Direction, type GraphPosition } from './graph-model.js';
 
 export type GroupMode = 'none' | 'hierarchy' | 'project' | 'status' | 'assignee' | 'sprint' | 'release' | 'priority' | 'level' | 'open-level';
+type FieldGroup = Exclude<GroupMode, 'none' | 'hierarchy'>;
+type GroupVariant = FieldGroup | 'sprint-unscheduled' | 'sprint-external';
+
+interface GroupAppearance { variant: GroupVariant; color?: number }
 
 export interface LayoutLabels {
   component: string;
   emptyGroup: string;
+  unscheduledSprint: string;
+  externalSprint: string;
   level: string;
   cycle: string;
   done: string;
@@ -19,17 +25,20 @@ export interface GraphZone extends GraphPosition, Dimensions {
   title: string;
   kind: 'component' | 'epic' | 'group' | 'nested';
   epicKey?: string;
+  appearance?: GroupAppearance;
   issues: number;
   done: number;
   points?: number;
 }
 
-interface GroupName { key: string; title: string; epicKey?: string }
+interface GroupName { key: string; title: string; epicKey?: string; appearance?: GroupAppearance }
+type FieldGroupName = GroupName & { appearance: GroupAppearance };
 
 interface GroupTree {
   id: string;
   title: string;
   epicKey?: string;
+  appearance?: GroupAppearance;
   issues: JiraIssue[];
   children: Map<string, GroupTree>;
 }
@@ -43,6 +52,16 @@ interface LayoutBox extends Dimensions {
 }
 
 const gap = 52;
+export const NOTE_WIDTH = 204;
+export const NOTE_HEIGHT = 82;
+const noteGap = 12;
+const groupColors = 8;
+
+export function notePosition(anchor: GraphPosition & Dimensions, direction: Direction): GraphPosition {
+  return direction === 'LR'
+    ? { x: anchor.x + (anchor.width - NOTE_WIDTH) / 2, y: anchor.y + anchor.height + noteGap }
+    : { x: anchor.x + anchor.width + noteGap, y: anchor.y };
+}
 
 export function connectedParts(issues: JiraIssue[], edges: JiraEdge[], groups = new Map<string, GroupName[]>()) {
   const roots = new Map(issues.map(({ key }) => [key, key]));
@@ -153,31 +172,55 @@ function hierarchyGroups(graph: JiraGraph): Map<string, GroupName[]> {
   }));
 }
 
-function groupPaths(graph: JiraGraph, mode: GroupMode, labels: LayoutLabels): Map<string, GroupName[]> {
+const sprintRank: Record<NonNullable<JiraSprint['state']>, number> = { active: 0, future: 1, closed: 2 };
+const sprintIdOrder = new Intl.Collator('en', { numeric: true });
+
+function sprintGroup(issue: JiraIssue, preferred: ReadonlySet<string>, labels: LayoutLabels): FieldGroupName {
+  const rank = ({ state }: JiraSprint) => state ? sprintRank[state] : 3;
+  const sprint = issue.sprintDetails?.toSorted((left, right) =>
+    Number(preferred.has(right.id)) - Number(preferred.has(left.id)) ||
+    rank(left) - rank(right) || sprintIdOrder.compare(right.id, left.id),
+  )[0];
+  if (sprint) return { key: `sprint:id:${sprint.id}`, title: sprint.name, appearance: { variant: 'sprint' } };
+
+  const name = issue.sprints?.findLast((value) => value.trim());
+  if (name) return { key: `sprint:name:${name}`, title: name, appearance: { variant: 'sprint' } };
+
+  return issue.external
+    ? { key: 'sprint:external', title: labels.externalSprint, appearance: { variant: 'sprint-external' } }
+    : { key: 'sprint:unscheduled', title: labels.unscheduledSprint, appearance: { variant: 'sprint-unscheduled' } };
+}
+
+function groupPaths(graph: JiraGraph, mode: GroupMode, labels: LayoutLabels, preferredSprintIds: readonly string[]): Map<string, GroupName[]> {
   if (mode === 'none') return new Map();
   if (mode === 'hierarchy') return hierarchyGroups(graph);
+  const preferred = new Set(preferredSprintIds);
   const levels = mode === 'level' || mode === 'open-level' ? dependencyLevels(graph, mode === 'open-level') : undefined;
-  return new Map(graph.issues.map((issue) => {
+  const groups = graph.issues.map((issue): [string, FieldGroupName] => {
+    if (mode === 'sprint') return [issue.key, sprintGroup(issue, preferred, labels)];
     const level = levels?.get(issue.key);
-    const choices: Record<Exclude<GroupMode, 'none' | 'hierarchy'>, string | undefined> = {
+    const choices: Record<Exclude<FieldGroup, 'sprint'>, string | undefined> = {
       project: issue.project, status: issue.status, assignee: issue.assignee,
-      sprint: issue.sprints?.join(' / '), release: issue.fixVersions?.join(' / '), priority: issue.priority,
+      release: issue.fixVersions?.join(' / '), priority: issue.priority,
       level: level ? `${labels.level} ${level}` : labels.cycle,
       'open-level': statusTone(issue) === 'done' ? labels.done : level ? `${labels.level} ${level}` : labels.cycle,
     };
-    const title = choices[mode] || labels.emptyGroup;
-    return [issue.key, [{ key: title, title }]];
-  }));
+    const name = choices[mode];
+    return [issue.key, { key: name ? `value:${name}` : 'unassigned', title: name || labels.emptyGroup, appearance: { variant: mode } }];
+  });
+  const namedGroups = [...new Set(groups.flatMap(([, { key, appearance }]) => appearance.variant === mode ? [key] : []))].sort();
+  const colors = new Map(namedGroups.map((key, index) => [key, index % groupColors]));
+  return new Map(groups.map(([key, group]) => [key, [{ ...group, appearance: { ...group.appearance, color: colors.get(group.key) } }]]));
 }
 
 function groupTree(issues: JiraIssue[], paths: Map<string, GroupName[]>, id: string): GroupTree {
   const root: GroupTree = { id, title: '', issues: [], children: new Map() };
   for (const issue of issues) {
     let group = root;
-    for (const { key, title, epicKey } of paths.get(issue.key) ?? []) {
+    for (const { key, title, epicKey, appearance } of paths.get(issue.key) ?? []) {
       let child = group.children.get(key);
       if (!child) {
-        child = { id: `${group.id}/${encodeURIComponent(key)}`, title, epicKey, issues: [], children: new Map() };
+        child = { id: `${group.id}/${encodeURIComponent(key)}`, title, epicKey, appearance, issues: [], children: new Map() };
         group.children.set(key, child);
       }
       group = child;
@@ -201,12 +244,12 @@ function moveBox(target: LayoutBox, box: LayoutBox, x: number, y: number) {
   if (box.points !== undefined) target.points = (target.points ?? 0) + box.points;
 }
 
-function zone(box: LayoutBox, id: string, title: string, kind: GraphZone['kind'], epicKey?: string): GraphZone {
-  return { id, title, kind, epicKey, x: 0, y: 0, width: box.width, height: box.height,
+function zone(box: LayoutBox, id: string, title: string, kind: GraphZone['kind']): GraphZone {
+  return { id, title, kind, x: 0, y: 0, width: box.width, height: box.height,
     issues: box.issues, done: box.done, points: box.points };
 }
 
-function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, cardHeight: number, depth = 0): LayoutBox {
+function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, cardHeight: number, notes: ReadonlySet<string>, depth = 0): LayoutBox {
   const items = new Map<string, LayoutBox>();
   const memberToGroup = new Map<string, string>();
   const withinGroups = new Map<string, JiraEdge[]>();
@@ -214,8 +257,11 @@ function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, ca
   const epic = tree.issues.find(({ key }) => key === tree.epicKey);
   for (const issue of tree.issues) {
     if (issue === epic) continue;
+    const hasNote = notes.has(issue.key);
     items.set(issue.key, {
-      width: CARD_WIDTH, height: cardHeight, issues: 1, done: statusTone(issue) === 'done' ? 1 : 0,
+      width: CARD_WIDTH + (hasNote && direction === 'TB' ? noteGap + NOTE_WIDTH : 0),
+      height: cardHeight + (hasNote && direction === 'LR' ? noteGap + NOTE_HEIGHT : 0),
+      issues: 1, done: statusTone(issue) === 'done' ? 1 : 0,
       points: issue.storyPoints, positions: new Map([[issue.key, { x: 0, y: 0 }]]), zones: [],
     });
   }
@@ -230,7 +276,7 @@ function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, ca
     else projected.push([source, target]);
   }
   for (const group of tree.children.values()) {
-    items.set(group.id, layoutTree(group, withinGroups.get(group.id)!, direction, cardHeight, depth + 1));
+    items.set(group.id, layoutTree(group, withinGroups.get(group.id)!, direction, cardHeight, notes, depth + 1));
   }
   const layout = new dagre.graphlib.Graph().setGraph({
     rankdir: direction, nodesep: 36, ranksep: 82, marginx: depth ? 22 : 0, marginy: depth ? 20 : 0,
@@ -253,13 +299,23 @@ function layoutTree(tree: GroupTree, edges: JiraEdge[], direction: Direction, ca
   }
   if (depth) {
     const kind = tree.epicKey ? 'epic' : depth === 1 ? 'group' : 'nested';
-    box.zones.unshift(zone(box, tree.id, tree.title, kind, tree.epicKey));
+    box.zones.unshift({ ...zone(box, tree.id, tree.title, kind), epicKey: tree.epicKey, appearance: tree.appearance });
+    if (tree.epicKey && notes.has(tree.epicKey)) {
+      box.width += noteGap + NOTE_WIDTH;
+      box.height = Math.max(box.height, NOTE_HEIGHT);
+    }
   }
   return box;
 }
 
-export function layoutWorkspace(graph: JiraGraph, direction: Direction, mode: GroupMode, labels: LayoutLabels, cardHeight: number, basis = graph) {
-  const paths = groupPaths(basis, mode, labels);
+interface LayoutOptions {
+  preferredSprintIds?: readonly string[];
+  noteKeys?: ReadonlySet<string>;
+}
+
+export function layoutWorkspace(graph: JiraGraph, direction: Direction, mode: GroupMode, labels: LayoutLabels, cardHeight: number, basis = graph,
+  { preferredSprintIds = [], noteKeys = new Set() }: LayoutOptions = {}) {
+  const paths = groupPaths(basis, mode, labels, preferredSprintIds);
   const parts = connectedParts(graph.issues, graph.edges, paths);
   const epicKeys = new Set(graph.issues.filter(({ key }) => paths.get(key)?.[0]?.epicKey === key).map(({ key }) => key));
   const byKey = new Map<string, number>();
@@ -276,7 +332,7 @@ export function layoutWorkspace(graph: JiraGraph, direction: Direction, mode: Gr
   }
   const boxes = parts.map((issues, index) => {
     const id = `zone:${index}`;
-    const box = layoutTree(groupTree(issues, paths, id), edgesByPart[index], direction, cardHeight);
+    const box = layoutTree(groupTree(issues, paths, id), edgesByPart[index], direction, cardHeight, noteKeys);
     if (parts.length < 2 || issues.length < 2 || box.zones.some(({ kind }) => kind === 'group' || kind === 'epic')) return box;
     const framed: LayoutBox = {
       width: box.width + 34, height: box.height + 55, positions: new Map(), zones: [], issues: 0, done: 0,

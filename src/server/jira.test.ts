@@ -102,15 +102,19 @@ test('Cloud search preserves link direction, convergent links, hierarchy, zero p
     { key: 'APP-2', storyPoints: 3, external: false },
     { key: 'EXT-3', storyPoints: 2, external: true },
     { key: 'APP-4', storyPoints: undefined, external: true },
-    { key: 'EXT-5', storyPoints: undefined, external: true },
   ]);
   assert.deepEqual(graph.edges.map(({ id, source, target, label }) => ({ id, source, target, label })), [
     { id: '200', source: 'APP-1', target: 'APP-2', label: 'blocks' },
     { id: '201', source: 'EXT-3', target: 'APP-2', label: 'blocks' },
     { id: 'parent:APP-4:APP-2', source: 'APP-4', target: 'APP-2', label: 'Родительская задача' },
-    { id: '202', source: 'EXT-3', target: 'EXT-5', label: 'reviews' },
   ]);
   assert.deepEqual(graph.warnings, []);
+  const selection = await client.loadGraph({ jql: 'project = APP', depth: 0 });
+  assert.deepEqual(selection.issues.map(({ key, external }) => ({ key, external })), [
+    { key: 'APP-1', external: false }, { key: 'APP-2', external: false },
+  ]);
+  assert.deepEqual(selection.edges.map(({ id }) => id), ['200']);
+  assert.deepEqual(externalJql, ['key in ("EXT-3", "APP-4")']);
 });
 
 test('Data Center requests preserve the Jira context path and use offset paging and PAT', async (t) => {
@@ -145,6 +149,7 @@ test('Data Center requests preserve the Jira context path and use offset paging 
   assert.equal(graph.issues[0]?.parentKey, 'APP-2');
   assert.equal(graph.issues[0]?.epicKey, 'APP-2');
   assert.deepEqual(graph.issues[0]?.sprints, ['Спринт, ноябрь']);
+  assert.deepEqual(graph.issues[0]?.sprintDetails, [{ id: '1', name: 'Спринт, ноябрь', state: 'closed' }]);
   assert.equal(graph.issues[1]?.isEpic, true);
   assert.deepEqual(graph.edges[0], { id: 'parent:APP-2:APP-1', source: 'APP-2', target: 'APP-1', label: 'Родительская задача', kind: 'parent' });
   assert.match(graph.warnings.join(' '), /типов связей/);
@@ -165,7 +170,7 @@ test('a newly created key survives a failed detail read and custom fields cannot
   const { client } = await connectJira(cloud, () => {});
   const issue = await client.createIssue({
     projectKey: 'APP', typeId: '10001', summary: 'New cleanup task', description: 'Remove old fields',
-    fields: { project: { key: 'BAD' }, key: 'BAD-2', description: 'Wrong', summary: 'Wrong', customfield_12345: 4 },
+    fields: { project: { key: 'BAD' }, key: 'BAD-2', reporter: { accountId: 'other' }, description: 'Wrong', summary: 'Wrong', customfield_12345: 4 },
   });
   assert.equal(issue.key, 'APP-31');
   assert.equal(issue.summary, 'New cleanup task');
@@ -200,6 +205,40 @@ test('Cloud create fields preserve required metadata and encode configured texta
   assert.deepEqual(postedDescription, { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [
     { type: 'text', text: 'Old readers may remain' },
   ] }] });
+});
+
+test('Jira assigns the authenticated reporter when create metadata and permissions allow it', async (t) => {
+  const reporters: unknown[] = [];
+  let permitted = true;
+  mockFetch(t, (url, init) => {
+    if (url.pathname.endsWith('/myself')) return json({ displayName: 'Jira User', accountId: 'abc', name: 'jira-user' });
+    if (url.pathname.endsWith('/mypermissions')) {
+      assert.equal(url.searchParams.get('projectKey'), 'APP');
+      assert.equal(url.searchParams.get('permissions'), url.pathname.includes('/api/3/') ? 'MODIFY_REPORTER' : null);
+      return json({ permissions: { MODIFY_REPORTER: { havePermission: permitted } } });
+    }
+    if (url.pathname.endsWith('/createmeta/APP/issuetypes')) return json({ issueTypes: [{ id: '10001', name: 'Task' }], total: 1 });
+    if (url.pathname.endsWith('/createmeta/APP/issuetypes/10001')) return json({ fields: [
+      { fieldId: 'reporter', name: 'Reporter', required: true, allowedValues: [{ id: 'raw-id', name: 'Jira User' }] },
+    ], total: 1 });
+    if (url.pathname.endsWith('/issue/APP-31')) return json(rawIssue('APP-31'));
+    assert.equal(init.method, 'POST');
+    assert.ok(url.pathname.endsWith('/issue'));
+    reporters.push(JSON.parse(String(init.body)).fields.reporter);
+    return json({ key: 'APP-31' }, 201);
+  });
+  const { client } = await connectJira(cloud, () => {});
+  const { client: dc } = await connectJira({ ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' }, () => {});
+  const options = await client.getCreateOptions('APP', '10001');
+  assert.equal(options.fields[0]?.hasDefaultValue, true);
+  assert.equal(options.fields[0]?.options, undefined);
+  await dc.getCreateOptions('APP', '10001');
+  const input = { projectKey: 'APP', typeId: '10001', summary: 'Cleanup' };
+  await client.createIssue(input);
+  await dc.createIssue(input);
+  permitted = false;
+  await client.createIssue(input);
+  assert.deepEqual(reporters, [{ id: 'abc' }, { name: 'jira-user' }, undefined]);
 });
 
 test('creating an outward Jira link resolves its real ID for subsequent deletion', async (t) => {
@@ -244,7 +283,9 @@ test('a title change preserves rich Cloud descriptions and a plain-text edit can
     return json(rawIssue('APP-1', { description, summary: 'Title' }));
   });
   const { client } = await connectJira(cloud, () => {});
-  await client.updateIssue({ key: 'APP-1', summary: 'Title', description: 'Keep the link' });
+  const updated = await client.updateIssue({ key: 'APP-1', summary: 'Title', description: 'Keep the link' });
+  assert.equal(updated.descriptionMarkdown, '[Keep the link](<https://example.com/>)');
+  assert.equal(updated.descriptionReadOnly, true);
   await assert.rejects(client.updateIssue({ key: 'APP-1', summary: 'Title', description: 'Remove the link' }),
     (error) => error instanceof JiraError && error.status === 409);
   assert.deepEqual(updates, [{ fields: { summary: 'Title' } }]);
@@ -277,7 +318,9 @@ test('Cloud search supplies filters and finds the epic of a nested subtask', asy
           rawIssue('APP-3', { issuetype: { name: 'Local Subtask', hierarchyLevel: -1 }, parent: rawIssue('APP-2') }),
           rawIssue('APP-2', {
             parent: rawIssue('APP-1'), labels: ['cleanup', 'cleanup', 'schema'], priority: { name: 'High' },
-            fixVersions: [{ name: 'Release 2.1' }], customfield_10004: [{ name: 'Sprint 2' }, { name: 'Sprint 1' }],
+            fixVersions: [{ name: 'Release 2.1' }], customfield_10004: [
+              { id: 30, name: 'Sprint 2', state: 'active' }, { id: '29', name: 'Sprint 1', state: 'closed' },
+            ],
             duedate: '2026-11-19', timeoriginalestimate: 3_600, timeestimate: 0,
           }),
           rawIssue('APP-1', { issuetype: { name: 'Local Epic', hierarchyLevel: 1 } }),
@@ -296,6 +339,9 @@ test('Cloud search supplies filters and finds the epic of a nested subtask', asy
   assert.equal(task?.priority, 'High');
   assert.deepEqual(task?.fixVersions, ['Release 2.1']);
   assert.deepEqual(task?.sprints, ['Sprint 2', 'Sprint 1']);
+  assert.deepEqual(task?.sprintDetails, [
+    { id: '30', name: 'Sprint 2', state: 'active' }, { id: '29', name: 'Sprint 1', state: 'closed' },
+  ]);
   assert.equal(task?.dueDate, '2026-11-19');
   assert.equal(task?.originalEstimateSeconds, 3_600);
   assert.equal(task?.remainingEstimateSeconds, 0);
@@ -332,6 +378,33 @@ test('Cloud project listing pages on the authenticated gateway and ignores malfo
     { id: '10001', key: 'APP', name: 'Application' }, { id: '10003', key: 'OPS_2', name: 'Operations' },
   ]);
   assert.deepEqual(offsets, [0, 2, 4]);
+});
+
+test('issue suggestions treat the search as text and return only plain distinct Jira issues', async (t) => {
+  const query = 'APP-2 & currentJQL=project = PRIVATE';
+  let calls = 0;
+  mockFetch(t, (url, init) => {
+    if (url.pathname.endsWith('/myself')) return profile();
+    assert.equal(url.pathname, '/rest/api/3/issue/picker');
+    assert.equal(init.method, 'GET');
+    assert.equal(url.searchParams.get('query'), query);
+    assert.equal(url.searchParams.get('currentJQL'), 'ORDER BY updated DESC');
+    calls += 1;
+    return json({ sections: [{ issues: [
+      { key: 'APP-2', summary: '<b>APP</b> issue', summaryText: 'APP issue' },
+      { key: 'not-an-issue', summaryText: 'Invalid' },
+    ] }, { issues: [
+      { key: 'APP-2', summaryText: 'Duplicate' },
+      { key: 'APP-3', summary: '<b>Highlighted only</b>' },
+    ] }] });
+  });
+  const session = createApiSession();
+  assert.equal((await session.invoke({ method: 'connect', input: cloud })).ok, true);
+  assert.deepEqual(await session.invoke({ method: 'suggestIssues', input: { query: 'A' } }), { ok: true, data: [] });
+  assert.deepEqual(await session.invoke({ method: 'suggestIssues', input: { query } }), { ok: true, data: [
+    { key: 'APP-2', summary: 'APP issue' }, { key: 'APP-3', summary: 'APP-3' },
+  ] });
+  assert.equal(calls, 1);
 });
 
 test('Data Center project listing uses the session PAT and propagates Jira permissions', async (t) => {
@@ -472,6 +545,37 @@ test('Cloud graph notes read all pages and refuse to delete comments outside the
   assert.deepEqual(methods, [
     `GET ${path}`, `GET ${path}`, `POST ${path}`, `GET ${path}/2`, `GET ${path}/4`, `DELETE ${path}/4`,
   ]);
+});
+
+test('graph note discovery batches keys and reads comments only for matching visible issues', async (t) => {
+  const searchQueries: string[] = [];
+  const commentReads: string[] = [];
+  mockFetch(t, (url, init) => {
+    if (url.pathname.endsWith('/myself')) return profile();
+    if (url.pathname.endsWith('/search/jql')) {
+      const { jql } = JSON.parse(String(init.body)) as { jql: string };
+      searchQueries.push(jql);
+      assert.ok(jql.endsWith(`comment ~ ${JSON.stringify(`"${noteMarker}"`)}`));
+      return json({ isLast: true, issues: searchQueries.length === 1
+        ? [rawIssue('APP-2'), rawIssue('APP-3'), rawIssue('OTHER-1')]
+        : [] });
+    }
+    commentReads.push(url.pathname);
+    if (url.pathname.endsWith('/APP-2/comment')) return json({ total: 1, comments: [rawComment('1', adf(noteMarker, 'A note'))] });
+    if (url.pathname.endsWith('/APP-3/comment')) return json({ total: 1, comments: [rawComment('2', adf(`Quote: ${noteMarker}`, 'Ordinary Jira comment'))] });
+    return json({}, 404);
+  });
+  const session = createApiSession();
+  assert.equal((await session.invoke({ method: 'connect', input: cloud })).ok, true);
+  assert.equal((await session.invoke({ method: 'listGraphNotes', input: { keys: ['APP-1" OR key="OTHER-1'] } })).ok, false);
+  const keys = Array.from({ length: 51 }, (_, index) => `APP-${index + 1}`);
+  const result = await session.invoke({ method: 'listGraphNotes', input: { keys: [...keys, 'app-1'] } });
+  assert.deepEqual(result, { ok: true, data: { 'APP-2': [
+    { id: '1', text: 'A note', author: 'Jira User', createdAt: '2026-11-11T12:00:00.000Z' },
+  ] } });
+  assert.equal(searchQueries.length, 2);
+  assert.ok(searchQueries[1]?.startsWith('key in ("APP-51")'));
+  assert.deepEqual(commentReads, ['/rest/api/3/issue/APP-2/comment', '/rest/api/3/issue/APP-3/comment']);
 });
 
 test('Data Center graph notes use plain Jira comments and the session rejects invalid note inputs', async (t) => {

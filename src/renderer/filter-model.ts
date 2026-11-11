@@ -10,7 +10,7 @@ export type GraphFacet = typeof graphFacets[number];
 export interface GraphFilters {
   search: string;
   facets: Partial<Record<GraphFacet, string[]>>;
-  edgeTypes: string[];
+  edgeTypes: string[] | undefined;
   hideExternal: boolean;
   hideIsolated: boolean;
   crossProject: boolean;
@@ -18,7 +18,7 @@ export interface GraphFilters {
 }
 
 export const emptyGraphFilters: GraphFilters = {
-  search: '', facets: {}, edgeTypes: [],
+  search: '', facets: {}, edgeTypes: undefined,
   hideExternal: false, hideIsolated: false, crossProject: false, crossEpic: false,
 };
 
@@ -30,10 +30,11 @@ export interface FacetOption {
   count: number;
 }
 
-export function hasGraphFilters(filters: GraphFilters): boolean {
-  return Boolean(filters.search.trim() || filters.edgeTypes.length ||
-    Object.values(filters.facets).some((values) => values.length) ||
-    filters.hideExternal || filters.hideIsolated || filters.crossProject || filters.crossEpic);
+type HighlightFilters = Pick<GraphFilters, 'search' | 'facets'>;
+type VisibilityFilters = Omit<GraphFilters, keyof HighlightFilters>;
+
+export function hasHighlightFilters(filters: HighlightFilters): boolean {
+  return Boolean(filters.search.trim() || Object.values(filters.facets).some((values) => values.length));
 }
 
 function statusCategory(issue: JiraIssue): string {
@@ -45,6 +46,20 @@ function epicKey(issue: JiraIssue): string | undefined {
   return issue.isEpic ? issue.key : issue.epicKey;
 }
 
+export function sprintFacetId(value: string): string | undefined {
+  return /^id:(\d+)$/.exec(value)?.[1];
+}
+
+export function sprintFacetLabels(issues: readonly JiraIssue[]): Map<string, string> {
+  return new Map(issues.flatMap(({ sprintDetails }) => (sprintDetails ?? []).map(({ id, name }) => [`id:${id}`, `${name} · #${id}`])));
+}
+
+function sprintFacetValues(issue: JiraIssue): string[] {
+  const details = issue.sprintDetails ?? [];
+  const namesWithIds = new Set(details.map(({ name }) => name));
+  return [...details.map(({ id }) => `id:${id}`), ...(issue.sprints ?? []).filter((name) => !namesWithIds.has(name))];
+}
+
 export function facetValues(issue: JiraIssue, facet: GraphFacet): string[] {
   switch (facet) {
     case 'statusCategory': return [statusCategory(issue)];
@@ -53,14 +68,17 @@ export function facetValues(issue: JiraIssue, facet: GraphFacet): string[] {
     case 'hierarchy': return [issue.isSubtask ? 'subtask' : issue.isEpic ? 'epic' : 'issue'];
     case 'estimate': return [issue.storyPoints === undefined ? 'missing' : 'present'];
     case 'dueDate': return [issue.dueDate ? 'present' : 'missing'];
+    case 'sprints': {
+      const values = sprintFacetValues(issue);
+      return values.length ? values : [noFacetValue];
+    }
     case 'labels':
-    case 'sprints':
     case 'fixVersions': return issue[facet]?.length ? issue[facet] : [noFacetValue];
     default: return [issue[facet] ?? noFacetValue];
   }
 }
 
-export function issueFacetOptions(issues: JiraIssue[]): Record<GraphFacet, FacetOption[]> {
+export function issueFacetOptions(issues: readonly JiraIssue[]): Record<GraphFacet, FacetOption[]> {
   return Object.fromEntries(graphFacets.map((facet) => {
     const counts = new Map<string, number>();
     for (const issue of issues) {
@@ -70,6 +88,10 @@ export function issueFacetOptions(issues: JiraIssue[]): Record<GraphFacet, Facet
     }
     return [facet, [...counts].map(([value, count]) => ({ value, count }))];
   })) as Record<GraphFacet, FacetOption[]>;
+}
+
+export function queryIssueFacetOptions(issues: readonly JiraIssue[], queryIssueKeys?: ReadonlySet<string>): Record<GraphFacet, FacetOption[]> {
+  return issueFacetOptions(issues.filter((issue) => queryIssueKeys ? queryIssueKeys.has(issue.key) : !issue.external));
 }
 
 export function edgeTypeKey(edge: JiraEdge): string {
@@ -102,25 +124,30 @@ function crossesBoundary(edge: JiraEdge, first: string | undefined, second: stri
   return edge.kind === 'link' && Boolean(first && second && first !== second);
 }
 
-export function filterGraph(graph: JiraGraph, filters: GraphFilters): JiraGraph {
-  if (!hasGraphFilters(filters)) return graph;
-
+export function highlightedIssueKeys(graph: JiraGraph, filters: HighlightFilters): Set<string> | undefined {
+  if (!hasHighlightFilters(filters)) return undefined;
   const selectedFacets = graphFacets.flatMap((facet) => {
     const values = filters.facets[facet];
     return values?.length ? [{ facet, values: new Set(values) }] : [];
   });
   const terms = filters.search.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const issues = graph.issues.filter((issue) => (!filters.hideExternal || !issue.external) &&
-    textMatches(issue, terms) && selectedFacets.every(({ facet, values }) =>
-      facetValues(issue, facet).some((value) => values.has(value)),
-    ));
+  const matching = graph.issues.filter((issue) => textMatches(issue, terms) && selectedFacets.every(({ facet, values }) =>
+    facetValues(issue, facet).some((value) => values.has(value))));
+  return new Set(matching.map(({ key }) => key));
+}
+
+export function filterGraph(graph: JiraGraph, filters: VisibilityFilters): JiraGraph {
+  if (filters.edgeTypes === undefined && !filters.hideExternal && !filters.hideIsolated && !filters.crossProject && !filters.crossEpic) {
+    return graph;
+  }
+  const issues = filters.hideExternal ? graph.issues.filter((issue) => !issue.external) : graph.issues;
   const byKey = new Map(issues.map((issue) => [issue.key, issue]));
-  const edgeTypes = new Set(filters.edgeTypes);
+  const edgeTypes = filters.edgeTypes && new Set(filters.edgeTypes);
   const edges = graph.edges.filter((edge) => {
     const source = byKey.get(edge.source);
     const target = byKey.get(edge.target);
     return source !== undefined && target !== undefined &&
-      (!edgeTypes.size || edgeTypes.has(edgeTypeKey(edge))) &&
+      (!edgeTypes || edgeTypes.has(edgeTypeKey(edge))) &&
       (!filters.crossProject || crossesBoundary(edge, source.project, target.project)) &&
       (!filters.crossEpic || crossesBoundary(edge, epicKey(source), epicKey(target)));
   });
@@ -233,6 +260,7 @@ export function jiraFacetClause(facet: GraphFacet, selected: readonly string[], 
   if (!field) return '';
   const references = values.flatMap((value) => {
     if (facet === 'statusCategory') return Object.hasOwn(categoryNames, value) ? [jqlLiteral(categoryNames[value]!)] : [];
+    if (facet === 'sprints') return [sprintFacetId(value) ?? jqlLiteral(value)];
     return [jqlLiteral(value)];
   });
   const missing = emptyJiraFields.has(facet) && selected.includes(noFacetValue) ? `${field} IS EMPTY` : '';

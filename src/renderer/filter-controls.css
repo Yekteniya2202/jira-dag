@@ -1,0 +1,26 @@
+.highlight-filters > summary > svg:first-child { margin-left: 0; }
+.highlight-fields { padding: 7px; }
+.highlight-reset { justify-self: end; }
+
+.view-menu.link-type-menu > div {
+  right: auto; left: 0; width: min(275px, calc(100vw - 32px));
+}
+.link-type-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.link-type-options { max-height: 200px; overflow: auto; }
+.link-display-options:not(:first-child) { padding-top: 6px; border-top: 1px solid var(--border); }
+
+.issue-lookup { position: relative; }
+.graph-search.issue-lookup input { min-width: 12ch; }
+.issue-suggestions {
+  position: absolute; z-index: 15; top: calc(100% + 5px); right: 0;
+  width: min(390px, calc(100vw - 32px)); max-height: 260px; overflow: auto;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: 0 8px 22px var(--shadow);
+}
+.issue-suggestions ul { list-style: none; margin: 0; padding: 0; }
+.issue-suggestions li, .suggestion-status { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 12px; }
+.issue-suggestions li { align-items: baseline; cursor: pointer; }
+.issue-suggestions li:hover, .issue-suggestions li[aria-selected='true'] { background: var(--surface-hover); }
+.issue-suggestions li strong { flex: none; color: var(--accent-ink); }
+.issue-suggestions li span { min-width: 0; overflow-wrap: anywhere; }
+.suggestion-status { color: var(--muted); }

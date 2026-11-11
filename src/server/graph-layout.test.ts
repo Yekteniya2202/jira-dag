@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { JiraEdge, JiraGraph, JiraIssue } from '../shared/contracts.js';
 import {
-  connectedParts, cyclicBlockingEdges, downstreamPoints, layoutWorkspace,
+  connectedParts, cyclicBlockingEdges, downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition,
   type GraphZone, type LayoutLabels,
 } from '../renderer/graph-layout.js';
 import { CARD_HEIGHT, CARD_WIDTH, type GraphPosition } from '../renderer/graph-model.js';
 
 const labels: LayoutLabels = {
   component: 'Component', emptyGroup: 'No group', level: 'Level', cycle: 'Cycle', done: 'Done',
+  unscheduledSprint: 'No sprint', externalSprint: 'External issues without a sprint',
 };
 const issue = (key: string, fields: Partial<JiraIssue> = {}): JiraIssue => ({
   key, summary: key, status: 'To Do', url: '', ...fields,
@@ -133,6 +134,59 @@ test('a filter can leave only children of a known epic without adding its card o
   assert.ok(contains(epic, position(layout, 'APP-2'), CARD_WIDTH, CARD_HEIGHT));
   assert.deepEqual([epic.issues, epic.done, epic.points], [1, 0, 3]);
   assert.equal(layoutWorkspace(basis, 'LR', 'hierarchy', labels, CARD_HEIGHT).positions.has('APP-1'), false);
+});
+
+test('sprint zones respect selected IDs and keep named, unscheduled, and external issues distinct', () => {
+  const data = graph([
+    issue('APP-1', { sprintDetails: [
+      { id: '30', name: 'Sprint 30', state: 'closed' }, { id: '31', name: 'Sprint 31', state: 'active' },
+    ] }),
+    issue('APP-2', { sprintDetails: [{ id: '31', name: 'Sprint 31', state: 'active' }] }),
+    issue('APP-3', { sprints: ['Sprint 29', 'Sprint 32'] }),
+    issue('APP-4'),
+    issue('APP-5', { external: true }),
+    issue('APP-6', { external: true, sprintDetails: [{ id: '31', name: 'Sprint 31', state: 'active' }] }),
+  ], []);
+  const groupOf = (layout: ReturnType<typeof layoutWorkspace>, key: string) => {
+    const group = layout.zones.find((zone) => contains(zone, position(layout, key), CARD_WIDTH, CARD_HEIGHT));
+    assert.ok(group);
+    return group;
+  };
+  const normal = layoutWorkspace(data, 'LR', 'sprint', labels, CARD_HEIGHT);
+  assert.equal(groupOf(normal, 'APP-1').title, 'Sprint 31');
+  const focused = layoutWorkspace(data, 'LR', 'sprint', labels, CARD_HEIGHT, data, { preferredSprintIds: ['30', '32'] });
+  assert.equal(groupOf(focused, 'APP-1').title, 'Sprint 30');
+  assert.equal(groupOf(focused, 'APP-2').title, 'Sprint 31');
+  assert.equal(groupOf(focused, 'APP-3').title, 'Sprint 32');
+  assert.deepEqual([groupOf(focused, 'APP-4').title, groupOf(focused, 'APP-4').appearance?.variant], ['No sprint', 'sprint-unscheduled']);
+  assert.deepEqual([groupOf(focused, 'APP-5').title, groupOf(focused, 'APP-5').appearance?.variant], ['External issues without a sprint', 'sprint-external']);
+  assert.equal(groupOf(focused, 'APP-6').id, groupOf(focused, 'APP-2').id);
+  assert.equal(new Set(['APP-1', 'APP-2', 'APP-3'].map((key) => groupOf(focused, key).appearance?.color)).size, 3);
+});
+
+test('stickers fit next to their issues without covering adjacent cards or spilling out of their zones', () => {
+  const data = graph([
+    issue('APP-1', { isEpic: true }), issue('APP-2', { epicKey: 'APP-1' }), issue('APP-3', { epicKey: 'APP-1' }),
+    issue('OPS-1'), issue('OPS-2'),
+  ], [parent('APP-1', 'APP-2'), parent('APP-1', 'APP-3'), blocks('1', 'APP-2', 'OPS-1'), blocks('2', 'OPS-1', 'OPS-2')]);
+  const noteKeys = new Set(['APP-1', 'APP-2', 'APP-3', 'OPS-1']);
+  for (const direction of ['LR', 'TB'] as const) {
+    const layout = layoutWorkspace(data, direction, 'hierarchy', labels, CARD_HEIGHT, data, { noteKeys });
+    const epic = layout.zones.find(({ kind }) => kind === 'epic');
+    assert.ok(epic);
+    const cards = [...layout.positions].map(([key, point]) => ({ key, ...point, width: CARD_WIDTH, height: CARD_HEIGHT }));
+    const stickers = cards.filter(({ key }) => noteKeys.has(key)).map((card) => ({
+      key: card.key, ...notePosition(card, direction), width: NOTE_WIDTH, height: NOTE_HEIGHT,
+    }));
+    assert.ok(stickers.filter(({ key }) => key.startsWith('APP')).every((sticker) => contains(epic, sticker, NOTE_WIDTH, NOTE_HEIGHT)));
+    stickers.push({ key: 'APP-1', ...notePosition(epic, 'TB'), width: NOTE_WIDTH, height: NOTE_HEIGHT });
+    const overlap = (a: typeof cards[number], b: typeof cards[number]) =>
+      a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+    const all = [...cards, ...stickers];
+    for (const [index, box] of all.entries()) {
+      assert.ok(all.slice(index + 1).every((other) => !overlap(box, other)));
+    }
+  }
 });
 
 test('only blocking edges internal to a cycle are marked including parallel edges and self-loops', () => {

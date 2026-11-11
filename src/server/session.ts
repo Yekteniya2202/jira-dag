@@ -1,5 +1,5 @@
 import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition } from '../shared/contracts.js';
-import { connectJira, JiraError, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
+import { connectJira, JiraError, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
 
@@ -161,6 +161,14 @@ function parseRequest(value: unknown): ApiRequest {
     case 'getAssigneeAvatar':
     case 'listNotes':
       return { method, input: { key: identifier(input.key, 'Issue key') } };
+    case 'suggestIssues':
+      return { method, input: { query: text(input.query, 'Issue search', 120, true).trim() } };
+    case 'listGraphNotes': {
+      if (!Array.isArray(input.keys) || input.keys.length > MAX_GRAPH_ISSUES) {
+        throw new RequestError('Too many issues for graph notes.');
+      }
+      return { method, input: { keys: input.keys.map((key) => identifier(key, 'Issue key')) } };
+    }
     case 'createNote':
       return { method, input: {
         key: identifier(input.key, 'Issue key'),
@@ -199,8 +207,10 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'updateIssue': return client.updateIssue(request.input);
     case 'createLink': return client.createLink(request.input);
     case 'listProjects': return client.listProjects();
+    case 'suggestIssues': return client.suggestIssues(request.input.query);
     case 'getAssigneeAvatar': return client.getAssigneeAvatar(request.input.key);
     case 'listSavedFilters': return client.listSavedFilters();
+    case 'listGraphNotes': return client.listGraphNotes(request.input.keys);
     case 'listNotes': return client.listNotes(request.input.key);
     case 'createNote': return client.createNote(request.input.key, request.input.text);
     case 'deleteNote':
