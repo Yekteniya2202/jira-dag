@@ -1,0 +1,34 @@
+appId: io.github.yekteniya2202.jiradag
+productName: Jira DAG
+directories:
+  output: release
+files:
+  - dist/renderer/**/*
+  - dist/node/electron/**/*
+  - dist/node/server/**/*
+  - dist/node/shared/**/*
+  - '!**/*.test.js'
+  - LICENSE
+artifactName: jira-dag-${version}-${arch}.${ext}
+asar: true
+electronFuses:
+  runAsNode: false
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  onlyLoadAppFromAsar: true
+  grantFileProtocolExtraPrivileges: false
+win:
+  target: nsis
+nsis:
+  artifactName: jira-dag-${version}-${arch}-setup.${ext}
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+linux:
+  executableName: jira-dag
+  syncDesktopName: true
+  target:
+    - deb
+    - AppImage
+  category: Development
+  maintainer: Jira DAG <Yekteniya2202@users.noreply.github.com>

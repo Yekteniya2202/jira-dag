@@ -1,0 +1,106 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-fund --no-audit
+      - run: npm run build
+      - run: npm test
+      - if: runner.os == 'Windows'
+        run: npm run smoke:desktop
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run smoke:desktop -- --no-sandbox
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node -e "if (process.env.GITHUB_REF_NAME !== 'v' + require('./package.json').version) throw new Error('Release tag does not match package.json version')"
+      - name: Build installers
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm exec -- electron-builder --x64 --publish never
+      - name: Smoke test packaged Windows app
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          $app = Start-Process -FilePath 'release/win-unpacked/Jira DAG.exe' -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+          exit $app.ExitCode
+      - name: Smoke test packaged Linux app
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/')
+        run: xvfb-run -a release/linux-unpacked/jira-dag --smoke-test --no-sandbox
+      - name: Package browser server
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tar --exclude='*.test.js' -czf "release/jira-dag-web-${GITHUB_REF_NAME#v}.tar.gz" \
+            package.json LICENSE README.md dist/renderer dist/node/server dist/node/shared dist/node/web
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-${{ runner.os }}
+          path: |
+            release/*.exe
+            release/*.deb
+            release/*.AppImage
+            release/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+      - name: Check assets and write checksums
+        shell: bash
+        working-directory: assets
+        run: |
+          shopt -s nullglob
+          assets=(*.exe *.deb *.AppImage *.tar.gz)
+          [[ ${#assets[@]} -eq 4 ]]
+          sha256sum -- "${assets[@]}" > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: assets/*
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* --verify-tag --generate-notes
+          fi
