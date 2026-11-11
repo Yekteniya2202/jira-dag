@@ -27,7 +27,7 @@ type Obstacle = Bounds & { id: string; labelOnly?: boolean };
 type Axis = 'x' | 'y';
 type Heading = 0 | 1;
 type StrokeSegment = [RoutePoint, RoutePoint] | [RoutePoint, RoutePoint, RoutePoint] | [RoutePoint, RoutePoint, RoutePoint, RoutePoint];
-type TracedStroke = Pick<RouteEdge, 'source' | 'target'> & { points: RoutePoint[]; bounds: Bounds };
+type TracedSegment = Obstacle & { from: RoutePoint; to: RoutePoint; lastQuery: number };
 
 const cellSize = 256;
 const obstacleClearance = 8;
@@ -36,6 +36,9 @@ const sourceOffset = 1;
 const arrowOffset = 1;
 const portOffset = 26;
 const laneSpacing = 12;
+const portSpacing = 14;
+const portMargin = 12;
+const sharedSpacing = 10;
 
 function intersects(a: Bounds, b: Bounds): boolean {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
@@ -57,15 +60,15 @@ function expand(box: Bounds, padding: number): Bounds {
   };
 }
 
-class ObstacleIndex {
-  private readonly cells = new Map<string, Obstacle[]>();
-  readonly boxes: Obstacle[] = [];
+class ObstacleIndex<Box extends Obstacle = Obstacle> {
+  private readonly cells = new Map<string, Box[]>();
+  readonly boxes: Box[] = [];
 
-  constructor(boxes: readonly Obstacle[] = []) {
+  constructor(boxes: readonly Box[] = []) {
     for (const box of boxes) this.add(box);
   }
 
-  add(box: Obstacle) {
+  add(box: Box) {
     this.boxes.push(box);
     const { left, top, right, bottom } = this.cellsOf(box);
     for (let row = top; row <= bottom; row++) {
@@ -78,7 +81,7 @@ class ObstacleIndex {
     }
   }
 
-  some(bounds: Bounds, predicate: (box: Obstacle) => boolean): boolean {
+  some(bounds: Bounds, predicate: (box: Box) => boolean): boolean {
     const { left, top, right, bottom } = this.cellsOf(bounds);
     if ((right - left + 1) * (bottom - top + 1) > this.boxes.length) return this.boxes.some(predicate);
     for (let row = top; row <= bottom; row++) {
@@ -90,8 +93,8 @@ class ObstacleIndex {
     return false;
   }
 
-  around(bounds: Bounds): Obstacle[] {
-    const found = new Set<Obstacle>();
+  around(bounds: Bounds): Box[] {
+    const found = new Set<Box>();
     this.some(bounds, (box) => {
       if (intersects(bounds, box)) found.add(box);
       return false;
@@ -105,6 +108,34 @@ class ObstacleIndex {
       right: Math.floor(bounds.right / cellSize), bottom: Math.floor(bounds.bottom / cellSize),
     };
   }
+}
+
+function fanPorts(
+  edges: readonly RouteEdge[], obstacles: ReadonlyMap<string, Obstacle>, outgoing: boolean,
+): Map<string, RoutePoint> {
+  const groups = new Map<string, RouteEdge[]>();
+  const pointKey = outgoing ? 'sourcePoint' : 'targetPoint';
+  const otherKey = outgoing ? 'targetPoint' : 'sourcePoint';
+  const result = new Map<string, RoutePoint>();
+  for (const edge of edges) {
+    const key = outgoing ? edge.source : edge.target;
+    const group = groups.get(key);
+    if (group) group.push(edge);
+    else groups.set(key, [edge]);
+  }
+  for (const [key, group] of groups) {
+    group.sort((a, b) => a[otherKey].y - b[otherKey].y || a[otherKey].x - b[otherKey].x ||
+      (a.lane ?? 0) - (b.lane ?? 0) || a.id.localeCompare(b.id));
+    const obstacle = obstacles.get(key);
+    const middle = (group.length - 1) / 2;
+    for (const [index, edge] of group.entries()) {
+      const anchor = edge[pointKey];
+      const available = obstacle ? Math.max(0, Math.min(anchor.y - obstacle.top, obstacle.bottom - anchor.y) - portMargin) : 36;
+      const spacing = middle ? Math.min(portSpacing, available / middle) : 0;
+      result.set(edge.id, { x: anchor.x, y: anchor.y + (index - middle) * spacing });
+    }
+  }
+  return result;
 }
 
 function segmentClear(index: ObstacleIndex, a: RoutePoint, b: RoutePoint, ignored?: string, alsoIgnored?: string): boolean {
@@ -604,16 +635,106 @@ function sharesLine(a: RoutePoint, b: RoutePoint, c: RoutePoint, d: RoutePoint):
   return near * far <= 0 && side(c, d, a) * side(c, d, b) <= 0;
 }
 
-function crossingCount(stroke: StrokeSegment[], edge: RouteEdge, traces: readonly TracedStroke[]): number {
-  const points = strokeSamples(stroke, 3, 6);
-  const bounds = expand(controlBounds(points), 1);
-  return traces.reduce((count, prior) => {
-    if (edge.source === prior.source || edge.source === prior.target || edge.target === prior.source ||
-        edge.target === prior.target || !intersects(bounds, prior.bounds)) return count;
-    const crosses = points.some((point, index) => index > 0 && prior.points.some((other, priorIndex) =>
-      priorIndex > 0 && sharesLine(points[index - 1], point, prior.points[priorIndex - 1], other)));
-    return count + Number(crosses);
-  }, 0);
+function axisOf(a: RoutePoint, b: RoutePoint): Axis | undefined {
+  return a.y === b.y ? 'x' : a.x === b.x ? 'y' : undefined;
+}
+
+function sharedRun(a: RoutePoint, b: RoutePoint, c: RoutePoint, d: RoutePoint): number {
+  const axis = axisOf(a, b);
+  if (!axis || axisOf(c, d) !== axis) return 0;
+  const normal = axis === 'x' ? 'y' : 'x';
+  if (Math.abs(a[normal] - c[normal]) >= sharedSpacing) return 0;
+  return Math.max(0, Math.min(Math.max(a[axis], b[axis]), Math.max(c[axis], d[axis]))
+    - Math.max(Math.min(a[axis], b[axis]), Math.min(c[axis], d[axis])));
+}
+
+class StrokeTraffic {
+  private readonly traces = new ObstacleIndex<TracedSegment>();
+  private query = 0;
+
+  add(stroke: StrokeSegment[], id: string) {
+    const points = strokeSamples(stroke, 3, 5);
+    for (let index = 1; index < points.length; index++) {
+      const from = points[index - 1];
+      const to = points[index];
+      this.traces.add({ ...extent(from, to, 0.01), id, from, to, lastQuery: 0 });
+    }
+  }
+
+  scoreSegment(a: RoutePoint, b: RoutePoint, sharedOnly = false, sharedWeight = 1): number {
+    if (!this.traces.boxes.length) return 0;
+    const bounds = extent(a, b, sharedSpacing);
+    const query = ++this.query;
+    let crossed: Set<string> | undefined;
+    let visited = 0;
+    let shared = 0;
+    this.traces.some(bounds, (trace) => {
+      if (++visited > 96) return true;
+      if (trace.lastQuery === query || !intersects(bounds, trace)) return false;
+      trace.lastQuery = query;
+      const overlap = sharedRun(a, b, trace.from, trace.to);
+      if (overlap >= 8) shared += overlap;
+      else if (!sharedOnly && sharesLine(a, b, trace.from, trace.to)) (crossed ??= new Set()).add(trace.id);
+      return shared >= 200 || (crossed?.size ?? 0) >= 5;
+    });
+    return shared * sharedWeight + (crossed?.size ?? 0) * 10;
+  }
+
+  score(stroke: StrokeSegment[]): number {
+    if (!this.traces.boxes.length) return 0;
+    const points = strokeSamples(stroke, 3, 5);
+    let total = 0;
+    for (let index = 1; index < points.length && total < 250; index++) {
+      total += this.scoreSegment(points[index - 1], points[index]);
+    }
+    return total;
+  }
+}
+
+function spreadDetour(points: RoutePoint[], edge: RouteEdge, index: ObstacleIndex, traffic: StrokeTraffic): RoutePoint[] {
+  const shared: Array<{ at: number; score: number }> = [];
+  for (let at = 1; at < points.length - 2; at++) {
+    const a = points[at];
+    const b = points[at + 1];
+    if (distance(a, b) < 30 || !axisOf(a, b)) continue;
+    const score = traffic.scoreSegment(a, b, true);
+    if (score) shared.push({ at, score });
+  }
+  const result = [...points];
+  const scoreSegment = (a: RoutePoint, b: RoutePoint) => traffic.scoreSegment(a, b, false, 2);
+  for (const { at } of shared.sort((left, right) => right.score - left.score).slice(0, 3)) {
+    const a = result[at];
+    const b = result[at + 1];
+    const previous = result[at - 1];
+    const next = result[at + 2];
+    const axis = axisOf(a, b);
+    const normal = axis === 'x' ? 'y' : 'x';
+    if (!axis || axisOf(previous, a) !== normal || axisOf(b, next) !== normal) continue;
+    const fromDirection = Math.sign(a[normal] - previous[normal]);
+    const toDirection = Math.sign(next[normal] - b[normal]);
+    let best = scoreSegment(previous, a) + scoreSegment(a, b) + scoreSegment(b, next);
+    for (const delta of [-12, 12, -24, 24, -36, 36]) {
+      const from = { ...a, [normal]: a[normal] + delta };
+      const to = { ...b, [normal]: b[normal] + delta };
+      if (Math.sign(from[normal] - previous[normal]) !== fromDirection ||
+          Math.sign(next[normal] - to[normal]) !== toDirection) continue;
+      const ignoredSource = at === 1 ? edge.source : undefined;
+      const ignoredTarget = at + 2 === result.length - 1 ? edge.target : undefined;
+      if ((ignoredSource && distance(previous, from) < Math.min(8, distance(previous, a))) ||
+          (ignoredTarget && distance(to, next) < Math.min(8, distance(b, next)))) continue;
+      if (!segmentClear(index, previous, from, ignoredSource) || !segmentClear(index, from, to) ||
+          !segmentClear(index, to, next, ignoredTarget)) continue;
+      const extra = distance(previous, from) + distance(to, next) - distance(previous, a) - distance(b, next);
+      const trafficScore = scoreSegment(previous, from) + scoreSegment(from, to) + scoreSegment(to, next);
+      const score = Math.max(0, extra) * 0.15 + Math.abs(delta) * 0.06 + trafficScore;
+      if (score >= best) continue;
+      best = score;
+      result[at] = from;
+      result[at + 1] = to;
+      if (!trafficScore) break;
+    }
+  }
+  return result;
 }
 
 function endpointPair({ source, target }: RouteEdge): string {
@@ -634,14 +755,14 @@ export function routeEdges(direction: 'LR' | 'TB', obstacles: readonly RouteObst
   const routeObstacles = routeBoxes.length === boxes.length ? occupied : new ObstacleIndex(routeBoxes);
   const labels = new ObstacleIndex();
   const routes = new Map<string, RoutedEdge>();
-  // Compare a bounded window of already routed neighbors. Large canvases keep routing independent during drag.
-  const traces: TracedStroke[] | undefined = edges.length <= 180 ? [] : undefined;
+  const traffic = new StrokeTraffic();
+  const normalized = edges.map((edge) => ({ ...edge, sourcePoint: orient(edge.sourcePoint), targetPoint: orient(edge.targetPoint) }));
+  const sourcePorts = fanPorts(normalized, rawById, true);
+  const targetPorts = fanPorts(normalized, rawById, false);
   const pairs = new Map<string, number>();
-  if (traces) {
-    for (const edge of edges) {
-      const pair = endpointPair(edge);
-      pairs.set(pair, (pairs.get(pair) ?? 0) + 1);
-    }
+  for (const edge of edges) {
+    const pair = endpointPair(edge);
+    pairs.set(pair, (pairs.get(pair) ?? 0) + 1);
   }
   const outside = expand(routeBoxes.reduce<Bounds>((area, box) => ({
     left: Math.min(area.left, box.left), top: Math.min(area.top, box.top),
@@ -649,40 +770,44 @@ export function routeEdges(direction: 'LR' | 'TB', obstacles: readonly RouteObst
   }), { left: 0, top: 0, right: 0, bottom: 0 }), 44);
   let tight: { index: ObstacleIndex; byId: Map<string, Obstacle> } | undefined;
 
-  for (const edge of edges) {
-    const source = orient(edge.sourcePoint);
-    const target = orient(edge.targetPoint);
+  function routeStroke(edge: RouteEdge, source: RoutePoint, target: RoutePoint): StrokeSegment[] | undefined {
     const start = { x: source.x + sourceOffset, y: source.y };
     const tip = { x: target.x - arrowOffset, y: target.y };
-    let stroke = flowingStroke(edge, start, tip, index, rawById,
-      traces?.length && pairs.get(endpointPair(edge)) === 1 ? (candidate) => crossingCount(candidate, edge, traces) : undefined);
-    if (!stroke) {
-      let route = pathFor(edge, source, target, index, byId, outside);
-      if (!route) {
-        if (!tight) {
-          const narrow = routeBoxes.map((box) => ({ ...expand(box, 2), id: box.id }));
-          tight = { index: new ObstacleIndex(narrow), byId: new Map(narrow.map((box) => [box.id, box])) };
-        }
-        route = pathFor(edge, source, target, tight.index, tight.byId, outside);
+    const curved = flowingStroke(edge, start, tip, index, rawById,
+      pairs.get(endpointPair(edge)) === 1 ? (candidate) => traffic.score(candidate) : undefined);
+    if (curved) return curved;
+    let routeIndex = index;
+    let route = pathFor(edge, source, target, routeIndex, byId, outside);
+    if (!route) {
+      if (!tight) {
+        const narrow = routeBoxes.map((box) => ({ ...expand(box, 2), id: box.id }));
+        tight = { index: new ObstacleIndex(narrow), byId: new Map(narrow.map((box) => [box.id, box])) };
       }
-      if (route && route.length > 1) stroke = roundStroke(route, routeObstacles);
+      routeIndex = tight.index;
+      route = pathFor(edge, source, target, routeIndex, tight.byId, outside);
+    }
+    return route && route.length > 1 ? roundStroke(spreadDetour(route, edge, routeIndex, traffic), routeObstacles) : undefined;
+  }
+
+  for (const edge of normalized) {
+    const source = sourcePorts.get(edge.id)!;
+    const target = targetPorts.get(edge.id)!;
+    let stroke = routeStroke(edge, source, target);
+    if (!stroke && (source.y !== edge.sourcePoint.y || target.y !== edge.targetPoint.y)) {
+      stroke = routeStroke(edge, edge.sourcePoint, edge.targetPoint);
     }
     if (!stroke?.length) {
-      routes.set(edge.id, { path: '', points: [], arrowTip: orient(tip) });
+      routes.set(edge.id, { path: '', points: [], arrowTip: orient({ x: target.x - arrowOffset, y: target.y }) });
       continue;
     }
     const width = flipped ? edge.labelHeight : edge.labelWidth;
     const height = flipped ? edge.labelWidth : edge.labelHeight;
     const { label, labelLeader } = placeLabel(stroke, width, height, flipped, occupied, labels, edge.id);
-    if (traces) {
-      const points = strokeSamples(stroke, 3, 6);
-      traces.push({ source: edge.source, target: edge.target, points, bounds: expand(controlBounds(points), 1) });
-      if (traces.length > 24) traces.shift();
-    }
+    traffic.add(stroke, edge.id);
     routes.set(edge.id, {
       path: strokePath(stroke, orient),
       points: strokeSamples(stroke).map(orient),
-      arrowTip: orient(tip),
+      arrowTip: orient(stroke.at(-1)!.at(-1)!),
       arrowFrom: orient(stroke.at(-1)!.at(-2)!),
       ...(label ? { label: orient(label) } : {}),
       ...(labelLeader ? { labelLeader: orient(labelLeader) } : {}),

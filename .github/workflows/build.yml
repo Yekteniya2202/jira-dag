@@ -62,6 +62,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           name: release-${{ runner.os }}
+          compression-level: 0
           path: |
             release/*.exe
             release/*.deb

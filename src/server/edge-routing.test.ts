@@ -165,6 +165,67 @@ test('parallel labels fit outside cards and each other, with a leader when the l
   assert.ok(routes.get('lane-1')!.points.some(({ y }) => y >= 60));
 });
 
+test('links to different neighbours fan out along both sides of a card in either orientation', () => {
+  for (const direction of ['LR', 'TB'] as const) {
+    const across = direction === 'LR';
+    const place = (id: string, along: number, acrossFlow: number) => across
+      ? card(id, along, acrossFlow) : card(id, acrossFlow, along, 80, 100);
+    const hub = place('hub', 0, 0);
+    const upstream = [-120, 0, 120].map((row, i) => place(`up-${i}`, -420, row));
+    const downstream = [-120, 0, 120].map((row, i) => place(`down-${i}`, 420, row));
+    const incoming = upstream.map((source, i) => link(`in-${i}`, source, hub, direction));
+    const outgoing = downstream.map((target, i) => link(`out-${i}`, hub, target, direction));
+    const obstacles = [hub, ...upstream, ...downstream];
+    const routes = routeEdges(direction, obstacles, [...outgoing, ...incoming].reverse());
+    const side = (point: RoutePoint) => across ? point.y : point.x;
+    const along = (point: RoutePoint) => across ? point.x : point.y;
+    const entries = incoming.map(({ id }) => {
+      const route = routes.get(id);
+      assertClear(route, obstacles);
+      assert.equal(along(route.arrowTip), -1);
+      return side(route.arrowTip);
+    });
+    const exits = outgoing.map(({ id }) => {
+      const route = routes.get(id);
+      assertClear(route, obstacles);
+      assert.equal(along(route.points[0]), 101);
+      return side(route.points[0]);
+    });
+    for (const offsets of [entries, exits]) {
+      assert.ok(offsets.every((offset) => offset >= 8 && offset <= 72));
+      assert.ok(offsets[1] - offsets[0] >= 8);
+      assert.ok(offsets[2] - offsets[1] >= 8);
+    }
+  }
+});
+
+test('unrelated detours use separate tracks along a shared obstacle even in a large graph', () => {
+  const sourceA = card('source-a', 0, 0);
+  const sourceB = card('source-b', 0, 110);
+  const targetA = card('target-a', 800, 0);
+  const targetB = card('target-b', 800, 110);
+  const blocker = card('blocker', 250, -5, 320, 380);
+  const obstacles = [sourceA, sourceB, targetA, targetB, blocker];
+  const first = link('first', sourceA, targetA);
+  const second = link('second', sourceB, targetB);
+  const elsewhere = Array.from({ length: 185 }, (_, i) =>
+    link(`distant-${i}`, card(`distant-source-${i}`, 0, 600 + 20 * i), card(`distant-target-${i}`, 230, 600 + 20 * i)));
+  const routes = routeEdges('LR', obstacles, [first, ...elsewhere, second]);
+  const a = routes.get(first.id);
+  const b = routes.get(second.id);
+  assertClear(a, obstacles);
+  assertClear(b, obstacles);
+  const positionAt = ({ points }: RoutedEdge, x: number): number => {
+    const index = points.findIndex((point, i) => i > 0 && points[i - 1].x < x && x <= point.x);
+    assert.ok(index > 0, `Expected the route to reach x=${x}`);
+    const [start, end] = [points[index - 1], points[index]];
+    return start.y + (end.y - start.y) * (x - start.x) / (end.x - start.x);
+  };
+  for (const x of [280, 350, 420, 500, 550]) {
+    assert.ok(Math.abs(positionAt(a, x) - positionAt(b, x)) >= 6, `Detours overlap near x=${x}`);
+  }
+});
+
 test('overlapping cards with an obscured port never produce an edge through a card', () => {
   const source = card('source', 0, 0);
   const target = card('target', 280, 0);
@@ -173,6 +234,18 @@ test('overlapping cards with an obscured port never produce an edge through a ca
   assert.ok(route);
   assert.equal(route.path, '');
   assert.deepEqual(route.points, []);
+});
+
+test('a blocked fan position falls back to the reachable centre of the card', () => {
+  const source = card('source', 0, 0);
+  const upper = card('upper', 450, -120);
+  const lower = card('lower', 450, 100);
+  const obstacles = [source, upper, lower, card('overlay', 100, 22, 60, 16)];
+  const routes = routeEdges('LR', obstacles, [link('upper', source, upper), link('lower', source, lower)]);
+  const route = routes.get('upper');
+  assertClear(route, obstacles);
+  assert.deepEqual(route.points[0], { x: 101, y: 40 });
+  assertClear(routes.get('lower'), obstacles);
 });
 
 test('large graphs route deterministically with populated corridors', () => {
