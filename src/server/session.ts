@@ -104,6 +104,7 @@ export function parseJiraCredentials(value: unknown): JiraCredentials {
 function parseRequest(value: unknown): ApiRequest {
   const { method, input: raw } = object(value, 'Request');
   if (method === 'disconnect' && raw === null) return { method, input: null };
+  if (method === 'listProjects' && raw === null) return { method, input: null };
   if (method === 'listSavedFilters' && raw === null) return { method, input: null };
   const input = object(raw, 'Input');
   switch (method) {
@@ -157,6 +158,7 @@ function parseRequest(value: unknown): ApiRequest {
     }
     case 'deleteLink':
       return { method, input: { id: identifier(input.id, 'Link') } };
+    case 'getAssigneeAvatar':
     case 'listNotes':
       return { method, input: { key: identifier(input.key, 'Issue key') } };
     case 'createNote':
@@ -196,6 +198,8 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'createIssue': return client.createIssue(request.input);
     case 'updateIssue': return client.updateIssue(request.input);
     case 'createLink': return client.createLink(request.input);
+    case 'listProjects': return client.listProjects();
+    case 'getAssigneeAvatar': return client.getAssigneeAvatar(request.input.key);
     case 'listSavedFilters': return client.listSavedFilters();
     case 'listNotes': return client.listNotes(request.input.key);
     case 'createNote': return client.createNote(request.input.key, request.input.text);

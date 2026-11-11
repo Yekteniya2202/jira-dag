@@ -58,6 +58,8 @@
   --zone-fill: #29243d87;
   --zone-border: #675984;
   --zone-nested-fill: #302c4599;
+  --epic-zone-fill: #2b2e37db;
+  --epic-zone-border: #555c6b;
 }
 
 :root[data-theme='light'] {
@@ -116,6 +118,8 @@
   --zone-fill: #eeeafa98;
   --zone-border: #bdb0d9;
   --zone-nested-fill: #e8e2f7aa;
+  --epic-zone-fill: #e9ecf2d9;
+  --epic-zone-border: #c2c9d4;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -166,6 +170,32 @@ button svg { flex: none; }
 .workspace {
   display: flex; flex: 1; min-height: 0; min-width: 0;
 }
+.workspace-tabs {
+  display: flex; align-items: center; gap: 4px; flex: none; padding: 4px 14px;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.workspace-tablist { display: flex; gap: 3px; min-width: 0; overflow-x: auto; padding: 2px; }
+.workspace-tablist button {
+  flex: none; max-width: 200px; padding: 6px 11px; border: 1px solid transparent; border-radius: 6px;
+  color: var(--muted); background: transparent; font-size: 12px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.workspace-tablist button:hover { background: var(--surface-raised); color: var(--text); }
+.workspace-tablist button[aria-selected="true"] {
+  color: var(--accent-ink); background: var(--accent-surface); border-color: var(--accent-border);
+}
+.workspace-deck { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+.workspace.workspace-inactive { position: absolute; inset: 0; visibility: hidden; pointer-events: none; overflow: hidden; }
+.applied-jql { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 11px; }
+.applied-jql code { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.inspector-assignee { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 12px; }
+.inspector-assignee > img, .inspector-assignee > span {
+  width: 26px; height: 26px; flex: none; border-radius: 50%; object-fit: cover;
+}
+.inspector-assignee > span {
+  display: grid; place-items: center; background: var(--accent-surface); color: var(--accent-ink); font-size: 10px; font-weight: 650;
+}
+.inspector-assignee small { display: block; color: var(--muted); }
 .sidebar, .inspector { flex: none; display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
 .sidebar { width: 237px; border-right: 1px solid var(--border); }
 .sidebar-scroll { overflow: auto; padding: 22px 17px; flex: 1; min-height: 0; }
@@ -280,13 +310,22 @@ select { padding-right: 6px; }
   border-radius: 12px; background: var(--zone-fill); color: var(--accent-ink); pointer-events: none;
 }
 .graph-zone.component { border-style: dashed; border-color: var(--border-strong); background: transparent; }
+.graph-zone.epic { border-color: var(--epic-zone-border); background: var(--epic-zone-fill); color: var(--heading); }
+.graph-zone.epic.is-selected { border-color: var(--accent); }
 .graph-zone.nested { border-radius: 9px; background: var(--zone-nested-fill); }
+.graph-zone-heading { display: flex; align-items: center; gap: 5px; }
 .graph-zone-title {
   display: flex; align-items: center; gap: 6px; min-width: 0;
   font-size: 13px; font-weight: 650; white-space: nowrap;
 }
 .graph-zone-title svg { flex: none; }
 .graph-zone-title span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.graph-zone-action {
+  padding: 0; color: inherit; background: transparent; border: 0; border-radius: 3px; pointer-events: auto;
+}
+.graph-zone-action:hover { color: var(--accent-ink); }
+.graph-zone-title.graph-zone-action:hover span { text-decoration: underline; text-underline-offset: 2px; }
+.graph-zone-open { display: inline-grid; place-items: center; flex: none; width: 18px; height: 18px; }
 .graph-zone-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
 
 .issue-card {
@@ -320,6 +359,15 @@ select { padding-right: 6px; }
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 .issue-card-details { font-size: 10px; line-height: 1.3; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-card-assignee {
+  display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--heading);
+  font-size: 10.5px; line-height: 1.3;
+}
+.issue-card-assignee > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-card-avatar {
+  display: inline-grid; place-items: center; flex: none; width: 17px; height: 17px; border-radius: 50%;
+  background: var(--accent-surface); color: var(--accent-ink); font-size: 8px; font-weight: 700;
+}
 .issue-card-meta, .inspector-metadata { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .issue-card-meta { margin-top: auto; }
 .status, .points {
@@ -333,6 +381,7 @@ select { padding-right: 6px; }
 .points { background: var(--accent-surface); color: var(--accent-ink); }
 .canvas .react-flow__handle { background: var(--accent); border: 2px solid var(--surface-deep); width: 10px; height: 10px; }
 .canvas .react-flow__handle:hover { background: var(--accent-ink); }
+.canvas[data-show-links='false'] .react-flow__handle { visibility: hidden; }
 .edge-label {
   position: absolute; pointer-events: none; color: var(--muted); background: var(--surface);
   padding: 2px 6px; border: 1px solid var(--border-strong); border-radius: 10px; font-size: 10.5px; white-space: nowrap;
@@ -474,7 +523,7 @@ select { padding-right: 6px; }
   .topbar-section, .topbar-divider { display: none; }
   .topbar-actions { gap: 7px; }
   .preference-controls { gap: 5px; }
-  .workspace { display: grid; grid-template-columns: minmax(0, 1fr); min-height: calc(100dvh - 61px); }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr); min-height: calc(100dvh - 101px); }
   .sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .sidebar-scroll { padding: 12px; max-height: 310px; display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 13px; }
   .sidebar-line, .sidebar-foot { display: none; }

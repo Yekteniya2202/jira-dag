@@ -14,6 +14,7 @@ import type {
   JiraLinkInput,
   JiraLinkType,
   JiraOption,
+  JiraProject,
   JiraSavedFilter,
 } from '../shared/contracts.js';
 
@@ -31,6 +32,8 @@ const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
 const TIMEOUT_MS = 15_000;
+const MAX_AVATAR_BYTES = 128 * 1024;
+const AVATAR_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const NOTE_MARKER = 'Jira DAG note v1';
 export const MAX_NOTE_LENGTH = 8_000;
 const ISSUE_FIELDS = [
@@ -109,7 +112,7 @@ export class JiraClient {
 
   constructor(
     private readonly site: URL,
-    apiSite: URL,
+    private readonly apiSite: URL,
     private readonly edition: JiraEdition,
     private readonly authorization: string,
     private readonly token: string,
@@ -330,6 +333,49 @@ export class JiraClient {
   async deleteLink(id: string): Promise<void> {
     if (!/^\d+$/.test(id)) throw new JiraError('Связь пока без идентификатора Jira. Обнови граф.', 400);
     await this.call('DELETE', `/issueLink/${encodeURIComponent(id)}`);
+  }
+
+  async listProjects(): Promise<JiraProject[]> {
+    if (this.edition === 'data-center') {
+      const result = await this.call('GET', '/project');
+      if (!Array.isArray(result)) throw new JiraError('Jira вернула некорректный список проектов.');
+      return result.flatMap(toProject);
+    }
+
+    const projects = new Map<string, JiraProject>();
+    let startAt = 0;
+    for (let pageIndex = 0; pageIndex < 1_000; pageIndex += 1) {
+      const page = record(await this.call('GET', `/project/search?startAt=${startAt}&maxResults=${SEARCH_PAGE_SIZE}`));
+      const { values } = page;
+      if (!Array.isArray(values) || (page.startAt !== undefined && page.startAt !== startAt)) break;
+      for (const project of values.flatMap(toProject)) projects.set(project.id, project);
+      startAt += values.length;
+      const total = integer(page.total);
+      if (!values.length || page.isLast === true || (page.isLast !== false && total !== undefined && startAt >= total)) {
+        return [...projects.values()];
+      }
+    }
+    throw new JiraError('Jira вернула слишком много страниц проектов или некорректную пагинацию.');
+  }
+
+  async getAssigneeAvatar(key: string): Promise<string | null> {
+    const issue = await this.readIssue(key, ['assignee']);
+    const urls = record(record(issue.fields?.assignee).avatarUrls);
+    const source = string(urls['48x48']) ?? string(urls['32x32']) ?? string(urls['24x24']) ?? string(urls['16x16']);
+    if (!source) return null;
+
+    const base = `${this.site.href.replace(/\/$/, '')}/`;
+    const url = URL.parse(source, base);
+    if (!url || url.username || url.password || url.hash) return null;
+    if (url.origin === this.site.origin && url.pathname === new URL('secure/useravatar', base).pathname) {
+      const authorization = this.apiSite.origin === this.site.origin ? this.authorization : undefined;
+      return fetchAvatar(url, authorization);
+    }
+    if (this.edition === 'cloud' && url.protocol === 'https:' && !url.port &&
+        /^avatar-management--avatars\.[a-z0-9-]+\.prod\.public\.atl-paas\.net$/.test(url.hostname)) {
+      return fetchAvatar(url);
+    }
+    return null;
   }
 
   async listSavedFilters(): Promise<JiraSavedFilter[]> {
@@ -738,6 +784,64 @@ function numericId(value: unknown): string | undefined {
   if (typeof value === 'string') return /^\d+$/.test(value) ? value : undefined;
   const id = integer(value);
   return id === undefined ? undefined : String(id);
+}
+
+function toProject(value: unknown): JiraProject[] {
+  const project = record(value);
+  const id = numericId(project.id);
+  const key = string(project.key);
+  const name = string(project.name)?.trim();
+  return id && key && /^[A-Z][A-Z0-9_]{0,127}$/.test(key) && name ? [{ id, key, name }] : [];
+}
+
+async function fetchAvatar(url: URL, authorization?: string): Promise<string | null> {
+  const headers = new Headers({ Accept: [...AVATAR_MEDIA_TYPES].join(', ') });
+  if (authorization) headers.set('Authorization', authorization);
+  try {
+    const response = await fetch(url, {
+      method: 'GET', headers, credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(5_000),
+    });
+    const mime = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+    if (!response.ok || !mime || !AVATAR_MEDIA_TYPES.has(mime) ||
+        Number(response.headers.get('Content-Length')) > MAX_AVATAR_BYTES) {
+      await response.body?.cancel();
+      return null;
+    }
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_AVATAR_BYTES) {
+          await reader.cancel();
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const image = Buffer.concat(chunks, size);
+    return hasAvatarSignature(image, mime) ? `data:${mime};base64,${image.toString('base64')}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasAvatarSignature(image: Buffer, mime: string): boolean {
+  switch (mime) {
+    case 'image/png': return image.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+    case 'image/jpeg': return image.subarray(0, 3).toString('hex') === 'ffd8ff';
+    case 'image/gif': return ['GIF87a', 'GIF89a'].includes(image.subarray(0, 6).toString('latin1'));
+    case 'image/webp': return image.subarray(0, 4).toString('latin1') === 'RIFF' &&
+      image.subarray(8, 12).toString('latin1') === 'WEBP';
+    default: return false;
+  }
 }
 
 async function request(url: URL, method: string, authorization?: string, token?: string, body?: unknown): Promise<unknown> {

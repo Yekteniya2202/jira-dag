@@ -5,6 +5,10 @@ export const CARD_HEIGHT = 112;
 export type Direction = 'LR' | 'TB';
 export type GraphPosition = { x: number; y: number };
 
+export function assigneeInitials(name: string): string {
+  return name.trim().split(/\s+/u).slice(0, 2).map((part) => [...part][0] ?? '').join('').toUpperCase();
+}
+
 export function statusTone(issue: JiraIssue): 'done' | 'active' | 'waiting' {
   if (issue.statusCategory === 'done') return 'done';
   if (issue.statusCategory === 'indeterminate' || issue.statusCategory === 'in-progress') return 'active';

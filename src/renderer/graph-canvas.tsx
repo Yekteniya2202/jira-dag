@@ -7,7 +7,7 @@ import {
 import { ArrowRight, ArrowUpRight, CheckSquare2, CircleDot, GitBranch, Layers3, MessageSquarePlus } from 'lucide-react';
 import type { JiraGraph, JiraIssue } from '../shared/contracts';
 import { downstreamPoints, layoutWorkspace, type GraphZone, type GroupMode } from './graph-layout';
-import { CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
+import { assigneeInitials, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
 
 export interface CardFields {
@@ -28,7 +28,13 @@ type Card = Node<{
   onOpen?: (issue: JiraIssue) => void;
   onNote?: (key: string) => void;
 }, 'issue'>;
-type Zone = Node<{ zone: GraphZone }, 'zone'>;
+type Zone = Node<{
+  zone: GraphZone;
+  epic?: JiraIssue;
+  onSelect?: (key: string) => void;
+  onOpen?: (issue: JiraIssue) => void;
+  selected: boolean;
+}, 'zone'>;
 type CanvasNode = Card | Zone;
 type Link = Edge<{ offset: number; hierarchy: boolean; active: boolean; muted: boolean; cycle: boolean; points?: number }, 'jiraLink'>;
 
@@ -37,8 +43,8 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
   const { issue, direction, muted, fields, onOpen, onNote, noteCount } = data;
   const across = direction === 'LR';
   const hours = issue.remainingEstimateSeconds ?? issue.originalEstimateSeconds;
+  const assignee = fields.assignee && issue.assignee?.trim();
   const details = [
-    fields.assignee && issue.assignee,
     fields.priority && issue.priority,
     fields.labels && issue.labels?.slice(0, 3).map((label) => `#${label}`).join(' '),
     fields.dueDate && issue.dueDate,
@@ -63,16 +69,29 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
         <span className={`status ${statusTone(issue)}`} title={issue.status}><CircleDot size={11} /> {issue.status}</span>
         {fields.points && issue.storyPoints !== undefined && <span className="points" title="Story points">{issue.storyPoints} SP</span>}
       </div>
+      {assignee && <div className="issue-card-assignee" title={`${t('Исполнитель', 'Assignee')}: ${assignee}`}>
+        <span className="issue-card-avatar" aria-hidden="true">{assigneeInitials(assignee)}</span><span>{assignee}</span>
+      </div>}
       {details && <div className="issue-card-details" title={details}>{details}</div>}
       <Handle type="source" position={across ? Position.Right : Position.Bottom} aria-label={t('Исходящая зависимость', 'Outgoing dependency')} />
     </div>
   );
 }
 
-function GroupZone({ data: { zone } }: NodeProps<Zone>) {
+function GroupZone({ data: { zone, epic, onSelect, onOpen, selected } }: NodeProps<Zone>) {
   const { t } = usePreferences();
-  return <div className={`graph-zone ${zone.kind}`}>
-    <div className="graph-zone-title" title={zone.title}><Layers3 size={15} /><span>{zone.title}</span></div>
+  const title = <><Layers3 size={15} aria-hidden="true" /><span>{zone.title}</span></>;
+  return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`}>
+    <div className="graph-zone-heading">
+      {epic && onSelect
+        ? <button type="button" className="graph-zone-title graph-zone-action nodrag nopan" title={zone.title}
+          aria-label={`${t('Открыть сведения об эпике', 'View epic details')} ${zone.title}`}
+          onClick={(event) => { event.stopPropagation(); onSelect(epic.key); }}>{title}</button>
+        : <div className="graph-zone-title" title={zone.title}>{title}</div>}
+      {epic?.url && onOpen && <button type="button" className="graph-zone-open graph-zone-action nodrag nopan"
+        title={t('Открыть в Jira', 'Open in Jira')} aria-label={`${t('Открыть в Jira', 'Open in Jira')} ${epic.key}`}
+        onClick={(event) => { event.stopPropagation(); onOpen(epic); }}><ArrowUpRight size={15} /></button>}
+    </div>
     <div className="graph-zone-meta" title={t('Выполнено задач / всего', 'Completed issues / total')}>
       {zone.done}/{zone.issues}{zone.points !== undefined && <> · {zone.points} SP</>}
     </div>
@@ -123,12 +142,14 @@ const nodeTypes = { issue: IssueCard, zone: GroupZone };
 const edgeTypes = { jiraLink: JiraLink };
 
 interface Props {
+  flowId: string;
   graph: JiraGraph;
   basis: JiraGraph;
   cycleIds: ReadonlySet<string>;
   direction: Direction;
   groupMode: GroupMode;
   fields: CardFields;
+  showLinks: boolean;
   showEdgePoints: boolean;
   selectedKey?: string;
   selectedEdge?: string;
@@ -142,12 +163,12 @@ interface Props {
   onConnect: OnConnect;
 }
 
-export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fields, showEdgePoints, selectedKey, selectedEdge, connected, editable,
+export function GraphCanvas({ flowId, graph, basis, cycleIds, direction, groupMode, fields, showLinks, showEdgePoints, selectedKey, selectedEdge, connected, editable,
   noteCounts, onSelectIssue, onSelectEdge, onOpenIssue, onNoteIssue, onConnect }: Props) {
   const { theme, t } = usePreferences();
   const flow = useReactFlow<CanvasNode, Link>();
   const [positions, setPositions] = useState<Record<string, GraphPosition>>({});
-  const cardHeight = CARD_HEIGHT + (fields.assignee || fields.priority || fields.labels || fields.dueDate || fields.estimate ? 21 : 0);
+  const cardHeight = CARD_HEIGHT + (fields.assignee ? 22 : 0) + (fields.priority || fields.labels || fields.dueDate || fields.estimate ? 19 : 0);
   const across = direction === 'LR';
   // The cards have fixed dimensions. Keep edge anchors available even before the DOM observer runs.
   const handles: NodeHandle[] = [
@@ -163,11 +184,12 @@ export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fiel
     cycle: t('Заблокировано циклом', 'Blocked by a cycle'),
     done: t('Выполнено', 'Done'),
   }, cardHeight, basis), [basis, cardHeight, direction, graph, groupMode, t]);
-  const estimates = useMemo(() => showEdgePoints ? downstreamPoints(graph) : undefined, [graph, showEdgePoints]);
+  const estimates = useMemo(() => showLinks && showEdgePoints ? downstreamPoints(graph) : undefined, [graph, showLinks, showEdgePoints]);
+  const basisIssues = useMemo(() => new Map(basis.issues.map((issue) => [issue.key, issue])), [basis.issues]);
   const lanes = useMemo(() => {
     const groups = new Map<string, string[]>();
     const offsets = new Map<string, number>();
-    for (const edge of graph.edges) {
+    for (const edge of layout.visibleEdges) {
       const key = [edge.source, edge.target].sort().join('|');
       const ids = groups.get(key) ?? [];
       ids.push(edge.id);
@@ -177,32 +199,41 @@ export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fiel
       ids.forEach((id, index) => offsets.set(id, (index - (ids.length - 1) / 2) * 28));
     }
     return offsets;
-  }, [graph.edges]);
+  }, [layout.visibleEdges]);
   const trace = useMemo(() => selectedKey ? {
     upstream: tracePath(graph.edges, selectedKey, 'up'),
     downstream: tracePath(graph.edges, selectedKey, 'down'),
   } : undefined, [graph.edges, selectedKey]);
-  const cards: Card[] = graph.issues.map((issue) => ({
-    id: issue.key, type: 'issue',
-    position: (groupMode === 'none' ? positions[issue.key] : undefined) ?? layout.positions.get(issue.key) ?? { x: 0, y: 0 },
-    width: CARD_WIDTH, height: cardHeight, zIndex: 2,
-    measured: { width: CARD_WIDTH, height: cardHeight }, handles,
-    selected: issue.key === selectedKey,
-    ariaLabel: `${issue.key} ${issue.summary}`,
-    data: {
-      issue, direction, fields, noteCount: noteCounts[issue.key],
-      onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined,
-      muted: Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
-    },
-  }));
+  const cards: Card[] = graph.issues.flatMap((issue) => {
+    const position = layout.positions.get(issue.key);
+    if (!position) return [];
+    return [{
+      id: issue.key, type: 'issue',
+      position: (groupMode === 'none' ? positions[issue.key] : undefined) ?? position,
+      width: CARD_WIDTH, height: cardHeight, zIndex: 2,
+      measured: { width: CARD_WIDTH, height: cardHeight }, handles,
+      selected: issue.key === selectedKey,
+      ariaLabel: `${issue.key} ${issue.summary}`,
+      data: {
+        issue, direction, fields, noteCount: noteCounts[issue.key],
+        onOpen: connected ? onOpenIssue : undefined, onNote: connected ? onNoteIssue : undefined,
+        muted: Boolean(trace && !trace.upstream.has(issue.key) && !trace.downstream.has(issue.key)),
+      },
+    }];
+  });
   const zones: Zone[] = layout.zones.map((zone) => ({
-    id: zone.id, type: 'zone', data: { zone }, position: { x: zone.x, y: zone.y },
+    id: zone.id, type: 'zone', position: { x: zone.x, y: zone.y },
+    data: {
+      zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
+      selected: Boolean(zone.epicKey && zone.epicKey === selectedKey), onSelect: onSelectIssue,
+      onOpen: connected ? onOpenIssue : undefined,
+    },
     width: zone.width, height: zone.height, zIndex: zone.kind === 'nested' ? -1 : -2,
     measured: { width: zone.width, height: zone.height },
     selectable: false, focusable: false, draggable: false, connectable: false, style: { pointerEvents: 'none' },
   }));
   const visibleKeys = new Set(cards.map(({ id }) => id));
-  const edges: Link[] = graph.edges.filter(({ source, target }) => visibleKeys.has(source) && visibleKeys.has(target)).map((edge) => {
+  const edges: Link[] = showLinks ? layout.visibleEdges.map((edge) => {
     const active = Boolean(trace && (
       (trace.upstream.has(edge.source) && trace.upstream.has(edge.target)) ||
       (trace.downstream.has(edge.source) && trace.downstream.has(edge.target))
@@ -216,7 +247,7 @@ export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fiel
       data: { offset: lanes.get(edge.id) ?? 0, hierarchy: edge.kind === 'parent', active,
         muted: Boolean(trace && !active), cycle, points: estimates?.get(edge.id) },
     };
-  });
+  }) : [];
 
   useEffect(() => {
     const id = requestAnimationFrame(() => void flow.fitView({ padding: 0.14, maxZoom: 1.05, duration: 240 }));
@@ -237,17 +268,17 @@ export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fiel
   };
 
   return (
-    <div className="canvas">
-      {cards.length === 0 ? <div className="empty-canvas">
+    <div className="canvas" data-show-links={showLinks}>
+      {cards.length === 0 && zones.length === 0 ? <div className="empty-canvas">
         <GitBranch size={26} /><h2>{t('Задачи не найдены', 'No issues found')}</h2>
         <p>{t('Измени JQL или сбрось фильтры.', 'Change the JQL query or clear the filters.')}</p>
       </div> : <ReactFlow<CanvasNode, Link>
-        colorMode={theme} nodes={[...zones, ...cards]} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
+        id={flowId} colorMode={theme} nodes={[...zones, ...cards]} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
         onNodesChange={onNodesChange} onEdgesChange={(changes) => {
           const selection = changes.find((change) => change.type === 'select' && change.selected);
           if (selection?.type === 'select') onSelectEdge(selection.id);
         }}
-        nodesDraggable={groupMode === 'none'} nodesConnectable={editable} onConnect={onConnect}
+        nodesDraggable={groupMode === 'none'} nodesConnectable={editable && showLinks} onConnect={onConnect}
         onNodeClick={(_, node) => { if (node.type === 'issue') onSelectIssue(node.id); }}
         onEdgeClick={(_, edge) => onSelectEdge(edge.id)}
         onPaneClick={() => onSelectIssue()} deleteKeyCode={null} minZoom={0.07} maxZoom={2}
@@ -268,7 +299,8 @@ export function GraphCanvas({ graph, basis, cycleIds, direction, groupMode, fiel
           maskColor="var(--minimap-mask)" pannable zoomable
         />
       </ReactFlow>}
-      <div className="canvas-legend"><ArrowRight size={14} /> {t('Связь Jira', 'Jira link')} <Layers3 size={13} /> {t('Иерархия', 'Hierarchy')}
+      <div className="canvas-legend">{showLinks ? <><ArrowRight size={14} /> {t('Связь Jira', 'Jira link')}</>
+        : <span>{t('Связи скрыты', 'Links hidden')}</span>} <Layers3 size={13} /> {t('Иерархия', 'Hierarchy')}
         {layout.parts > 1 && <span>· {t('Частей', 'Components')}: {layout.parts}</span>}
         {edges.some(({ data }) => data?.cycle) && <span className="legend-cycle">↻ {t('Связь в цикле', 'Link in a cycle')}</span>}
       </div>

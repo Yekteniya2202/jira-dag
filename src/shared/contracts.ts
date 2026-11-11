@@ -59,6 +59,12 @@ export interface JiraSavedFilter {
   jql?: string;
 }
 
+export interface JiraProject {
+  id: string;
+  key: string;
+  name: string;
+}
+
 export interface JiraGraphNote {
   id: string;
   text: string;
@@ -135,6 +141,8 @@ export interface ApiMethods {
   };
   createLink: { input: JiraLinkInput; output: JiraEdge | null };
   deleteLink: { input: { id: string }; output: null };
+  listProjects: { input: null; output: JiraProject[] };
+  getAssigneeAvatar: { input: { key: string }; output: string | null };
   listSavedFilters: { input: null; output: JiraSavedFilter[] };
   listNotes: { input: { key: string }; output: JiraGraphNote[] };
   createNote: { input: { key: string; text: string }; output: JiraGraphNote };

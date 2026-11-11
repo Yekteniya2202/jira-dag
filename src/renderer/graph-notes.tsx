@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { LoaderCircle, MessageSquareText, Plus, Trash2 } from 'lucide-react';
 import type { JiraGraphNote } from '../shared/contracts';
 import { errorMessage, request, RequestError } from './api';
@@ -10,6 +10,7 @@ export function GraphNotes({ issueKey, focus, onCount }: {
   onCount(issueKey: string, count: number): void;
 }) {
   const { language, t } = usePreferences();
+  const noteInputId = useId();
   const [notes, setNotes] = useState<JiraGraphNote[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -111,8 +112,8 @@ export function GraphNotes({ issueKey, focus, onCount }: {
       </div>}
     </article>)}
     <form className="note-form" onSubmit={(event) => void submit(event)}>
-      <label htmlFor="graph-note-text">{t('Добавить заметку', 'Add a note')}</label>
-      <textarea id="graph-note-text" ref={input} rows={3} maxLength={8000} value={draft}
+      <label htmlFor={noteInputId}>{t('Добавить заметку', 'Add a note')}</label>
+      <textarea id={noteInputId} ref={input} rows={3} maxLength={8000} value={draft}
         onChange={(event) => setDraft(event.target.value)}
         placeholder={t('Что важно для этого шага?', 'What matters for this step?')} />
       <p>{t('Сохранится как комментарий к задаче Jira.', 'Saved as a comment on the Jira issue.')}</p>

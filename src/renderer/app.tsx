@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { ReactFlowProvider } from '@xyflow/react';
 import {
   ArrowDown, ArrowRight, ArrowUpRight, Box, Check, ChevronDown, CircleAlert, CircleDot, Crosshair,
   GitBranch, GitMerge, Layers3, Link2, LoaderCircle, LogOut, Pencil, Plus, RefreshCw, Trash2, X,
@@ -7,11 +8,11 @@ import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraIssue, JiraI
 import { errorMessage, IssueCreationUnconfirmed, openIssue, request, RequestError, restoreDesktopConnection } from './api';
 import { makeDemoGraph } from './demo';
 import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
-import { emptyGraphFilters, filterGraph } from './filter-model';
-import { GraphFilterPanel, GraphScopePresets } from './filters';
+import { appendJqlClauses, emptyGraphFilters, filterGraph, graphFacets, jiraFacetClause, scopeJql, type GraphFilters } from './filter-model';
+import { GraphFilterPanel, GraphJqlFilters, GraphScopePresets } from './filters';
 import { GraphCanvas, type CardFields } from './graph-canvas';
 import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
-import { blockersFor, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction } from './graph-model';
+import { assigneeInitials, blockersFor, linkClosesCycle, mergeGraphs, putIssue, statusTone, tracePath, type Direction } from './graph-model';
 import { GraphNotes } from './graph-notes';
 import { localizeMessage, PreferenceControls, usePreferences } from './i18n';
 import { defaultCardFields, GraphViewControls, type FocusMode } from './view-controls';
@@ -20,20 +21,196 @@ const emptyGraph: JiraGraph = { issues: [], edges: [], linkTypes: [], storyPoint
 const demoQuery = 'project in (MIG, OPS) ORDER BY key ASC';
 
 type Notice = { text: string; error?: boolean; retry?: JiraLinkInput };
-type Modal = { kind: 'connection' } | { kind: 'create'; source?: JiraIssue } |
+type Modal = { kind: 'create'; source?: JiraIssue } |
   { kind: 'link'; source: string; target: string } | { kind: 'edit'; issue: JiraIssue } |
   { kind: 'delete'; edge: JiraEdge };
 
 const issueKey = /^[A-Z][A-Z0-9_]*-\d+$/i;
 
+type GraphTab = { id: number; query?: string; project?: string };
+const initialTabs: GraphTab[] = [{ id: 1 }];
+const graphTabId = (id: number) => `graph-tab-${id}`;
+const graphPanelId = (id: number) => `graph-panel-${id}`;
+
 export function App() {
-  const { language, t } = usePreferences();
+  const { t } = usePreferences();
   const [connection, setConnection] = useState<JiraConnection>();
   const [edition, setEdition] = useState<JiraEdition>('cloud');
+  const [tabs, setTabs] = useState(initialTabs);
+  const [activeTab, setActiveTab] = useState(1);
+  const nextTabId = useRef(2);
+  const [busyTabs, setBusyTabs] = useState<number[]>([]);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [restoring, setRestoring] = useState(Boolean(window.jiraDag));
+  const [connectionDialog, setConnectionDialog] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState<Notice>();
+
+  useEffect(() => {
+    if (!window.jiraDag) return;
+    let mounted = true;
+    void restoreDesktopConnection().then((restored) => {
+      if (!mounted || !restored) return;
+      setConnection(restored.connection);
+      setEdition(restored.edition);
+      setTabs(initialTabs);
+      setActiveTab(1);
+      nextTabId.current = 2;
+    }).catch((cause: unknown) => {
+      if (!mounted) return;
+      const text = cause instanceof RequestError && cause.status === 401
+        ? 'Jira rejected the saved login. Sign in again.'
+        : 'Could not restore the saved Jira connection.';
+      setSessionNotice({ text, error: true });
+    }).finally(() => {
+      if (mounted) setRestoring(false);
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  function resetTabs() {
+    setTabs(initialTabs);
+    setActiveTab(1);
+    nextTabId.current = 2;
+  }
+
+  async function connect(credentials: JiraLogin) {
+    const result = await request('connect', credentials);
+    setConnection(result);
+    setEdition(credentials.edition);
+    setConnectionDialog(false);
+    resetTabs();
+    setSessionNotice(result.rememberFailed
+      ? { text: 'Connected. Could not update the saved Jira connection.', error: true }
+      : { text: t(`Подключено как ${result.displayName}. Введи JQL или ключ задачи.`, `Connected as ${result.displayName}. Enter JQL or an issue key.`) });
+  }
+
+  async function disconnect() {
+    setDisconnecting(true);
+    try {
+      await request('disconnect', null);
+      setConnection(undefined);
+      resetTabs();
+      setSessionNotice(undefined);
+    } catch (cause) {
+      setSessionNotice({ text: errorMessage(cause), error: true });
+    } finally {
+      setDisconnecting(false);
+    }
+  }
+
+  function openTab() {
+    const id = nextTabId.current++;
+    setTabs((previous) => [...previous, { id }]);
+    setActiveTab(id);
+    requestAnimationFrame(() => document.getElementById(graphTabId(id))?.focus());
+  }
+
+  function closeTab() {
+    const index = tabs.findIndex(({ id }) => id === activeTab);
+    const next = tabs[index + 1] ?? tabs[index - 1];
+    if (!next || busyTabs.includes(activeTab)) return;
+    setTabs((previous) => previous.filter(({ id }) => id !== activeTab));
+    setActiveTab(next.id);
+    requestAnimationFrame(() => document.getElementById(graphTabId(next.id))?.focus());
+  }
+
+  function navigateTabs(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const nextIndex = event.key === 'ArrowRight' ? (index + 1) % tabs.length
+      : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length
+      : event.key === 'Home' ? 0
+      : event.key === 'End' ? tabs.length - 1 : undefined;
+    if (nextIndex === undefined) return;
+    event.preventDefault();
+    const next = tabs[nextIndex].id;
+    setActiveTab(next);
+    document.getElementById(graphTabId(next))?.focus();
+  }
+
+  function tabBusy(id: number, value: boolean) {
+    setBusyTabs((previous) => {
+      if (value === previous.includes(id)) return previous;
+      return value ? [...previous, id] : previous.filter((tabId) => tabId !== id);
+    });
+  }
+
+  return <div className="app">
+    <header className="topbar">
+      <div className="brand">
+        <span className="brand-icon"><GitMerge size={21} /></span>
+        <div className="brand-wordmark">
+          <strong>Jira <span>DAG</span></strong>
+          <span className="app-version" title={t('Версия приложения', 'Application version')}>v{__APP_VERSION__}</span>
+        </div>
+      </div>
+      <div className="topbar-divider" />
+      <span className="topbar-section">{t('Граф зависимостей', 'Dependency graph')}</span>
+      <div className="topbar-actions">
+        <PreferenceControls />
+        {connection ? <>
+          <span className="connection-state" title={connection.url}><i />{connection.displayName}</span>
+          <button className="icon-button" title={window.jiraDag
+            ? t('Отключить Jira и удалить сохранённый вход', 'Disconnect Jira and clear saved sign-in')
+            : t('Отключить Jira', 'Disconnect Jira')} aria-label={t('Отключить Jira', 'Disconnect Jira')}
+            disabled={disconnecting || busyTabs.length > 0} onClick={() => void disconnect()}><LogOut size={17} /></button>
+        </> : <>
+          <span className="demo-pill"><span /> {t('Демо', 'Demo')}</span>
+          <button className="button secondary" disabled={restoring} onClick={() => setConnectionDialog(true)}>
+            {restoring ? <LoaderCircle className="spin" size={16} /> : <Link2 size={16} />}
+            {restoring ? t('Восстановление входа', 'Restoring sign-in') : t('Подключить Jira', 'Connect Jira')}
+          </button>
+        </>}
+      </div>
+    </header>
+    <div className="workspace-tabs">
+      <div className="workspace-tablist" role="tablist" aria-label={t('Графы', 'Graphs')}>
+        {tabs.map((tab, index) => <button key={tab.id} type="button" id={graphTabId(tab.id)}
+          role="tab" aria-selected={activeTab === tab.id} aria-controls={graphPanelId(tab.id)}
+          tabIndex={activeTab === tab.id ? 0 : -1} title={tab.query}
+          onClick={() => setActiveTab(tab.id)} onKeyDown={(event) => navigateTabs(event, index)}>
+          {t(`Граф ${tab.id}`, `Graph ${tab.id}`)}{tab.project && ` · ${tab.project}`}
+        </button>)}
+      </div>
+      <button className="icon-button" type="button" aria-label={t('Новая вкладка', 'New graph tab')}
+        title={t('Новая вкладка', 'New graph tab')} disabled={restoring || disconnecting} onClick={openTab}><Plus size={16} /></button>
+      {tabs.length > 1 && <button className="icon-button" type="button" aria-label={t('Закрыть вкладку', 'Close graph tab')}
+        title={t('Закрыть вкладку', 'Close graph tab')} disabled={busyTabs.includes(activeTab)} onClick={closeTab}><X size={15} /></button>}
+    </div>
+    <main className="workspace-deck">
+      {tabs.map((tab) => <ReactFlowProvider key={`${connection?.url ?? 'demo'}:${tab.id}`}>
+        <GraphWorkspace tabId={tab.id} active={activeTab === tab.id} connection={connection} edition={edition}
+          sessionBusy={restoring || disconnecting} sessionNotice={sessionNotice}
+          onRequestConnection={() => setConnectionDialog(true)} onDismissSessionNotice={() => setSessionNotice(undefined)}
+          onBusyChange={(value) => tabBusy(tab.id, value)}
+          onLoad={(query, project) => setTabs((previous) => previous.map((item) =>
+            item.id === tab.id ? { ...item, query, project } : item))} />
+      </ReactFlowProvider>)}
+    </main>
+    {connectionDialog && <ConnectionDialog onConnect={connect} onClose={() => setConnectionDialog(false)} />}
+  </div>;
+}
+
+function GraphWorkspace({
+  tabId, active, connection, edition, sessionBusy, sessionNotice, onRequestConnection, onDismissSessionNotice, onBusyChange, onLoad,
+}: {
+  tabId: number;
+  active: boolean;
+  connection?: JiraConnection;
+  edition: JiraEdition;
+  sessionBusy: boolean;
+  sessionNotice?: Notice;
+  onRequestConnection(): void;
+  onDismissSessionNotice(): void;
+  onBusyChange(value: boolean): void;
+  onLoad(query: string, project?: string): void;
+}) {
+  const { language, t } = usePreferences();
+  const formId = useId();
   const [loadedGraph, setGraph] = useState(emptyGraph);
   const demoGraph = useMemo(() => makeDemoGraph(t), [t]);
   const graph = connection ? loadedGraph : demoGraph;
-  const [jql, setJql] = useState(demoQuery);
+  const [baseJql, setBaseJql] = useState(connection ? '' : demoQuery);
+  const [projectKey, setProjectKey] = useState('');
+  const [jiraFacets, setJiraFacets] = useState<GraphFilters['facets']>({});
   const [loadedQuery, setLoadedQuery] = useState('');
   const [includedKeys, setIncludedKeys] = useState<string[]>([]);
   const [depth, setDepth] = useState(1);
@@ -41,19 +218,25 @@ export function App() {
   const [filters, setFilters] = useState(emptyGraphFilters);
   const [groupMode, setGroupMode] = useState<GroupMode>('hierarchy');
   const [fields, setFields] = useState<CardFields>(defaultCardFields);
+  const [showLinks, setShowLinks] = useState(true);
   const [showEdgePoints, setShowEdgePoints] = useState(false);
   const [focusMode, setFocusMode] = useState<FocusMode>('all');
   const [direction, setDirection] = useState<Direction>('LR');
-  const [selectedKey, setSelectedKey] = useState<string | undefined>('MIG-27');
+  const [selectedKey, setSelectedKey] = useState<string | undefined>(connection ? undefined : 'MIG-27');
   const [selectedEdge, setSelectedEdge] = useState<string>();
   const [layoutGeneration, setLayoutGeneration] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [restoring, setRestoring] = useState(Boolean(window.jiraDag));
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const busy = sessionBusy || workspaceBusy;
   const [notice, setNotice] = useState<Notice>();
   const [modal, setModal] = useState<Modal>();
   const [noteFocus, setNoteFocus] = useState<string>();
   const [noteCounts, setNoteCounts] = useState<Record<string, number>>({});
+  const visibleNotice = notice ?? sessionNotice;
 
+  const filterStoryField = storyField || (graph.storyPointsFields.length === 1 ? graph.storyPointsFields[0].id : undefined);
+  const jiraClauses = useMemo(() => graphFacets.map((facet) =>
+    jiraFacetClause(facet, jiraFacets[facet] ?? [], edition, filterStoryField)), [edition, filterStoryField, jiraFacets]);
+  const jql = appendJqlClauses(baseJql, [scopeJql('project', projectKey), ...jiraClauses]);
   const cycleIds = useMemo(() => cyclicBlockingEdges(graph), [graph]);
   const cycleExamples = useMemo(() => graph.edges.filter(({ id }) => cycleIds.has(id)).slice(0, 5), [cycleIds, graph.edges]);
   const filtered = useMemo(() => filterGraph(graph, filters), [graph, filters]);
@@ -78,26 +261,11 @@ export function App() {
   useEffect(() => {
     if (!connection) setFilters(emptyGraphFilters);
   }, [connection, language]);
-  useEffect(() => {
-    if (!window.jiraDag) return;
-    let mounted = true;
-    void restoreDesktopConnection().then((restored) => {
-      if (!mounted || !restored) return;
-      setConnection(restored.connection);
-      setEdition(restored.edition);
-      setJql('');
-      setSelectedKey(undefined);
-    }).catch((cause: unknown) => {
-      if (!mounted) return;
-      const text = cause instanceof RequestError && cause.status === 401
-        ? 'Jira rejected the saved login. Sign in again.'
-        : 'Could not restore the saved Jira connection.';
-      setNotice({ text, error: true });
-    }).finally(() => {
-      if (mounted) setRestoring(false);
-    });
-    return () => { mounted = false; };
-  }, []);
+
+  function setBusy(value: boolean) {
+    setWorkspaceBusy(value);
+    onBusyChange(value);
+  }
 
   function selectIssue(key?: string) {
     if (key && !filtered.issues.some((issue) => issue.key === key)) setFilters(emptyGraphFilters);
@@ -116,46 +284,14 @@ export function App() {
     setFilters(emptyGraphFilters);
     setFocusMode('all');
   }
+  function editJql(value: string) {
+    setBaseJql(value);
+    setProjectKey('');
+    setJiraFacets({});
+  }
   function changeLayout() {
     setDirection((previous) => previous === 'LR' ? 'TB' : 'LR');
     setLayoutGeneration((previous) => previous + 1);
-  }
-
-  async function connect(credentials: JiraLogin) {
-    const result = await request('connect', credentials);
-    setConnection(result);
-    setEdition(credentials.edition);
-    setModal(undefined);
-    setGraph(emptyGraph);
-    setNoteCounts({});
-    setIncludedKeys([]);
-    setLoadedQuery('');
-    setJql('');
-    setStoryField('');
-    resetFilters();
-    selectIssue();
-    setLayoutGeneration((previous) => previous + 1);
-    setNotice(result.rememberFailed
-      ? { text: 'Connected. Could not update the saved Jira connection.', error: true }
-      : { text: t(`Подключено как ${result.displayName}. Введи JQL или ключ задачи.`, `Connected as ${result.displayName}. Enter JQL or an issue key.`) });
-  }
-  async function disconnect() {
-    setBusy(true);
-    try {
-      await request('disconnect', null);
-      setConnection(undefined);
-      setGraph(emptyGraph);
-      setNoteCounts({});
-      setIncludedKeys([]);
-      setLoadedQuery('');
-      setJql(demoQuery);
-      setStoryField('');
-      resetFilters();
-      selectIssue('MIG-27');
-      setNotice(undefined);
-      setLayoutGeneration((previous) => previous + 1);
-    } catch (cause) { setNotice({ text: errorMessage(cause), error: true }); }
-    finally { setBusy(false); }
   }
 
   async function load(event?: FormEvent) {
@@ -164,6 +300,7 @@ export function App() {
     if (!connection || !query || busy) return;
     setBusy(true);
     setNotice(undefined);
+    onDismissSessionNotice();
     try {
       const normalized = issueKey.test(query) ? `key = "${query.toUpperCase()}"` : query;
       const graphOptions = { depth, storyPointsField: storyField.trim() || undefined };
@@ -179,6 +316,8 @@ export function App() {
         };
       }
       setLoadedQuery(normalized);
+      const projects = new Set(result.issues.flatMap(({ project, external }) => project && !external ? [project] : []));
+      onLoad(normalized, projectKey || (projects.size === 1 ? projects.values().next().value : undefined));
       setIncludedKeys(pins);
       setGraph(result);
       setLayoutGeneration((previous) => previous + 1);
@@ -271,55 +410,35 @@ export function App() {
     setModal({ kind: 'edit', issue });
   }
   function addTask(source?: JiraIssue) {
-    if (restoring) return;
-    setModal(connection ? { kind: 'create', source } : { kind: 'connection' });
+    if (busy) return;
+    if (connection) setModal({ kind: 'create', source });
+    else onRequestConnection();
   }
   function launchIssue(issue: JiraIssue) {
     void openIssue(issue).catch((cause: unknown) => setNotice({ text: errorMessage(cause), error: true }));
   }
-  const project = selected?.project ?? /\bproject\s*=\s*"?([A-Z][A-Z0-9_]*)/i.exec(jql)?.[1] ?? '';
+  const project = selected?.project ?? (projectKey || /\bproject\s*=\s*"?([A-Z][A-Z0-9_]*)/i.exec(jql)?.[1] || '');
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-icon"><GitMerge size={21} /></span>
-          <div className="brand-wordmark">
-            <strong>Jira <span>DAG</span></strong>
-            <span className="app-version" title={t('Версия приложения', 'Application version')}>v{__APP_VERSION__}</span>
-          </div>
-        </div>
-        <div className="topbar-divider" />
-        <span className="topbar-section">{t('Граф зависимостей', 'Dependency graph')}</span>
-        <div className="topbar-actions">
-          <PreferenceControls />
-          {connection ? <>
-            <span className="connection-state" title={connection.url}><i />{connection.displayName}</span>
-            <button className="icon-button" title={window.jiraDag
-              ? t('Отключить Jira и удалить сохранённый вход', 'Disconnect Jira and clear saved sign-in')
-              : t('Отключить Jira', 'Disconnect Jira')} aria-label={t('Отключить Jira', 'Disconnect Jira')} disabled={busy}
-              onClick={() => void disconnect()}><LogOut size={17} /></button>
-          </> : <>
-            <span className="demo-pill"><span /> {t('Демо', 'Demo')}</span>
-            <button className="button secondary" disabled={restoring} onClick={() => setModal({ kind: 'connection' })}>
-              {restoring ? <LoaderCircle className="spin" size={16} /> : <Link2 size={16} />}
-              {restoring ? t('Восстановление входа', 'Restoring sign-in') : t('Подключить Jira', 'Connect Jira')}
-            </button>
-          </>}
-        </div>
-      </header>
-      <main className="workspace">
+    <section className={active ? 'workspace' : 'workspace workspace-inactive'} role="tabpanel"
+      id={graphPanelId(tabId)} aria-labelledby={graphTabId(tabId)} aria-hidden={!active} inert={!active}>
         <aside className="sidebar" aria-label={t('Настройки графа', 'Graph settings')}>
           <div className="sidebar-scroll">
             <form className="scope-form" onSubmit={(event) => void load(event)}>
               <h2><Crosshair size={16} /> {t('Область графа', 'Graph scope')}</h2>
-              <GraphScopePresets key={connection?.url ?? 'demo'} connected={Boolean(connection)} edition={edition} onApply={setJql} />
-              <label htmlFor="jql">{t('JQL или ключ задачи', 'JQL or issue key')}</label>
-              <textarea id="jql" value={jql} onChange={(event) => setJql(event.target.value)}
-                placeholder={'project = PROJ ORDER BY key ASC'} rows={3} spellCheck={false} />
+              <GraphScopePresets key={connection?.url ?? 'demo'} connected={Boolean(connection)} edition={edition}
+                projectKey={projectKey} onProjectChange={setProjectKey}
+                onApply={(clause) => setBaseJql((query) => appendJqlClauses(query, [clause]))} />
+              <label htmlFor={`${formId}-jql`}>{t('JQL или ключ задачи', 'JQL or issue key')}</label>
+              <textarea id={`${formId}-jql`} value={jql} onChange={(event) => editJql(event.target.value)}
+                placeholder="project = PROJ ORDER BY key ASC" rows={5} spellCheck={false} />
+              {loadedQuery && loadedQuery !== jql.trim() && <div className="applied-jql">
+                <span>{t('JQL загруженного графа', 'JQL of the loaded graph')}</span>
+                <code>{loadedQuery}</code>
+              </div>}
               <div className="scope-row">
-                <label htmlFor="depth" title={t('Сколько уровней связей догрузить за пределами выборки', 'How far to expand links beyond the query')}>{t('Глубина связей', 'Link depth')}</label>
-                <select id="depth" value={depth} onChange={(event) => setDepth(Number(event.target.value))}>
+                <label htmlFor={`${formId}-depth`} title={t('Сколько уровней связей догрузить за пределами выборки', 'How far to expand links beyond the query')}>{t('Глубина связей', 'Link depth')}</label>
+                <select id={`${formId}-depth`} value={depth} onChange={(event) => setDepth(Number(event.target.value))}>
                   <option value="0">{t('Только выборка', 'Query only')}</option><option value="1">{t('1 уровень', '1 level')}</option>
                   <option value="2">{t('2 уровня', '2 levels')}</option><option value="3">{t('3 уровня', '3 levels')}</option>
                 </select>
@@ -330,14 +449,16 @@ export function App() {
                   {graph.storyPointsFields.map(({ id, name }) => <option value={id} key={id}>{name} ({id})</option>)}
                 </select>
               </label>}
-              <button type={connection ? 'submit' : 'button'} className="button primary full" disabled={busy || restoring || (Boolean(connection) && !jql.trim())}
-                onClick={connection ? undefined : () => setModal({ kind: 'connection' })}>
+              <button type={connection ? 'submit' : 'button'} className="button primary full" disabled={busy || (Boolean(connection) && !jql.trim())}
+                onClick={connection ? undefined : onRequestConnection}>
                 {busy ? <LoaderCircle size={15} className="spin" /> : <GitBranch size={15} />}
                 {connection ? t('Загрузить граф', 'Load graph') : t('Подключить для загрузки', 'Connect to load')}
               </button>
+              {connection && <GraphJqlFilters graph={graph} edition={edition}
+                storyField={filterStoryField} selected={jiraFacets} onChange={setJiraFacets} />}
             </form>
             <div className="sidebar-line" />
-            <GraphFilterPanel graph={graph} filters={filters} onChange={setFilters} />
+            <GraphFilterPanel graph={graph} filters={filters} connected={Boolean(connection)} onChange={setFilters} />
           </div>
           <div className="sidebar-foot"><Box size={15} /> {window.jiraDag ? t('Десктоп', 'Desktop') : t('Веб-версия', 'Web')}</div>
         </aside>
@@ -362,13 +483,17 @@ export function App() {
               </button>
               <button className="icon-button outline" title={t('Обновить граф', 'Reload graph')} aria-label={t('Обновить граф', 'Reload graph')}
                 disabled={!connection || busy || !jql.trim()} onClick={() => void load()}><RefreshCw size={17} /></button>
-              <button className="button primary" disabled={busy || restoring} onClick={() => addTask()}><Plus size={18} /> {t('Новая задача', 'New issue')}</button>
+              <button className="button primary" disabled={busy} onClick={() => addTask()}><Plus size={18} /> {t('Новая задача', 'New issue')}</button>
             </div>
           </div>
           <GraphViewControls groupMode={groupMode} onGroupMode={(mode) => {
             setGroupMode(mode);
             setLayoutGeneration((generation) => generation + 1);
           }} fields={fields} onFields={setFields} showEdgePoints={showEdgePoints} onShowEdgePoints={setShowEdgePoints}
+          showLinks={showLinks} onShowLinks={(value) => {
+            setShowLinks(value);
+            if (!value) setSelectedEdge(undefined);
+          }}
           focusMode={focusMode} onFocusMode={setFocusMode} selected={Boolean(selected)}
           connected={Boolean(connection)} busy={busy} onInclude={includeIssue} />
           {graph.warnings.length > 0 && <details className="graph-warning">
@@ -394,22 +519,24 @@ export function App() {
               )}</span>}
             </details>}
           </div>
-          <GraphCanvas key={layoutGeneration} graph={shown} basis={graph} cycleIds={cycleIds} direction={direction} groupMode={groupMode}
-            fields={fields} showEdgePoints={showEdgePoints} connected={Boolean(connection)} noteCounts={noteCounts}
+          <GraphCanvas key={layoutGeneration} flowId={`graph-canvas-${tabId}`} graph={shown} basis={graph} cycleIds={cycleIds}
+            direction={direction} groupMode={groupMode}
+            fields={fields} showLinks={showLinks} showEdgePoints={showEdgePoints} connected={Boolean(connection)} noteCounts={noteCounts}
             selectedKey={selected?.key} selectedEdge={edge?.id} editable={Boolean(connection && !busy && graph.linkTypes.length)}
             onSelectIssue={selectIssue} onSelectEdge={selectEdge} onOpenIssue={launchIssue}
             onNoteIssue={(key) => { selectIssue(key); setNoteFocus(key); }}
             onConnect={({ source, target }) => {
               if (source !== target) setModal({ kind: 'link', source, target });
             }} />
-          {notice && <div className={`toast ${notice.error ? 'error' : ''}`} role={notice.error ? 'alert' : 'status'}>
-            {notice.error ? <CircleAlert size={17} /> : <Check size={17} />}
-            <span>{localizeMessage(notice.text, language)}</span>
-            {notice.retry && <button className="text-button" disabled={busy} onClick={() => void retryLink(notice.retry!)}>{t('Повторить связь', 'Retry link')}</button>}
-            <button className="icon-button" aria-label={t('Закрыть уведомление', 'Dismiss notification')} onClick={() => setNotice(undefined)}><X size={15} /></button>
+          {active && visibleNotice && <div className={`toast ${visibleNotice.error ? 'error' : ''}`} role={visibleNotice.error ? 'alert' : 'status'}>
+            {visibleNotice.error ? <CircleAlert size={17} /> : <Check size={17} />}
+            <span>{localizeMessage(visibleNotice.text, language)}</span>
+            {visibleNotice.retry && <button className="text-button" disabled={busy} onClick={() => void retryLink(visibleNotice.retry!)}>{t('Повторить связь', 'Retry link')}</button>}
+            <button className="icon-button" aria-label={t('Закрыть уведомление', 'Dismiss notification')} onClick={() =>
+              notice ? setNotice(undefined) : onDismissSessionNotice()}><X size={15} /></button>
           </div>}
         </section>
-        {selected && <IssueInspector issue={selected} graph={graph} connected={Boolean(connection)} busy={busy}
+        {selected && <IssueInspector key={selected.key} issue={selected} graph={graph} connected={Boolean(connection)} active={active} busy={busy}
           noteFocus={noteFocus === selected.key} onNoteCount={updateNoteCount}
           onClose={() => selectIssue()} onSelect={selectIssue} onAdd={() => addTask(selected)} onEdit={() => editIssue(selected)}
           onOpen={() => launchIssue(selected)} />}
@@ -425,8 +552,6 @@ export function App() {
               disabled={busy} onClick={() => setModal({ kind: 'delete', edge })}><Trash2 size={16} /> {t('Удалить связь', 'Delete link')}</button>}
           </div>
         </aside>}
-      </main>
-      {modal?.kind === 'connection' && <ConnectionDialog onConnect={connect} onClose={() => setModal(undefined)} />}
       {modal?.kind === 'create' && <CreateDialog project={modal.source?.project ?? project} source={modal.source} types={graph.linkTypes}
         onCreate={(input, typeId) => create(input, modal.source, typeId)} onClose={() => setModal(undefined)} />}
       {modal?.kind === 'link' && <LinkDialog source={modal.source} target={modal.target} types={graph.linkTypes}
@@ -451,16 +576,27 @@ export function App() {
         setModal(undefined);
         setNotice({ text: t('Связь удалена из Jira.', 'Link deleted from Jira.') });
       }} />}
-    </div>
+    </section>
   );
 }
 
-function IssueInspector({ issue, graph, connected, busy, noteFocus, onNoteCount, onClose, onSelect, onAdd, onEdit, onOpen }: {
-  issue: JiraIssue; graph: JiraGraph; connected: boolean; busy: boolean;
+function IssueInspector({ issue, graph, connected, active, busy, noteFocus, onNoteCount, onClose, onSelect, onAdd, onEdit, onOpen }: {
+  issue: JiraIssue; graph: JiraGraph; connected: boolean; active: boolean; busy: boolean;
   noteFocus: boolean; onNoteCount(key: string, count: number): void;
   onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onOpen(): void;
 }) {
   const { t } = usePreferences();
+  const { assignee, key } = issue;
+  const [avatar, setAvatar] = useState<{ name: string; url: string | null }>();
+  useEffect(() => {
+    if (!active || !connected || !assignee || avatar?.name === assignee) return;
+    let current = true;
+    void request('getAssigneeAvatar', { key }).catch(() => null).then((url) => {
+      if (current) setAvatar({ name: assignee, url });
+    });
+    return () => { current = false; };
+  }, [active, connected, key, assignee, avatar]);
+  const avatarUrl = avatar?.name === assignee ? avatar?.url : undefined;
   const blockers = blockersFor(graph, issue.key);
   const linked = graph.edges.filter(({ source, target }) => source === issue.key || target === issue.key);
   return <aside className="inspector" aria-label={t('Сведения о задаче', 'Issue details')}>
@@ -474,7 +610,10 @@ function IssueInspector({ issue, graph, connected, busy, noteFocus, onNoteCount,
         <span className={`status ${statusTone(issue)}`}><CircleDot size={11} /> {issue.status}</span>
         {issue.storyPoints !== undefined && <span className="points">{issue.storyPoints} SP</span>}
       </div>
-      {issue.assignee && <p className="assignee">{issue.assignee}</p>}
+      {assignee && <div className="inspector-assignee" aria-label={t(`Исполнитель: ${assignee}`, `Assignee: ${assignee}`)}>
+        {avatarUrl ? <img src={avatarUrl} alt="" /> : <span aria-hidden="true">{assigneeInitials(assignee)}</span>}
+        <div><small>{t('Исполнитель', 'Assignee')}</small>{assignee}</div>
+      </div>}
       {!!issue.labels?.length && <p className="assignee">{issue.labels.map((label) => `#${label}`).join(' ')}</p>}
       {issue.description && <p className="issue-description">{issue.description}</p>}
       <section className="inspector-block">

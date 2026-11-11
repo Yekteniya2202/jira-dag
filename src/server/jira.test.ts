@@ -303,6 +303,119 @@ test('Cloud search supplies filters and finds the epic of a nested subtask', asy
   assert.equal(epic?.epicKey, 'APP-1');
 });
 
+test('Cloud project listing pages on the authenticated gateway and ignores malformed records', async (t) => {
+  const cloudId = '12345678-abcd-abcd-abcd-1234567890ab';
+  const offsets: number[] = [];
+  mockFetch(t, (url, init) => {
+    if (url.pathname === '/_edge/tenant_info') return json({ cloudId });
+    assert.equal(url.origin, 'https://api.atlassian.com');
+    assert.equal(new Headers(init.headers).get('Authorization'), basic);
+    if (url.pathname.endsWith('/myself')) return profile();
+    assert.equal(url.pathname, `/ex/jira/${cloudId}/rest/api/3/project/search`);
+    assert.equal(init.method, 'GET');
+    assert.equal(url.searchParams.get('maxResults'), '100');
+    const startAt = Number(url.searchParams.get('startAt'));
+    offsets.push(startAt);
+    if (startAt === 0) return json({
+      startAt, isLast: false, maxResults: 2, nextPage: 'https://unrelated.invalid/projects',
+      values: [{ id: '10001', key: 'APP', name: 'Application' }, { id: '10002', key: 'X" OR project = "PRIVATE', name: 'Bad key' }],
+    });
+    if (startAt === 2) return json({
+      startAt, isLast: false, maxResults: 2, values: [
+        { id: 10001, key: 'APP', name: 'Application' }, { id: 10003, key: 'OPS_2', name: ' Operations ' },
+      ],
+    });
+    return json({ startAt, isLast: true, maxResults: 2, values: [] });
+  });
+  const { client } = await connectJira({ ...cloud, scopedToken: true }, () => {});
+  assert.deepEqual(await client.listProjects(), [
+    { id: '10001', key: 'APP', name: 'Application' }, { id: '10003', key: 'OPS_2', name: 'Operations' },
+  ]);
+  assert.deepEqual(offsets, [0, 2, 4]);
+});
+
+test('Data Center project listing uses the session PAT and propagates Jira permissions', async (t) => {
+  let forbidden = false;
+  mockFetch(t, (url, init) => {
+    assert.equal(new Headers(init.headers).get('Authorization'), `Bearer ${cloud.token}`);
+    if (url.pathname === '/jira/rest/api/2/myself') return profile();
+    assert.equal(url.pathname, '/jira/rest/api/2/project');
+    return forbidden ? json({ errorMessages: ['Forbidden'] }, 403) : json([
+      { id: '10001', key: 'APP', name: 'Application' }, { id: 10002, key: 'OLD', name: ' ' },
+    ]);
+  });
+  const session = createApiSession();
+  const action = { method: 'listProjects', input: null };
+  const unauthenticated = await session.invoke(action);
+  assert.equal(unauthenticated.ok ? null : unauthenticated.status, 401);
+  assert.equal((await session.invoke({
+    method: 'connect', input: { ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' },
+  })).ok, true);
+  const invalid = await session.invoke({ ...action, input: {} });
+  assert.equal(invalid.ok ? null : invalid.status, 400);
+  assert.deepEqual(await session.invoke(action), {
+    ok: true, data: [{ id: '10001', key: 'APP', name: 'Application' }],
+  });
+  forbidden = true;
+  const denied = await session.invoke(action);
+  assert.equal(denied.ok ? null : denied.status, 403);
+});
+
+test('Cloud avatars are limited to the Atlassian CDN without forwarding Jira authorization', async (t) => {
+  const cdn = 'avatar-management--avatars.us-west-2.prod.public.atl-paas.net';
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+lGxsAAAAASUVORK5CYII=';
+  let source = `https://${cdn}/initials/JS-1.png?size=48`;
+  let requests = 0;
+  mockFetch(t, (url, init) => {
+    const authorization = new Headers(init.headers).get('Authorization');
+    if (url.origin === 'https://team.atlassian.net') {
+      assert.equal(authorization, basic);
+      if (url.pathname.endsWith('/myself')) return profile();
+      assert.equal(url.pathname, '/rest/api/3/issue/APP-1');
+      assert.equal(url.searchParams.get('fields'), 'assignee');
+      return json(rawIssue('APP-1', { assignee: { avatarUrls: { '48x48': source } } }));
+    }
+    requests += 1;
+    assert.equal(url.hostname, cdn);
+    assert.equal(authorization, null);
+    assert.equal(init.credentials, 'omit');
+    return new Response(Uint8Array.from(Buffer.from(png, 'base64')), { headers: { 'Content-Type': 'image/png' } });
+  });
+  const { client } = await connectJira(cloud, () => {});
+  assert.equal(await client.getAssigneeAvatar('APP-1'), `data:image/png;base64,${png}`);
+  source = `https://${cdn}.example.com/initials/JS-1.png`;
+  assert.equal(await client.getAssigneeAvatar('APP-1'), null);
+  source = '/rest/api/3/user/search';
+  assert.equal(await client.getAssigneeAvatar('APP-1'), null);
+  assert.equal(requests, 1);
+});
+
+test('Data Center avatar fetch uses the context path and rejects non-raster and oversized responses', async (t) => {
+  let body = () => new Response('<svg/>', { headers: { 'Content-Type': 'image/svg+xml' } });
+  mockFetch(t, (url, init) => {
+    assert.equal(url.origin, 'https://jira.example.com');
+    assert.equal(new Headers(init.headers).get('Authorization'), `Bearer ${cloud.token}`);
+    if (url.pathname === '/jira/rest/api/2/myself') return profile();
+    if (url.pathname === '/jira/rest/api/2/issue/APP-1') return json(rawIssue('APP-1', {
+      assignee: { avatarUrls: { '48x48': '/jira/secure/useravatar?ownerId=jira-user' } },
+    }));
+    assert.equal(url.pathname, '/jira/secure/useravatar');
+    return body();
+  });
+  const session = createApiSession();
+  const action = { method: 'getAssigneeAvatar', input: { key: 'APP-1' } };
+  assert.equal((await session.invoke({
+    method: 'connect', input: { ...cloud, edition: 'data-center', url: 'https://jira.example.com/jira' },
+  })).ok, true);
+  assert.deepEqual(await session.invoke(action), { ok: true, data: null });
+  body = () => new Response('<svg/>', { headers: { 'Content-Type': 'image/png' } });
+  assert.deepEqual(await session.invoke(action), { ok: true, data: null });
+  body = () => new Response(new Uint8Array(128 * 1024 + 1), { headers: { 'Content-Type': 'image/png' } });
+  assert.deepEqual(await session.invoke(action), { ok: true, data: null });
+  body = () => Response.redirect('https://unrelated.invalid/avatar.png');
+  assert.deepEqual(await session.invoke(action), { ok: true, data: null });
+});
+
 test('saved favorites support Jira Cloud and Data Center, including filters without exposed JQL', async (t) => {
   const paths: string[] = [];
   mockFetch(t, (url) => {

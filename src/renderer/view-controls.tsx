@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import { Columns3, Focus, Layers3, Plus, Search } from 'lucide-react';
 import type { CardFields } from './graph-canvas';
 import type { GroupMode } from './graph-layout';
@@ -8,7 +8,7 @@ export type FocusMode = 'all' | 'connected' | 'upstream' | 'downstream';
 
 export const defaultCardFields: CardFields = {
   points: true,
-  assignee: false,
+  assignee: true,
   priority: false,
   labels: false,
   dueDate: false,
@@ -20,6 +20,8 @@ interface ViewControlsProps {
   onGroupMode(value: GroupMode): void;
   fields: CardFields;
   onFields(value: CardFields): void;
+  showLinks: boolean;
+  onShowLinks(value: boolean): void;
   showEdgePoints: boolean;
   onShowEdgePoints(value: boolean): void;
   focusMode: FocusMode;
@@ -46,13 +48,14 @@ function groupOptions(t: Translate): Record<GroupMode, string> {
 }
 
 export function GraphViewControls({
-  groupMode, onGroupMode, fields, onFields, showEdgePoints, onShowEdgePoints,
+  groupMode, onGroupMode, fields, onFields, showLinks, onShowLinks, showEdgePoints, onShowEdgePoints,
   focusMode, onFocusMode, selected, connected, busy, onInclude,
 }: ViewControlsProps) {
   const { t, language } = usePreferences();
   const [issueKey, setIssueKey] = useState('');
   const [includeError, setIncludeError] = useState('');
   const [including, setIncluding] = useState(false);
+  const includeErrorId = useId();
   const fieldOptions: Record<keyof CardFields, string> = {
     points: 'Story Points',
     assignee: t('Исполнитель', 'Assignee'),
@@ -108,11 +111,16 @@ export function GraphViewControls({
           </label>)}
         <label className="view-switch" title={t('Сумма Story Points уникальных задач дальше по цепочке блокировок',
           'Total Story Points of unique issues downstream in the blocking chain')}>
-          <input type="checkbox" checked={showEdgePoints} onChange={(event) => onShowEdgePoints(event.target.checked)} />
+          <input type="checkbox" checked={showEdgePoints} disabled={!showLinks}
+            onChange={(event) => onShowEdgePoints(event.target.checked)} />
           {t('SP на связях', 'SP on links')}
         </label>
       </div>
     </details>
+    <label className="view-switch">
+      <input type="checkbox" checked={showLinks} onChange={(event) => onShowLinks(event.target.checked)} />
+      {t('Связи между задачами', 'Links between issues')}
+    </label>
     <label className="view-control" title={!selected ? t('Выбери карточку для просмотра ветки', 'Select an issue to focus on its branch') : undefined}>
       <Focus size={14} aria-hidden="true" />
       <span>{t('Фокус', 'Focus')}</span>
@@ -125,13 +133,13 @@ export function GraphViewControls({
       <Search size={14} aria-hidden="true" />
       <input value={issueKey} onChange={(event) => { setIssueKey(event.target.value); setIncludeError(''); }}
         placeholder={t('Ключ задачи Jira', 'Jira issue key')} aria-label={t('Ключ задачи Jira', 'Jira issue key')}
-        aria-describedby={includeError ? 'graph-include-error' : undefined} aria-invalid={Boolean(includeError)}
+        aria-describedby={includeError ? includeErrorId : undefined} aria-invalid={Boolean(includeError)}
         maxLength={128} spellCheck={false} disabled={busy || including} />
       <button type="submit" className="icon-button outline" title={t('Добавить задачу на граф', 'Add issue to graph')}
         aria-label={t('Добавить задачу на граф', 'Add issue to graph')} disabled={busy || including || !issueKey.trim()}>
         <Plus size={15} aria-hidden="true" />
       </button>
     </form>}
-    {includeError && connected && <p id="graph-include-error" className="form-error" role="alert">{includeError}</p>}
+    {includeError && connected && <p id={includeErrorId} className="form-error" role="alert">{includeError}</p>}
   </div>;
 }

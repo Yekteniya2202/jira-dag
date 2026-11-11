@@ -79,14 +79,19 @@ test('a parent and its subtasks stay inside a nested zone within the epic and sh
     issue('APP-3', { parentKey: 'APP-2', isSubtask: true, statusCategory: 'done', storyPoints: 2 }),
     issue('APP-4', { parentKey: 'APP-1', storyPoints: 3 }),
     issue('OPS-1', { storyPoints: 8 }),
-  ], [parent('APP-1', 'APP-2'), parent('APP-2', 'APP-3'), parent('APP-1', 'APP-4'), blocks('1', 'APP-3', 'OPS-1')]);
+  ], [
+    parent('APP-1', 'APP-2'), parent('APP-2', 'APP-3'), parent('APP-1', 'APP-4'),
+    blocks('1', 'APP-3', 'OPS-1'), blocks('2', 'APP-1', 'OPS-1'),
+  ]);
 
   const layout = layoutWorkspace(data, 'LR', 'hierarchy', labels, CARD_HEIGHT);
-  const epic = layout.zones.find(({ kind }) => kind === 'group');
+  const epic = layout.zones.find(({ kind }) => kind === 'epic');
   const nested = layout.zones.find(({ kind }) => kind === 'nested');
   assert.ok(epic);
   assert.ok(nested);
   assert.equal(epic.title, 'APP-1 · Migration');
+  assert.equal(epic.epicKey, 'APP-1');
+  assert.equal(layout.positions.has('APP-1'), false);
   assert.equal(nested.title, 'APP-2');
   assert.deepEqual([epic.issues, epic.done, epic.points], [4, 1, 5]);
   assert.deepEqual([nested.issues, nested.done, nested.points], [2, 1, 2]);
@@ -94,6 +99,40 @@ test('a parent and its subtasks stay inside a nested zone within the epic and sh
   for (const key of ['APP-2', 'APP-3']) assert.ok(contains(nested, position(layout, key), CARD_WIDTH, CARD_HEIGHT));
   assert.ok(contains(epic, position(layout, 'APP-4'), CARD_WIDTH, CARD_HEIGHT));
   assert.equal(contains(epic, position(layout, 'OPS-1'), CARD_WIDTH, CARD_HEIGHT), false);
+  assert.deepEqual(layout.visibleEdges.map(({ id }) => id), ['parent:APP-2:APP-3', '1']);
+
+  const ungrouped = layoutWorkspace(data, 'LR', 'none', labels, CARD_HEIGHT);
+  position(ungrouped, 'APP-1');
+  assert.deepEqual(ungrouped.visibleEdges, data.edges);
+});
+
+test('an isolated epic has a selectable zone with finite dimensions', () => {
+  const data = graph([issue('APP-1', { issueType: 'Epic', statusCategory: 'done', storyPoints: 0 })], []);
+  for (const direction of ['LR', 'TB'] as const) {
+    const layout = layoutWorkspace(data, direction, 'hierarchy', labels, CARD_HEIGHT);
+    assert.equal(layout.positions.size, 0);
+    assert.equal(layout.zones.length, 1);
+    const [epic] = layout.zones;
+    assert.equal(epic.kind, 'epic');
+    assert.equal(epic.epicKey, 'APP-1');
+    assert.ok(Number.isFinite(epic.width) && epic.width >= CARD_WIDTH);
+    assert.ok(Number.isFinite(epic.height) && epic.height > 0);
+    assert.deepEqual([epic.issues, epic.done, epic.points], [1, 1, 0]);
+  }
+});
+
+test('a filter can leave only children of a known epic without adding its card or counting it in the zone', () => {
+  const child = issue('APP-2', { epicKey: 'APP-1', storyPoints: 3 });
+  const basis = graph([issue('APP-1', { summary: 'Migration', external: true }), child], [parent('APP-1', 'APP-2')]);
+  const filtered = graph([child], []);
+  const layout = layoutWorkspace(filtered, 'LR', 'hierarchy', labels, CARD_HEIGHT, basis);
+  const epic = layout.zones.find(({ kind }) => kind === 'epic');
+  assert.ok(epic);
+  assert.equal(epic.title, 'APP-1 · Migration');
+  assert.equal(epic.epicKey, 'APP-1');
+  assert.ok(contains(epic, position(layout, 'APP-2'), CARD_WIDTH, CARD_HEIGHT));
+  assert.deepEqual([epic.issues, epic.done, epic.points], [1, 0, 3]);
+  assert.equal(layoutWorkspace(basis, 'LR', 'hierarchy', labels, CARD_HEIGHT).positions.has('APP-1'), false);
 });
 
 test('only blocking edges internal to a cycle are marked including parallel edges and self-loops', () => {

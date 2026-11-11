@@ -137,6 +137,41 @@ function jqlLiteral(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+function splitJqlOrder(query: string): [where: string, orderBy: string] {
+  let quote: '"' | "'" | undefined;
+  let depth = 0;
+  for (let index = 0; index < query.length; index++) {
+    const character = query[index];
+    if (quote) {
+      if (character === '\\') index++;
+      else if (character === quote) quote = undefined;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '(') {
+      depth++;
+    } else if (character === ')') {
+      depth--;
+    } else if (depth === 0 && (character === 'O' || character === 'o') &&
+      (index === 0 || /[\s)]/.test(query[index - 1])) && /^order\s+by\b/i.test(query.slice(index))) {
+      return [query.slice(0, index).trimEnd(), query.slice(index)];
+    }
+  }
+  return [query, ''];
+}
+
+export function appendJqlClauses(jql: string, clauses: readonly string[]): string {
+  const additions = clauses.filter(Boolean);
+  if (!additions.length) return jql;
+  const [where, orderBy] = splitJqlOrder(jql.trim());
+  const base = /^[A-Z][A-Z0-9_]*-\d+$/i.test(where) ? `key = ${jqlLiteral(where.toUpperCase())}` : where;
+  const body = [...(base ? [`(${base})`] : []), ...additions].join(' AND ');
+  return orderBy ? `${body} ${orderBy}` : body;
+}
+
+function epicField(edition: JiraEdition): string {
+  return edition === 'data-center' ? '"Epic Link"' : 'parentEpic';
+}
+
 export function scopeJql(scope: ScopePreset, value: string, edition: JiraEdition = 'cloud'): string {
   if (scope === 'mine') return 'assignee = currentUser()';
   if (scope === 'openSprints') return 'sprint in openSprints()';
@@ -148,14 +183,58 @@ export function scopeJql(scope: ScopePreset, value: string, edition: JiraEdition
   switch (scope) {
     case 'issue': return `key = ${quoted}`;
     case 'project': return `project = ${reference}`;
-    case 'epic': {
-      const field = edition === 'data-center' ? '"Epic Link"' : 'parent';
-      return `(key = ${quoted} OR ${field} = ${quoted})`;
-    }
+    case 'epic': return `(key = ${quoted} OR ${epicField(edition)} = ${quoted})`;
     case 'subtasks': return `(key = ${quoted} OR (parent = ${quoted} AND issuetype in subtaskIssueTypes()))`;
     case 'label': return `labels = ${quoted}`;
     case 'sprint': return `sprint = ${reference}`;
     case 'release': return `fixVersion = ${reference}`;
     case 'saved': return `filter = ${reference}`;
   }
+}
+
+const jiraFields: Partial<Record<GraphFacet, string>> = {
+  statusCategory: 'statusCategory', status: 'status', project: 'project', parent: 'parent', issueType: 'issuetype',
+  labels: 'labels', assignee: 'assignee', priority: 'priority', sprints: 'sprint', fixVersions: 'fixVersion',
+};
+
+const emptyJiraFields = new Set<GraphFacet>(['labels', 'assignee', 'sprints', 'fixVersions']);
+const categoryNames: Readonly<Record<string, string | undefined>> = { new: 'To Do', indeterminate: 'In Progress', done: 'Done' };
+const hierarchyLevels: Readonly<Record<string, string | undefined>> = { epic: '1', issue: '0', subtask: '-1' };
+
+function anyOf(clauses: string[]): string {
+  return clauses.length > 1 ? `(${clauses.join(' OR ')})` : clauses[0] ?? '';
+}
+
+function matchJiraValues(field: string, values: string[]): string {
+  if (values.length === 1) return `${field} = ${values[0]}`;
+  return values.length ? `${field} in (${values.join(', ')})` : '';
+}
+
+export function jiraFacetClause(facet: GraphFacet, selected: readonly string[], edition: JiraEdition, storyField?: string): string {
+  const values = [...new Set(selected)].filter((value) => value && !/[\x00-\x1F\x7F]/.test(value));
+  if (facet === 'dueDate' || facet === 'estimate') {
+    const fieldId = /^customfield_(\d+)$/.exec(storyField ?? '')?.[1];
+    const field = facet === 'dueDate' ? 'due' : fieldId && `cf[${fieldId}]`;
+    if (!field) return '';
+    return anyOf(values.flatMap((value) => {
+      if (value === 'present') return [`${field} IS NOT EMPTY`];
+      return value === 'missing' ? [`${field} IS EMPTY`] : [];
+    }));
+  }
+  if (facet === 'hierarchy') {
+    if (edition === 'data-center') return values.includes('subtask') ? 'issuetype in subtaskIssueTypes()' : '';
+    return matchJiraValues('hierarchyLevel', values.flatMap((value) => Object.hasOwn(hierarchyLevels, value) ? [hierarchyLevels[value]!] : []));
+  }
+  if (facet === 'epic') {
+    const keys = values.map(jqlLiteral);
+    return anyOf([matchJiraValues('key', keys), ...keys.map((key) => `${epicField(edition)} = ${key}`)].filter(Boolean));
+  }
+  const field = jiraFields[facet];
+  if (!field) return '';
+  const references = values.flatMap((value) => {
+    if (facet === 'statusCategory') return Object.hasOwn(categoryNames, value) ? [jqlLiteral(categoryNames[value]!)] : [];
+    return [jqlLiteral(value)];
+  });
+  const missing = emptyJiraFields.has(facet) && selected.includes(noFacetValue) ? `${field} IS EMPTY` : '';
+  return anyOf([matchJiraValues(field, references), missing].filter(Boolean));
 }

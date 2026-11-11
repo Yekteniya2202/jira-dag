@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { emptyGraphFilters, filterGraph, issueFacetOptions, noFacetValue, scopeJql } from '../renderer/filter-model.js';
+import {
+  appendJqlClauses, emptyGraphFilters, filterGraph, issueFacetOptions, jiraFacetClause, noFacetValue, scopeJql,
+} from '../renderer/filter-model.js';
 import type { JiraGraph, JiraIssue } from '../shared/contracts.js';
 
 const issue = (key: string, fields: Partial<JiraIssue> = {}): JiraIssue => ({
@@ -64,11 +66,40 @@ test('cross-epic and edge-type filtering does not introduce links to hidden issu
 });
 
 test('scope presets quote names and switch to the Data Center Epic Link field', () => {
-  assert.equal(scopeJql('epic', 'APP-9'), '(key = "APP-9" OR parent = "APP-9")');
+  assert.equal(scopeJql('epic', 'APP-9'), '(key = "APP-9" OR parentEpic = "APP-9")');
   assert.equal(scopeJql('epic', 'APP-9', 'data-center'), '(key = "APP-9" OR "Epic Link" = "APP-9")');
   assert.equal(scopeJql('label', 'x" OR labels = "other'), String.raw`labels = "x\" OR labels = \"other"`);
   assert.equal(scopeJql('saved', '10001'), 'filter = 10001');
   assert.equal(scopeJql('sprint', 'Sprint 24'), 'sprint = "Sprint 24"');
   assert.equal(scopeJql('mine', ''), 'assignee = currentUser()');
   assert.equal(scopeJql('project', 'A\nB'), '');
+});
+
+test('Jira filter clauses preserve raw input, normalize bare keys and keep ORDER BY after the combined predicate', () => {
+  assert.equal(appendJqlClauses('  project = APP\n', []), '  project = APP\n');
+  assert.equal(appendJqlClauses('app-1', ['labels = "cleanup"']), '(key = "APP-1") AND labels = "cleanup"');
+  assert.equal(appendJqlClauses('project = APP OR project = OPS\norder   by priority DESC, key', ['status = "Open"']),
+    '(project = APP OR project = OPS) AND status = "Open" order   by priority DESC, key');
+  assert.equal(appendJqlClauses('ORDER BY created DESC', ['project = "APP"']), 'project = "APP" ORDER BY created DESC');
+  assert.equal(appendJqlClauses('', ['project = "APP"']), 'project = "APP"');
+});
+
+test('ORDER BY inside JQL literals or function arguments is preserved', () => {
+  const where = String.raw`summary ~ "Before \"ORDER BY\"" OR issue in linkedIssues('ORDER BY')`;
+  assert.equal(appendJqlClauses(`${where} ORDER BY key`, ['priority = "High"']),
+    `(${where}) AND priority = "High" ORDER BY key`);
+  assert.equal(appendJqlClauses(where, ['priority = "High"']), `(${where}) AND priority = "High"`);
+});
+
+test('Jira facets produce quoted field values, missing values, and native hierarchy conditions', () => {
+  assert.equal(jiraFacetClause('statusCategory', ['new', 'indeterminate'], 'cloud'), 'statusCategory in ("To Do", "In Progress")');
+  assert.equal(jiraFacetClause('assignee', ['Alex', noFacetValue], 'cloud'), '(assignee = "Alex" OR assignee IS EMPTY)');
+  assert.equal(jiraFacetClause('labels', ['a"b', 'c\\d'], 'cloud'), String.raw`labels in ("a\"b", "c\\d")`);
+  assert.equal(jiraFacetClause('hierarchy', ['epic', 'subtask'], 'cloud'), 'hierarchyLevel in (1, -1)');
+  assert.equal(jiraFacetClause('hierarchy', ['subtask'], 'data-center'), 'issuetype in subtaskIssueTypes()');
+  assert.equal(jiraFacetClause('epic', ['APP-9'], 'data-center'), '(key = "APP-9" OR "Epic Link" = "APP-9")');
+  assert.equal(jiraFacetClause('parent', [noFacetValue], 'cloud'), '');
+  assert.equal(jiraFacetClause('dueDate', ['present'], 'cloud'), 'due IS NOT EMPTY');
+  assert.equal(jiraFacetClause('estimate', ['missing'], 'cloud', 'customfield_10016'), 'cf[10016] IS EMPTY');
+  assert.equal(jiraFacetClause('estimate', ['missing'], 'cloud'), '');
 });

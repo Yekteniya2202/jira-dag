@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import { ChevronDown, Filter, LoaderCircle, Search } from 'lucide-react';
-import type { JiraEdition, JiraGraph, JiraSavedFilter } from '../shared/contracts';
+import type { JiraEdition, JiraGraph, JiraProject, JiraSavedFilter } from '../shared/contracts';
 import { request } from './api';
 import {
   edgeFacetOptions, emptyGraphFilters, graphFacets, hasGraphFilters, hierarchyEdgeType,
-  issueFacetOptions, noFacetValue, scopeJql,
+  issueFacetOptions, jiraFacetClause, noFacetValue, scopeJql,
   type FacetOption, type GraphFacet, type GraphFilters, type ScopePreset,
 } from './filter-model';
 import { usePreferences } from './i18n';
@@ -24,20 +24,39 @@ const scopeOptions: Array<{ id: ScopePreset; label: Translation; prompt?: Transl
   { id: 'openSprints', label: ['Активные спринты', 'Active sprints'] },
 ];
 
-type SavedState = { kind: 'loading' | 'failed' } | { kind: 'ready'; items: JiraSavedFilter[] };
+type ListState<T> = { kind: 'loading' | 'failed' } | { kind: 'ready'; items: T[] };
 
-export function GraphScopePresets({ connected, edition, onApply }: {
+export function GraphScopePresets({ connected, edition, projectKey, onProjectChange, onApply }: {
   connected: boolean;
   edition?: JiraEdition;
+  projectKey: string;
+  onProjectChange(key: string): void;
   onApply(jql: string): void;
 }) {
-  const { t } = usePreferences();
+  const { t, language } = usePreferences();
   const [presetId, setPresetId] = useState<ScopePreset | ''>('');
   const [value, setValue] = useState('');
-  const [saved, setSaved] = useState<SavedState>();
+  const [projects, setProjects] = useState<ListState<JiraProject>>({ kind: 'loading' });
+  const [projectRetry, setProjectRetry] = useState(0);
+  const [saved, setSaved] = useState<ListState<JiraSavedFilter>>();
   const [retry, setRetry] = useState(0);
   const preset = scopeOptions.find(({ id }) => id === presetId);
   const jql = preset ? scopeJql(preset.id, value, edition) : '';
+  const projectOptions = useMemo(() => projects.kind === 'ready'
+    ? [...projects.items].sort((left, right) => left.name.localeCompare(right.name, language, { numeric: true }))
+    : [], [language, projects]);
+
+  useEffect(() => {
+    if (!connected) return;
+    let active = true;
+    setProjects({ kind: 'loading' });
+    void request('listProjects', null).then((items) => {
+      if (active) setProjects({ kind: 'ready', items });
+    }).catch(() => {
+      if (active) setProjects({ kind: 'failed' });
+    });
+    return () => { active = false; };
+  }, [connected, projectRetry]);
 
   useEffect(() => {
     if (!connected || presetId !== 'saved') return;
@@ -58,6 +77,27 @@ export function GraphScopePresets({ connected, edition, onApply }: {
   }
 
   return <section className="scope-presets" aria-label={t('Шаблоны JQL', 'JQL presets')}>
+    {connected && <>
+      <label>{t('Проект Jira', 'Jira project')}
+        <select value={projectKey} onChange={(event) => onProjectChange(event.target.value)}>
+          <option value="">{t('Все доступные проекты', 'All accessible projects')}</option>
+          {projectKey && !projectOptions.some(({ key }) => key === projectKey) && <option value={projectKey}>{projectKey}</option>}
+          {projectOptions.map(({ id, key, name }) => <option value={key} key={id}>{name} ({key})</option>)}
+        </select>
+      </label>
+      {projects.kind === 'loading' && <p className="form-hint" role="status">
+        <LoaderCircle size={13} className="spin" /> {t('Загрузка проектов Jira…', 'Loading Jira projects…')}
+      </p>}
+      {projects.kind === 'ready' && projects.items.length === 0 && <p className="form-hint">
+        {t('Нет доступных проектов. Ключ можно ввести в JQL.', 'No accessible projects. You can enter a key in JQL.')}
+      </p>}
+      {projects.kind === 'failed' && <p className="form-hint">
+        {t('Список проектов Jira недоступен.', 'The Jira project list is unavailable.')}
+        <button type="button" className="text-button" onClick={() => setProjectRetry((previous) => previous + 1)}>
+          {t('Повторить', 'Retry')}
+        </button>
+      </p>}
+    </>}
     <label>{t('Шаблон выборки', 'Scope preset')}
       <select value={presetId} onChange={(event) => {
         setPresetId(event.target.value as ScopePreset | '');
@@ -94,7 +134,7 @@ export function GraphScopePresets({ connected, edition, onApply }: {
         <input value={value} placeholder={preset.example} onChange={(event) => setValue(event.target.value)} onKeyDown={applyOnEnter} />
       </label>}
       <button type="button" className="button secondary full" disabled={!jql} onClick={() => onApply(jql)}>
-        {t('Подставить в JQL', 'Use in JQL')}
+        {t('Добавить в JQL', 'Add to JQL')}
       </button>
     </div>}
   </section>;
@@ -175,17 +215,10 @@ const flags: Array<{
   { field: 'crossEpic', label: ['Только связи между эпиками', 'Only cross-epic links'] },
 ];
 
-export function GraphFilterPanel({ graph, filters, onChange }: {
-  graph: JiraGraph;
-  filters: GraphFilters;
-  onChange(filters: GraphFilters): void;
-}) {
+function useIssueOptions(graph: JiraGraph) {
   const { t, language } = usePreferences();
   const facets = useMemo(() => issueFacetOptions(graph.issues), [graph.issues]);
-  const edgeTypes = useMemo(() => edgeFacetOptions(graph), [graph]);
   const summaries = useMemo(() => new Map(graph.issues.map(({ key, summary }) => [key, summary])), [graph.issues]);
-  const sorted = (options: Array<FacetOption & { label: string }>) =>
-    options.sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }));
 
   function optionLabel(facet: GraphFacet, value: string): string {
     if (value === noFacetValue) return t(...(missingLabels[facet] ?? ['Без значения', 'No value']));
@@ -194,10 +227,61 @@ export function GraphFilterPanel({ graph, filters, onChange }: {
     const summary = (facet === 'epic' || facet === 'parent') && summaries.get(value);
     return summary && summary !== value ? `${value} · ${summary}` : value;
   }
+  return (facet: GraphFacet, selected: string[]) => {
+    const options = [...facets[facet]];
+    for (const value of selected) if (!options.some((option) => option.value === value)) options.push({ value, count: 0 });
+    return options.map((option) => ({ ...option, label: optionLabel(facet, option.value) }))
+      .sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }));
+  };
+}
 
-  return <section className="filters" aria-label={t('Фильтры графа', 'Graph filters')}>
+export function GraphJqlFilters({ graph, edition, storyField, selected, onChange }: {
+  graph: JiraGraph;
+  edition: JiraEdition;
+  storyField?: string;
+  selected: GraphFilters['facets'];
+  onChange(selected: GraphFilters['facets']): void;
+}) {
+  const { t } = usePreferences();
+  const issueOptions = useIssueOptions(graph);
+  const hasSelection = Object.values(selected).some((values) => values.length);
+
+  if (!graph.issues.length && !hasSelection) return null;
+  return <section className="filters" aria-label={t('Фильтры Jira в JQL', 'Jira filters in JQL')}>
     <div className="filter-heading">
-      <h2><Filter size={16} /> {t('Фильтры графа', 'Graph filters')}</h2>
+      <h2><Filter size={16} /> {t('Фильтры Jira', 'Jira filters')}</h2>
+      {hasSelection && <button type="button" className="text-button" onClick={() => onChange({})}>
+        {t('Сбросить', 'Reset')}
+      </button>}
+    </div>
+    <p className="form-hint">{t('Значения из загруженного графа меняют JQL. Загрузи граф, чтобы применить запрос.',
+      'Values from the loaded graph update JQL. Load the graph to apply the query.')}</p>
+    <div className="facet-grid">
+      {graphFacets.filter((facet) => facet !== 'project').map((facet) => {
+        const values = selected[facet] ?? [];
+        const options = issueOptions(facet, values).filter(({ value }) => jiraFacetClause(facet, [value], edition, storyField));
+        if (!options.some(({ value }) => value !== noFacetValue) && !values.length) return null;
+        return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={values}
+          onChange={(next) => onChange({ ...selected, [facet]: next })} />;
+      })}
+    </div>
+  </section>;
+}
+
+export function GraphFilterPanel({ graph, filters, connected, onChange }: {
+  graph: JiraGraph;
+  filters: GraphFilters;
+  connected?: boolean;
+  onChange(filters: GraphFilters): void;
+}) {
+  const { t, language } = usePreferences();
+  const issueOptions = useIssueOptions(graph);
+  const edgeTypes = useMemo(() => edgeFacetOptions(graph), [graph]);
+
+  const heading = connected ? t('Отображение графа', 'Graph display') : t('Фильтры графа', 'Graph filters');
+  return <section className="filters" aria-label={heading}>
+    <div className="filter-heading">
+      <h2><Filter size={16} /> {heading}</h2>
       {hasGraphFilters(filters) && <button type="button" className="text-button" onClick={() => onChange(emptyGraphFilters)}>
         {t('Сбросить', 'Reset')}
       </button>}
@@ -209,16 +293,15 @@ export function GraphFilterPanel({ graph, filters, onChange }: {
     </label>
     <div className="facet-grid">
       {edgeTypes.length > 0 && <Facet title={t('Тип связи', 'Link type')}
-        options={sorted(edgeTypes.map((option) => ({
+        options={edgeTypes.map((option) => ({
           ...option, label: option.value === hierarchyEdgeType ? t('Иерархия задач', 'Issue hierarchy') : option.label,
-        })))}
+        })).sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }))}
         selected={filters.edgeTypes} onChange={(values) => onChange({ ...filters, edgeTypes: values })} />}
-      {graphFacets.map((facet) => {
-        const options = facets[facet];
-        if (!options.some(({ value }) => value !== noFacetValue) && !filters.facets[facet]?.length) return null;
-        return <Facet key={facet} title={t(...facetTitles[facet])}
-          options={sorted(options.map((option) => ({ ...option, label: optionLabel(facet, option.value) })))}
-          selected={filters.facets[facet] ?? []}
+      {!connected && graphFacets.map((facet) => {
+        const selected = filters.facets[facet] ?? [];
+        const options = issueOptions(facet, selected);
+        if (!options.some(({ value }) => value !== noFacetValue) && !selected.length) return null;
+        return <Facet key={facet} title={t(...facetTitles[facet])} options={options} selected={selected}
           onChange={(values) => onChange({ ...filters, facets: { ...filters.facets, [facet]: values } })} />;
       })}
     </div>
