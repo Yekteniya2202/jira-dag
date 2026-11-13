@@ -103,6 +103,13 @@ export interface JiraSprintMembershipResult {
   failed: { key: string; operation: 'add' | 'remove'; reason: string }[];
 }
 
+export interface JiraStartSprintInput extends JiraSprintScope {
+  expectedIssueKeys: string[];
+  startDate: string;
+  endDate: string;
+  goal?: string;
+}
+
 export interface JiraIssue {
   key: string;
   summary: string;
@@ -125,6 +132,7 @@ export interface JiraIssue {
   parentSummary?: string;
   epicKey?: string;
   epicSummary?: string;
+  epicColor?: string;
   isEpic?: boolean;
   isSubtask?: boolean;
   priority?: string;
@@ -259,6 +267,7 @@ export interface ApiMethods {
   loadSprintPlan: { input: JiraSprintPlanQuery; output: JiraSprintPlan };
   loadSprintVelocity: { input: { boardId: string } & JiraSprintEstimateFields; output: JiraSprintVelocity };
   applySprintMembership: { input: JiraSprintMembershipInput; output: JiraSprintMembershipResult };
+  startSprint: { input: JiraStartSprintInput; output: JiraSprint };
   getCreateOptions: { input: { projectKey: string; issueTypeId?: string }; output: JiraCreateOptions };
   createIssue: { input: JiraIssueInput; output: JiraIssue };
   updateIssue: {

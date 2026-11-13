@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from
 import { ChevronDown, Filter, LoaderCircle, Search } from 'lucide-react';
 import type { JiraEdition, JiraGraph, JiraIssue, JiraProject, JiraProjectFilterOptions, JiraSavedFilter } from '../shared/contracts';
 import { request } from './api';
+import { epicColors, epicColorStyle } from './epic-color';
 import {
   graphFacets, hasHighlightFilters, issueFacetOptions, jiraFacetClause, manualJiraFacetValue, noFacetValue,
   projectJiraFacetValues, queryIssueFacetOptions, scopeJql, sprintFacetId, sprintFacetLabels,
@@ -89,7 +90,7 @@ export function GraphProjectFilters({
     const available = new Map(options.map((option) => [option.value, option]));
     for (const value of [...Object.keys(localValueLabels[facet] ?? {}), noFacetValue, ...values]) {
       if (!available.has(value) && (values.includes(value) || allows(value))) {
-        available.set(value, { value, label: loadedOptions.label(facet, value) });
+        available.set(value, { value, label: loadedOptions.label(facet, value), color: loadedOptions.color(facet, value) });
       }
     }
     if (!available.size && !manual) return null;
@@ -251,6 +252,7 @@ interface FacetChoice {
   value: string;
   label: string;
   count?: number;
+  color?: string;
 }
 
 function combineChoices(observed: FacetChoice[], metadata: ProjectFacetValue[], selected: string[]): FacetChoice[] {
@@ -308,9 +310,11 @@ function Facet({ title, options, selected, onChange, queryCounts, manual }: {
       aria-label={t('Найти значение', 'Find a value')} placeholder={t('Найти значение', 'Find a value')}
       onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => onEnter(event, () => {})} />}
     {(options.length > 0 || !manual) && <div className="facet-options">
-      {visible.map(({ value, label, count }) => <label className="facet-option" key={value} title={label}>
+      {visible.map(({ value, label, count, color }) => <label className="facet-option" key={value} title={label}>
         <input type="checkbox" checked={selected.includes(value)} onChange={() => onChange(toggle(selected, value))} />
-        <span>{label}</span>{count !== undefined && <small title={queryCounts ? t('Задачи в загруженной выборке JQL', 'Issues in the loaded JQL selection') : undefined}>
+        <span className={color ? 'facet-epic-label' : undefined}>
+          {color && <i className="epic-color-swatch" style={epicColorStyle(color)} aria-hidden="true" />}{label}
+        </span>{count !== undefined && <small title={queryCounts ? t('Задачи в загруженной выборке JQL', 'Issues in the loaded JQL selection') : undefined}>
           {count.toLocaleString(language)}
         </small>}
       </label>)}
@@ -331,6 +335,7 @@ function useIssueOptions(issues: readonly JiraIssue[], queryOnly = false, queryI
   const facets = useMemo(() => queryOnly ? queryIssueFacetOptions(issues, queryIssueKeys)
     : issueFacetOptions(issues), [issues, queryIssueKeys, queryOnly]);
   const summaries = useMemo(() => new Map(issues.map(({ key, summary }) => [key, summary])), [issues]);
+  const colorsByEpic = useMemo(() => epicColors(issues), [issues]);
   const sprintLabels = useMemo(() => sprintFacetLabels(issues), [issues]);
 
   function optionLabel(facet: GraphFacet, value: string): string {
@@ -349,10 +354,13 @@ function useIssueOptions(issues: readonly JiraIssue[], queryOnly = false, queryI
   function optionsFor(facet: GraphFacet, selected: string[]) {
     const options = [...facets[facet]];
     for (const value of selected) if (!options.some((option) => option.value === value)) options.push({ value, count: 0 });
-    return options.map((option) => ({ ...option, label: optionLabel(facet, option.value) }))
+    return options.map((option) => ({ ...option, label: optionLabel(facet, option.value), color: optionColor(facet, option.value) }))
       .sort((left, right) => left.label.localeCompare(right.label, language, { numeric: true }));
   }
-  return { options: optionsFor, label: optionLabel };
+  function optionColor(facet: GraphFacet, value: string) {
+    return facet === 'epic' ? colorsByEpic.get(value) : undefined;
+  }
+  return { options: optionsFor, label: optionLabel, color: optionColor };
 }
 
 export function GraphFilterPanel({ graph, filters, onChange }: {

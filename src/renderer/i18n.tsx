@@ -92,6 +92,12 @@ const applicationMessages: [ru: string, en: string][] = [
   ['Изменения не совпадают с исходным составом спринта или превышают допустимый размер.', 'The changes do not match the original sprint membership or exceed the allowed size.'],
   ['Другое изменение спринта ещё выполняется.', 'Another sprint change is still in progress.'],
   ['Состав спринта изменился или загружен не полностью. Обнови план перед применением.', 'Sprint membership changed or was only partially loaded. Refresh the draft before applying.'],
+  ['Состав спринта изменился или загружен не полностью. Обнови план перед изменением.', 'Sprint membership changed or was only partially loaded. Refresh the draft before proceeding.'],
+  ['Дата окончания спринта должна быть позже даты начала.', 'The sprint must end after it starts.'],
+  ['Запустить можно только будущий спринт.', 'Only a future sprint can be started.'],
+  ['Укажи дату и время спринта с часовым поясом.', 'Enter a sprint date and time with a time zone.'],
+  ['Jira не подтвердила запуск спринта. Обнови его состояние перед повторной попыткой.', 'Jira did not confirm the sprint start. Refresh its state before retrying.'],
+  ['Спринт активен в Jira, но даты или цель отличаются. Обнови план.', 'The sprint is active in Jira with different dates or a different goal. Refresh the draft.'],
   ['Состав закрытого спринта изменить нельзя.', 'Membership of a closed sprint cannot be changed.'],
   ['Задача больше не входит в бэклог выбранной доски.', 'The issue is no longer in the selected board’s backlog.'],
   ['Открытый спринт задачи изменился. Обнови план.', 'The issue’s open sprint changed. Refresh the draft.'],
@@ -139,6 +145,7 @@ export function localizeMessage(message: string, language: Language): string {
     .replace(/^История спринта «(.+)» неполная\. Недоступные статусы и оценки исключены из итогов\.$/u, 'Sprint “$1” has incomplete history. Unavailable statuses and estimates are omitted.')
     .replace(/^Не удалось прочитать историю спринта «(.+)»\.$/u, 'Could not load history for sprint “$1”.')
     .replace(/^У закрытого спринта «(.+)» нет фактической даты завершения\.$/u, 'Closed sprint “$1” has no actual completion date.')
+    .replace(/^Укажи цель спринта длиной до (\d+) символов\.$/u, 'Enter a sprint goal of at most $1 characters.')
     .replace(/^Показаны первые (\d+) задач\. Уточни JQL для полной выборки\.$/u, 'Showing the first $1 issues. Refine the JQL to load the complete results.')
     .replace(/^Граф ограничен (\d+) задачами\.$/u, 'The graph is limited to $1 issues.')
     .replace(/^Догрузка ограничена (\d+) связанными задачами\.$/u, 'Expansion is limited to $1 linked issues.')

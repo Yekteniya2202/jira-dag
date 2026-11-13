@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
-  ArrowLeft, ArrowRight, CalendarRange, ChevronDown, CircleAlert, Clock3, ExternalLink, GitBranch, ListFilter,
+  ArrowLeft, ArrowRight, CalendarRange, ChartNoAxesCombined, ChevronDown, CircleAlert, Clock3, ExternalLink, GitBranch, ListFilter,
   LoaderCircle, Plus, RefreshCw, Search, SlidersHorizontal, Trash2, Users, X,
 } from 'lucide-react';
 import type {
@@ -10,12 +10,17 @@ import type {
 import { errorMessage, openIssue, request } from './api';
 import { analyzeDependencies } from './dependency-analysis';
 import { Dialog } from './dialogs';
+import { epicColorStyle, epicColors } from './epic-color';
 import { mergeGraphs, statusTone } from './graph-model';
 import { localizeMessage, usePreferences, type Translate } from './i18n';
 import {
   inferSprintRole, planSprintDraft, type SprintDraftItem, type SprintDraftOverride, type SprintDraftPlan, type SprintRole,
 } from './sprint-draft-planning';
 import { emptySprintDraftEntry, type SprintDraftEntry, type SprintDraftMember, type SprintDraftState } from './sprint-draft-state';
+import { SprintPlanCharts } from './sprint-plan-charts';
+import { SprintPlanGraph, SprintPlanLegend } from './sprint-plan-graph';
+import { layoutSprintGraph, type SprintGraphCard } from './sprint-plan-graph-model';
+import { StartSprintButton } from './start-sprint';
 import './sprint-draft-panel.css';
 
 const roles: SprintRole[] = ['BE', 'FE', 'QA', 'SA'];
@@ -38,6 +43,7 @@ type Resource<T> = { key: string; status: 'loading' } | { key: string; status: '
   { key: string; status: 'failed'; message: string };
 type Preview = { input: JiraSprintMembershipInput; sprint: string; remaining: number };
 type Pending = 'search' | 'add' | 'apply';
+type DraftView = 'graph' | 'list' | 'statistics';
 type FormatNumber = (value: number) => string;
 
 const reasonLabels: Record<string, [string, string]> = {
@@ -126,6 +132,11 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
   const [notice, setNotice] = useState<{ text: string; error?: boolean }>();
   const [preview, setPreview] = useState<Preview>();
   const [pending, setPending] = useState<Pending>();
+  const [starting, setStarting] = useState(false);
+  const [view, setView] = useState<DraftView>('graph');
+  const [showBacklog, setShowBacklog] = useState(false);
+  const [focusedKey, setFocusedKey] = useState<string>();
+  const [locate, setLocate] = useState<{ key: string; at: number }>();
   const [quickSearch, setQuickSearch] = useState('');
   const [backlogQuery, setBacklogQuery] = useState('');
   const [filter, setFilter] = useState('all');
@@ -205,8 +216,24 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
     reservePercent: entry.reservePercent ?? defaultReserve,
   }, dependencyAnalysis), [plannerGraph, dependencyAnalysis, selectedKeys, data, remoteGraph, scope, current, configuredTeam, entry, readyHistory]);
   const term = quickSearch.trim().toLocaleLowerCase();
+  const busy = Boolean(pending) || starting;
+  const hasChanges = Boolean(locallyAdded.length || locallyRemoved.length);
   const writeSafe = Boolean(data && connected && data.membershipComplete &&
-    (data.sprint.state === 'active' || data.sprint.state === 'future') && !pending);
+    (data.sprint.state === 'active' || data.sprint.state === 'future') && !busy);
+
+  function startBusy(value: boolean) {
+    setStarting(value);
+    onBusyChange(value);
+  }
+
+  function sprintStarted(sprint: JiraSprint) {
+    updateEntry((previous) => ({ ...previous, goal: undefined }));
+    setNotice({ text: t(`Спринт «${sprint.name}» начат в Jira.`, `Sprint “${sprint.name}” started in Jira.`) });
+    setRemoteGraph(undefined);
+    snapshot.reload();
+    sprints.reload();
+    onApplied?.();
+  }
 
   function updateEntry(change: (previous: SprintDraftEntry) => SprintDraftEntry) {
     const latest = stateRef.current;
@@ -296,6 +323,9 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
     setQuickSearch('');
     setBacklogQuery('');
     setFilter('all');
+    setFocusedKey(undefined);
+    setLocate(undefined);
+    setShowBacklog(false);
     setNotice(undefined);
     setPreview(undefined);
   }
@@ -307,13 +337,14 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
 
   async function searchBacklog(event?: FormEvent) {
     event?.preventDefault();
-    if (!jiraSnapshot || !backlogQuery.trim() || lock.current) return;
+    if (!jiraSnapshot || !backlogQuery.trim() || lock.current || starting) return;
     lock.current = true;
     setPending('search');
     setNotice(undefined);
     try {
       const result = await request('loadSprintPlan', { ...planScope(boardId, sprintId, entry), backlogJql: backlogQuery.trim() });
       appendRemote(result, scope);
+      setShowBacklog(true);
       setNotice({ text: t(
         `Найдено в бэклоге Jira — ${result.backlogIssueKeys.length}.`,
         `Found in the Jira backlog — ${result.backlogIssueKeys.length}.`,
@@ -327,7 +358,7 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
 
   async function addByKey(raw: string) {
     const key = raw.trim().toUpperCase();
-    if (!jiraSnapshot || !keyPattern.test(key) || lock.current) return;
+    if (!jiraSnapshot || !keyPattern.test(key) || lock.current || starting) return;
     const knownIssue = plannerGraph?.issues.find((issue) => issue.key === key);
     if (knownIssue?.isSubtask) {
       setNotice({ text: t('Спринт подзадачи меняется вместе с родительской задачей.', 'Subtasks move with their parent issue.'), error: true });
@@ -336,6 +367,8 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
     if (currentKeys.includes(key) || jiraSnapshot.backlogIssueKeys.includes(key) || remoteGraph?.scope === scope && remoteGraph.keys.includes(key)) {
       updateSelection([key], true, !currentKeys.includes(key) && !jiraSnapshot.backlogIssueKeys.includes(key) ? key : undefined);
       setQuickSearch('');
+      setFocusedKey(key);
+      setLocate({ key, at: Date.now() });
       return;
     }
     lock.current = true;
@@ -354,6 +387,8 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
       appendRemote(result, scope);
       updateSelection([key], true, key);
       setQuickSearch('');
+      setFocusedKey(key);
+      setLocate({ key, at: Date.now() });
     } catch (cause) { setNotice({ text: localizeMessage(errorMessage(cause), language), error: true }); }
     finally {
       lock.current = false;
@@ -406,16 +441,19 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
   const visibleProjects = connected ? resourceItems(projects.resource) : [demoProject];
   const visibleBoards = connected ? resourceItems(boards.resource) : [demoBoard];
   const visibleSprints = connected ? resourceItems(sprints.resource) : [demoSprint];
-  const issueByKey = new Map(plannerGraph?.issues.map((issue) => [issue.key, issue]));
+  const issueByKey = useMemo(() => new Map(plannerGraph?.issues.map((issue) => [issue.key, issue])), [plannerGraph]);
   const availableTeam = new Map(resourceItems(projectTeam.resource).map((person) => [person.id, person]));
   for (const { assigneeId, assignee } of plannerGraph?.issues ?? []) {
     if (assigneeId && assignee && !availableTeam.has(assigneeId)) availableTeam.set(assigneeId, { id: assigneeId, name: assignee });
   }
   const planByKey = new Map(plan?.items.map((item) => [item.issue.key, item]));
-  const selected = new Set(selectedKeys);
-  const backlog = [...new Set([...(data?.backlogIssueKeys ?? []), ...(remoteGraph?.scope === scope ? remoteGraph.keys : []), ...locallyRemoved])]
-    .filter((key) => !selected.has(key)).flatMap((key) => issueByKey.get(key) ?? []);
-  const selectedIssues = selectedKeys.flatMap((key) => issueByKey.get(key) ?? []);
+  const selected = useMemo(() => new Set(selectedKeys), [selectedKeys]);
+  const backlog = useMemo(() => [...new Set([
+    ...(data?.backlogIssueKeys ?? []), ...(remoteGraph?.scope === scope ? remoteGraph.keys : []),
+    ...entry.removed.filter((key) => current?.includes(key)),
+  ])].filter((key) => !selected.has(key)).flatMap((key) => issueByKey.get(key) ?? []),
+  [data, remoteGraph, scope, entry.removed, current, selected, issueByKey]);
+  const selectedIssues = useMemo(() => selectedKeys.flatMap((key) => issueByKey.get(key) ?? []), [selectedKeys, issueByKey]);
   const recommendations = plan?.items.filter((item) => item.source === 'recommended' && !item.issue.isSubtask) ?? [];
   const recommendationKeys = new Set(recommendations.map((item) => item.issue.key));
   const skipped = new Map(plan?.skipped.map((entry) => [entry.issue.key, entry]));
@@ -427,16 +465,45 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
   for (const issue of [...backlog, ...selectedIssues]) {
     if (issue.epicKey) epicNames.set(issue.epicKey, issue.epicSummary || epicNames.get(issue.epicKey) || issue.epicKey);
   }
+  const colors = useMemo(() => epicColors(plannerGraph?.issues ?? []), [plannerGraph]);
   const validKey = connected && keyPattern.test(quickSearch.trim());
+  const backlogKeys = useMemo(() => new Set(backlog.map(({ key }) => key)), [backlog]);
+  const visibleBacklogKeyList = visibleBacklog.map(({ key }) => key).join(',');
+  const includeBacklog = showBacklog || Boolean(term) || filter !== 'all' || (!selectedKeys.length && !recommendations.length);
+  const graphLayout = useMemo(() => plannerGraph && plan && layoutSprintGraph(plannerGraph, plan, {
+    selectedKeys, backlogKeys, visibleBacklogKeys: visibleBacklogKeyList ? visibleBacklogKeyList.split(',') : [], includeBacklog,
+  }), [plannerGraph, plan, selectedKeys, backlogKeys, visibleBacklogKeyList, includeBacklog]);
+  const matches = term ? new Set([...visibleSelected, ...visibleBacklog].map(({ key }) => key)) : undefined;
+  const focused = focusedKey && graphLayout?.cards.some(({ key }) => key === focusedKey) ? issueByKey.get(focusedKey) : undefined;
+  const focusedBlocker = focusedKey && !focused && graphLayout?.cards.some(({ key }) => key === focusedKey) ? focusedKey : undefined;
+
+  function canMove(card: SprintGraphCard) {
+    return !busy && card.primary && Boolean(card.issue) && !card.issue?.isSubtask && card.kind !== 'blocker';
+  }
+
+  function moveIssue(key: string, add: boolean) {
+    if (busy) return;
+    if (!add) setShowBacklog(true);
+    updateSelection([key], add, add && !data?.backlogIssueKeys.includes(key) && !currentKeys.includes(key) ? key : undefined);
+  }
+
+  function locateIssue(key: string) {
+    setFocusedKey(key);
+    setLocate({ key, at: Date.now() });
+  }
+
+  function editCard(key: string, override: SprintDraftOverride) {
+    updateEntry((previous) => ({ ...previous, overrides: { ...previous.overrides, [key]: override } }));
+  }
 
   return <section className="sprint-draft" aria-label={t('Черновик спринта', 'Sprint draft')}>
     <header className="sprint-draft-heading">
-      <button type="button" className="button secondary" onClick={onClose} disabled={pending === 'apply'}>
+      <button type="button" className="button secondary" onClick={onClose} disabled={pending === 'apply' || starting}>
         <ArrowLeft size={16} /> {t('К графу', 'Back to graph')}
       </button>
       <h1><CalendarRange size={19} /> {t('Черновик спринта', 'Sprint draft')}</h1>
       <div className="sprint-draft-actions">
-        {connected && <button type="button" className="icon-button outline" disabled={Boolean(pending)}
+        {connected && <button type="button" className="icon-button outline" disabled={busy}
           title={t('Обновить данные Jira', 'Refresh Jira data')} aria-label={t('Обновить данные Jira', 'Refresh Jira data')}
           onClick={() => {
             setRemoteGraph(undefined);
@@ -448,22 +515,24 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
           <RefreshCw size={16} />
         </button>}
         {onOpenGraph && <button type="button" className="button secondary"
-          disabled={Boolean(pending) || !data || selectedKeys.length === 0 || selectedKeys.length > 250}
+          disabled={busy || !data || selectedKeys.length === 0 || selectedKeys.length > 250}
           title={selectedKeys.length > 250 ? t('До 250 задач в графе спринта', 'Up to 250 issues in the sprint graph') : undefined}
           onClick={() => { if (data) onOpenGraph(selectedKeys, data.sprint.name); }}>
-          <GitBranch size={15} /> {t('Граф черновика', 'Draft graph')}
+          <GitBranch size={15} /> {t('Открыть в редакторе графа', 'Open in graph editor')}
         </button>}
         {connected && <button type="button" className="button primary" onClick={previewChanges}
           disabled={!writeSafe || !locallyAdded.length && !locallyRemoved.length}>
           {t('Проверить изменения в Jira', 'Review Jira changes')}
           {locallyAdded.length + locallyRemoved.length > 0 && <b>{locallyAdded.length + locallyRemoved.length}</b>}
         </button>}
+        {connected && data && <StartSprintButton boardId={boardId} sprint={data.sprint} expectedIssueKeys={currentKeys}
+          hasChanges={hasChanges} disabled={!writeSafe} goal={entry.goal} onStarted={sprintStarted} onBusyChange={startBusy} />}
       </div>
     </header>
     <div className="sprint-draft-content">
       <div className="sprint-draft-scope">
         <label>{t('Проект Jira', 'Jira project')}
-          <select value={project} disabled={!connected || Boolean(pending)} onChange={(event) =>
+          <select value={project} disabled={!connected || busy} onChange={(event) =>
             selectScope({ projectKey: event.target.value, boardId: undefined, sprintId: undefined })}>
             <option value="">{t('Выбрать проект', 'Choose a project')}</option>
             {project && !visibleProjects.some(({ key }) => key === project) && <option value={project}>{project}</option>}
@@ -471,7 +540,7 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
           </select>
         </label>
         <label>{t('Scrum-доска', 'Scrum board')}
-          <select value={boardId} disabled={!connected || !project || Boolean(pending)} onChange={(event) =>
+          <select value={boardId} disabled={!connected || !project || busy} onChange={(event) =>
             selectScope({ projectKey: project, boardId: event.target.value || undefined, sprintId: undefined })}>
             <option value="">{t('Выбрать доску', 'Choose a board')}</option>
             {boardId && !visibleBoards.some(({ id }) => id === boardId) && <option value={boardId}>{boardId}</option>}
@@ -479,7 +548,7 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
           </select>
         </label>
         <label>{t('Спринт Jira', 'Jira sprint')}
-          <select value={sprintId} disabled={!connected || !boardId || Boolean(pending)} onChange={(event) =>
+          <select value={sprintId} disabled={!connected || !boardId || busy} onChange={(event) =>
             selectScope({ sprintId: event.target.value || undefined })}>
             <option value="">{t('Выбрать спринт', 'Choose a sprint')}</option>
             {sprintId && !visibleSprints.some(({ id }) => id === sprintId) && <option value={sprintId}>{sprintId}</option>}
@@ -510,12 +579,23 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
             : t('Jira вернула неполный состав спринта. Изменения можно сохранить локально.', 'Jira returned incomplete sprint membership. Changes can be saved locally.')}
         </p>}
         <SprintDraftSummary plan={plan} data={data} entry={entry} format={format} t={t} />
-        <div className="sprint-draft-toolbar">
+        <nav className="sprint-view-switch" aria-label={t('Режим планирования спринта', 'Sprint planning view')}>
+          <button type="button" className="button secondary" aria-pressed={view === 'graph'} onClick={() => setView('graph')}>
+            <GitBranch size={15} />{t('Граф планирования', 'Planning graph')}
+          </button>
+          <button type="button" className="button secondary" aria-pressed={view === 'list'} onClick={() => setView('list')}>
+            <ListFilter size={15} />{t('Список задач', 'Issue list')}
+          </button>
+          <button type="button" className="button secondary" aria-pressed={view === 'statistics'} onClick={() => setView('statistics')}>
+            <ChartNoAxesCombined size={15} />{t('Статистика', 'Statistics')}
+          </button>
+        </nav>
+        {view !== 'statistics' && <div className="sprint-draft-toolbar">
           <form className="sprint-draft-quick-search" onSubmit={(event) => { event.preventDefault(); if (validKey) void addByKey(quickSearch); }}>
             <label><Search size={16} /><input type="search" placeholder={t('Ключ, название, эпик, исполнитель', 'Key, title, epic, assignee')}
               aria-label={t('Поиск по задачам спринта и бэклога', 'Search sprint and backlog issues')}
               value={quickSearch} onChange={(event) => setQuickSearch(event.target.value)} /></label>
-            {validKey && <button type="submit" className="button secondary" disabled={Boolean(pending)}>
+            {validKey && <button type="submit" className="button secondary" disabled={busy}>
               {pending === 'add' ? <LoaderCircle size={15} className="spin" /> : <Plus size={15} />} {t('Добавить по ключу', 'Add by key')}
             </button>}
           </form>
@@ -530,26 +610,56 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
             <form onSubmit={(event) => void searchBacklog(event)}>
               <input aria-label={t('JQL бэклога', 'Backlog JQL')} placeholder='labels = "migration"' maxLength={4000}
                 value={backlogQuery} onChange={(event) => setBacklogQuery(event.target.value)} />
-              <button type="submit" className="button secondary" disabled={!backlogQuery.trim() || Boolean(pending)}>
+              <button type="submit" className="button secondary" disabled={!backlogQuery.trim() || busy}>
                 {pending === 'search' ? <LoaderCircle size={15} className="spin" /> : <Search size={15} />} {t('Найти', 'Search')}
               </button>
             </form>
           </details>}
-        </div>
-        <div className="sprint-draft-grid">
+        </div>}
+        {view === 'graph' && term && (visibleSelected.length > 0 || visibleBacklog.length > 0) &&
+          <div className="sprint-search-results" aria-label={t('Найденные задачи', 'Matching issues')}>
+            {[...visibleSelected, ...visibleBacklog].slice(0, 12).map(({ key, summary }) =>
+              <button type="button" className="text-button" key={key} title={summary} onClick={() => locateIssue(key)}>{key}</button>)}
+          </div>}
+        <div className={view === 'list' ? 'sprint-draft-grid' : 'sprint-draft-grid is-graph'}>
+          {view === 'graph' && graphLayout && <section className="sprint-graph-workspace">
+            <header className="sprint-graph-actions">
+              <label className="sprint-graph-checkbox">
+                <input type="checkbox" checked={showBacklog} onChange={(event) => setShowBacklog(event.target.checked)} />
+                {t('Показать бэклог на графе', 'Show backlog on graph')}
+              </label>
+              {recommendations.length > 0 && <button type="button" className="button secondary"
+                disabled={busy} onClick={() => acceptRecommendations(recommendations)}>
+                <Plus size={15} /> {t('Добавить рекомендованные', 'Add recommendations')} <b>{recommendations.length}</b>
+              </button>}
+              {hasChanges && <button type="button" className="text-button" disabled={busy}
+                onClick={() => updateEntry((previous) => ({ ...previous, added: [], removed: [] }))}>
+                {t('Сбросить переносы', 'Reset moves')}
+              </button>}
+            </header>
+            <SprintPlanGraph key={draftKey} layout={graphLayout} focusedKey={focusedKey} locate={locate} matches={matches}
+              format={format} onSelect={setFocusedKey} canMove={canMove} onMove={(card) => moveIssue(card.key, card.kind !== 'selected')} />
+            <SprintPlanLegend />
+            {(graphLayout.omittedBacklog > 0 || !data.backlogComplete) && <p className="sprint-draft-caption">{t(
+              'На графе показана часть бэклога. Уточни поиск по ключу, названию или JQL.',
+              'The graph shows part of the backlog. Refine the search by key, title, or JQL.',
+            )}</p>}
+          </section>}
+          {view === 'statistics' && <SprintPlanCharts plan={plan} history={readyHistory} selectedKeys={selectedKeys} />}
+          {view === 'list' && <>
           <DraftColumn title={t('Бэклог', 'Backlog')} count={visibleBacklog.length}
             description={data.backlogComplete ? undefined : t(
               'Загружена часть бэклога. Остальные задачи можно найти по ключу или JQL.',
               'Part of the backlog is loaded. Find other issues by key or JQL.',
             )} action={recommendations.length > 0 && <button type="button" className="button secondary"
-              disabled={Boolean(pending)} onClick={() => acceptRecommendations(recommendations)}>
+              disabled={busy} onClick={() => acceptRecommendations(recommendations)}>
               <Plus size={15} /> {t('Добавить рекомендованные', 'Add recommendations')} <b>{recommendations.length}</b>
             </button>}>
             {(limit) => visibleBacklog.slice(0, limit).map((issue) => <DraftCard key={issue.key} issue={issue} team={configuredTeam}
               item={planByKey.get(issue.key)} skip={skipped.get(issue.key)} override={entry.overrides[issue.key]} t={t} format={format}
-              connected={connected} disabled={Boolean(pending)} mode="backlog" onMove={() => updateSelection([issue.key], true,
-                data.backlogIssueKeys.includes(issue.key) || currentKeys.includes(issue.key) ? undefined : issue.key)}
-              onOverride={(override) => updateEntry((previous) => ({ ...previous, overrides: { ...previous.overrides, [issue.key]: override } }))}
+              connected={connected} disabled={busy} mode="backlog" onMove={() => moveIssue(issue.key, true)}
+              epicColor={colors.get(issue.epicKey ?? issue.key)}
+              onOverride={(override) => editCard(issue.key, override)}
               onFocusIssue={onFocusIssue && graph.issues.some(({ key }) => key === issue.key) ? () => onFocusIssue(issue.key) : undefined} />)}
           </DraftColumn>
           <DraftColumn title={t('В спринте', 'In sprint')} count={visibleSelected.length}
@@ -557,20 +667,36 @@ export function SprintDraftPanel({ graph, connected, active, projectKey, state, 
               `В черновике: +${locallyAdded.length} / −${locallyRemoved.length}`,
               `Draft changes: +${locallyAdded.length} / −${locallyRemoved.length}`,
             ) : undefined} action={(locallyAdded.length || locallyRemoved.length) > 0 && <button type="button" className="text-button"
-              disabled={Boolean(pending)} onClick={() => updateEntry((previous) => ({ ...previous, added: [], removed: [] }))}>
+              disabled={busy} onClick={() => updateEntry((previous) => ({ ...previous, added: [], removed: [] }))}>
               {t('Сбросить переносы', 'Reset moves')}
             </button>}>
             {(limit) => visibleSelected.slice(0, limit).map((issue) => <DraftCard key={issue.key} issue={issue} team={configuredTeam}
               item={planByKey.get(issue.key)} override={entry.overrides[issue.key]} t={t} format={format} connected={connected}
-              disabled={Boolean(pending)} mode="sprint" onMove={() => updateSelection([issue.key], false)}
-              onOverride={(override) => updateEntry((previous) => ({ ...previous, overrides: { ...previous.overrides, [issue.key]: override } }))}
+              disabled={busy} mode="sprint" onMove={() => moveIssue(issue.key, false)}
+              epicColor={colors.get(issue.epicKey ?? issue.key)}
+              onOverride={(override) => editCard(issue.key, override)}
               onFocusIssue={onFocusIssue && graph.issues.some(({ key }) => key === issue.key) ? () => onFocusIssue(issue.key) : undefined} />)}
           </DraftColumn>
+          </>}
           <aside className="sprint-draft-settings" aria-label={t('Настройки планирования', 'Planning settings')}>
-            <DraftSettings data={data} entry={entry} epicNames={epicNames} format={format} t={t} disabled={Boolean(pending)}
+            {view === 'graph' && (focused || focusedBlocker) && <section className="sprint-graph-inspector" aria-label={t('Задача на графе', 'Issue on graph')}>
+              <header><h2>{t('Задача на графе', 'Issue on graph')}</h2>
+                <button type="button" className="icon-button" onClick={() => setFocusedKey(undefined)}
+                  aria-label={t('Закрыть задачу', 'Close issue')}><X size={16} /></button></header>
+              {focused ? <ul className="sprint-card-list">
+                <DraftCard key={focused.key} issue={focused} team={configuredTeam} item={planByKey.get(focused.key)}
+                  skip={skipped.get(focused.key)} override={entry.overrides[focused.key]} t={t} format={format} connected={connected}
+                  disabled={busy} mode={selected.has(focused.key) ? 'sprint' : 'backlog'}
+                  readOnly={!selected.has(focused.key) && !backlogKeys.has(focused.key)}
+                  epicColor={colors.get(focused.epicKey ?? focused.key)}
+                  onMove={() => moveIssue(focused.key, !selected.has(focused.key))}
+                  onOverride={(override) => editCard(focused.key, override)} />
+              </ul> : <p className="sprint-draft-caption"><strong>{focusedBlocker}</strong> · {t('Блокер вне загруженной выборки.', 'Blocker outside the loaded scope.')}</p>}
+            </section>}
+            <DraftSettings data={data} entry={entry} epicNames={epicNames} colors={colors} format={format} t={t} disabled={busy}
               onChange={(patch) => updateEntry((previous) => ({ ...previous, ...patch }))} />
             <DraftTeam team={configuredTeam} projectTeam={[...availableTeam.values()]} plan={plan}
-              entry={entry} format={format} t={t} disabled={Boolean(pending)}
+              entry={entry} format={format} t={t} disabled={busy}
               onTeamChange={(team) => {
                 const latest = stateRef.current;
                 onChange({ ...latest, teams: { ...latest.teams, [boardId]: team } });
@@ -660,10 +786,11 @@ function DraftColumn({ title, count, action, description, children }: {
   </section>;
 }
 
-function DraftCard({ issue, team, item, skip, override, t, format, connected, disabled, mode, onMove, onOverride, onFocusIssue }: {
+function DraftCard({ issue, team, item, skip, override, t, format, connected, disabled, mode, onMove, onOverride, onFocusIssue, epicColor, readOnly }: {
   issue: JiraIssue; team: SprintDraftMember[]; item?: SprintDraftItem; skip?: SprintDraftPlan['skipped'][number];
   override?: SprintDraftOverride; t: Translate; format: FormatNumber; connected: boolean; disabled: boolean;
   mode: 'backlog' | 'sprint'; onMove(): void; onOverride(override: SprintDraftOverride): void; onFocusIssue?(): void;
+  epicColor?: string; readOnly?: boolean;
 }) {
   const { language } = usePreferences();
   const [openError, setOpenError] = useState('');
@@ -684,7 +811,8 @@ function DraftCard({ issue, team, item, skip, override, t, format, connected, di
   function patchOverride(patch: SprintDraftOverride) {
     onOverride({ ...override, ...patch });
   }
-  return <li className="sprint-draft-card" data-status={tone} data-recommended={item?.source === 'recommended' || undefined}>
+  return <li className="sprint-draft-card" data-status={tone} data-recommended={item?.source === 'recommended' || undefined}
+    style={epicColorStyle(epicColor ?? issue.epicColor)}>
     <header>
       <div className="sprint-card-key">
         {onFocusIssue ? <button type="button" className="text-button" onClick={onFocusIssue} title={t('Открыть на графе', 'Open on graph')}>{issue.key}</button>
@@ -695,10 +823,10 @@ function DraftCard({ issue, team, item, skip, override, t, format, connected, di
             void openIssue(issue).catch((cause: unknown) => setOpenError(localizeMessage(errorMessage(cause), language)));
           }}><ExternalLink size={13} /></button>}
       </div>
-      <button type="button" className="icon-button outline sprint-card-move" disabled={disabled || issue.isSubtask}
+      {!readOnly && <button type="button" className="icon-button outline sprint-card-move" disabled={disabled || issue.isSubtask}
         aria-label={moveLabel} title={issue.isSubtask
           ? t('Спринт подзадачи меняется вместе с родителем', 'Subtasks move with their parent issue') : moveLabel}
-        onClick={onMove}>{mode === 'backlog' ? <Plus size={17} /> : <X size={17} />}</button>
+        onClick={onMove}>{mode === 'backlog' ? <Plus size={17} /> : <X size={17} />}</button>}
     </header>
     <p className="sprint-card-title">{issue.summary}</p>
     <div className="sprint-card-tags">
@@ -706,7 +834,8 @@ function DraftCard({ issue, team, item, skip, override, t, format, connected, di
       {role && <span className="sprint-draft-chip">{role}</span>}
       {role !== 'QA' && workPoints !== undefined && <span className="sprint-draft-chip">{format(workPoints)} SP</span>}
       {qaPoints !== undefined && <span className="sprint-draft-chip">{format(qaPoints)} QA</span>}
-      {issue.epicKey && <span className="sprint-draft-chip" title={issue.epicSummary}>{issue.epicKey}</span>}
+      {(issue.epicKey || issue.isEpic) && <span className="sprint-draft-chip epic-color-label"
+        style={epicColorStyle(epicColor ?? issue.epicColor)} title={issue.epicSummary}>{issue.epicKey ?? issue.key}</span>}
       {issue.isSubtask && <span className="sprint-draft-chip" title={t(
         'Спринт подзадачи меняется вместе с родителем', 'Subtasks move with their parent issue',
       )}>{t('Подзадача', 'Subtask')}{issue.parentKey && ` · ${issue.parentKey}`}</span>}
@@ -725,7 +854,7 @@ function DraftCard({ issue, team, item, skip, override, t, format, connected, di
       `Оценка учтена в ${item.coveredBy}`, `Estimate included in ${item.coveredBy}`,
     )}</p>}
     {openError && <p className="sprint-card-risk" role="alert">{openError}</p>}
-    {!issue.isEpic && tone !== 'done' && <details className="sprint-draft-details sprint-card-edit">
+    {!readOnly && !issue.isEpic && tone !== 'done' && <details className="sprint-draft-details sprint-card-edit">
       <summary>{t('Роль, исполнитель и оценка', 'Role, assignee and estimates')} <ChevronDown size={13} /></summary>
       <fieldset disabled={disabled} className="sprint-card-fields">
         <label>{t('Роль задачи', 'Issue role')}
@@ -780,9 +909,9 @@ function NumberField({ label, value, placeholder, disabled, max = maximumValue, 
   </label>;
 }
 
-function DraftSettings({ data, entry, epicNames, format, t, disabled, onChange }: {
+function DraftSettings({ data, entry, epicNames, colors, format, t, disabled, onChange }: {
   data: JiraSprintPlan; entry: SprintDraftEntry; epicNames: Map<string, string>; format: FormatNumber; t: Translate;
-  disabled: boolean; onChange(patch: Partial<SprintDraftEntry>): void;
+  colors: ReadonlyMap<string, string>; disabled: boolean; onChange(patch: Partial<SprintDraftEntry>): void;
 }) {
   const [epic, setEpic] = useState('');
   const reserve = entry.reservePercent ?? defaultReserve;
@@ -825,7 +954,10 @@ function DraftSettings({ data, entry, epicNames, format, t, disabled, onChange }
       <summary>{t('Приоритеты эпиков', 'Epic priorities')} {entry.epicPriorities.length > 0 && <b>{entry.epicPriorities.length}</b>}<ChevronDown size={14} /></summary>
       <fieldset disabled={disabled}>
         {entry.epicPriorities.length > 0 && <ol className="sprint-epic-list">{entry.epicPriorities.map((key, index) => <li key={key}>
-          <span title={epicNames.get(key)}>{index + 1}. {key}{epicNames.get(key) && epicNames.get(key) !== key ? ` · ${epicNames.get(key)}` : ''}</span>
+          <span title={epicNames.get(key)}>
+            <i className="epic-color-swatch" style={epicColorStyle(colors.get(key))} aria-hidden="true" /> {index + 1}. {key}
+            {epicNames.get(key) && epicNames.get(key) !== key ? ` · ${epicNames.get(key)}` : ''}
+          </span>
           <button type="button" className="text-button" disabled={index === 0} onClick={() => moveEpic(index, -1)}
             aria-label={t(`Поднять ${key}`, `Move ${key} up`)}>↑</button>
           <button type="button" className="text-button" disabled={index === entry.epicPriorities.length - 1} onClick={() => moveEpic(index, 1)}

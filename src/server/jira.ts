@@ -31,9 +31,11 @@ import type {
   JiraSprintScope,
   JiraSprintVelocity,
   JiraSprintVelocitySample,
+  JiraStartSprintInput,
   JiraTeamMember,
 } from '../shared/contracts.js';
 import { isBlockingType } from '../shared/jira-links.js';
+import { epicColorHex } from '../shared/jira-epic-color.js';
 
 type JsonObject = Record<string, unknown>;
 type IssueRef = { key: string; fields?: JsonObject };
@@ -49,7 +51,11 @@ export const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
 const MAX_HIERARCHY_LEVELS = 8;
-const MAX_SPRINT_ISSUES = 500;
+const MAX_EPIC_COLOR_LOOKUPS = 24;
+const EPIC_COLOR_BATCH = 6;
+const EPIC_COLOR_TIMEOUT_MS = 4_000;
+export const MAX_SPRINT_ISSUES = 500;
+export const MAX_SPRINT_GOAL_LENGTH = 8_000;
 const MAX_BACKLOG_ISSUES = 400;
 const MAX_SPRINT_BLOCKERS = 200;
 const MAX_SPRINT_CHANGES = 100;
@@ -143,6 +149,7 @@ export class JiraClient {
   private readonly knownQaFields = new Set<string>();
   private readonly knownHierarchyFields = new Set<string>();
   private readonly knownEpicFields = new Set<string>();
+  private readonly knownEpicColorFields = new Set<string>();
   private readonly knownSprintFields = new Set<string>();
   private readonly knownSprints = new Map<string, JiraSprint>();
   private readonly adfFieldIds = new Set(['environment']);
@@ -153,7 +160,7 @@ export class JiraClient {
   private readonly issueAvatarSources = new Map<string, string>();
   private readonly projectAvatarSources = new Map<string, Map<string, string>>();
   private readonly pendingAvatars = new Map<string, Promise<string | null>>();
-  private applyingSprintMembership = false;
+  private changingSprint = false;
 
   constructor(
     private readonly site: URL,
@@ -217,13 +224,19 @@ export class JiraClient {
       ? fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id)
       : [...this.knownHierarchyFields];
     const epicFields = fields.filter(isEpicLinkField).flatMap(fieldOption).map((field) => field.id);
+    if (Array.isArray(fieldCatalog)) {
+      const colors = fields.filter(isEpicColorField).sort((left, right) => Number(isIssueColorField(right)) - Number(isIssueColorField(left)));
+      this.knownEpicColorFields.clear();
+      for (const { id } of colors.flatMap(fieldOption)) this.knownEpicColorFields.add(id);
+    }
     const sprintFields = Array.isArray(fieldCatalog)
       ? fields.filter(isSprintField).flatMap(fieldOption).map((field) => field.id)
       : [...this.knownSprintFields];
     for (const field of hierarchyFields) this.knownHierarchyFields.add(field);
     for (const field of epicFields) this.knownEpicFields.add(field);
     for (const field of sprintFields) this.knownSprintFields.add(field);
-    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...hierarchyFields, ...sprintFields])];
+    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...hierarchyFields,
+      ...this.knownEpicColorFields, ...sprintFields])];
     const configuredTypes = list(record(configuredLinkTypes).issueLinkTypes).flatMap(toLinkType);
     return { requestedFields, epicFields, hierarchyFields, storyFields, qaFields, storyPointsFields, qaPointsFields, configuredTypes };
   }
@@ -315,6 +328,7 @@ export class JiraClient {
     });
     const outsideHierarchy = [...hierarchy.values()].filter(({ key }) => !issues.has(key)).map((ref) => this.toIssue(ref, []));
     addIssueHierarchy(graphIssues, graphEdges, outsideHierarchy);
+    await this.addEpicColors(graphIssues, outsideHierarchy, hierarchy);
     return {
       issues: graphIssues,
       edges: graphEdges,
@@ -529,7 +543,7 @@ export class JiraClient {
     const warnings = new Set<string>();
     const [sprint, board] = await Promise.all([this.readBoardSprint(scope), this.boardConfiguration(scope.boardId, warnings)]);
     const settings = await this.graphSettings(query, warnings, board);
-    const fields = [...settings.requestedFields, 'sprint', 'closedSprints'];
+    const fields = [...settings.requestedFields, 'sprint', 'closedSprints', 'epic'];
     const [members, backlog] = await Promise.all([
       this.agileIssues(`/sprint/${scope.sprintId}/issue`, fields, MAX_SPRINT_ISSUES),
       this.agileIssues(`/board/${scope.boardId}/backlog`, fields, MAX_BACKLOG_ISSUES, backlogJql),
@@ -575,19 +589,13 @@ export class JiraClient {
       remove.some((key) => !expected.includes(key))) {
       throw new JiraError('Изменения не совпадают с исходным составом спринта или превышают допустимый размер.', 400);
     }
-    if (this.applyingSprintMembership) throw new JiraError('Другое изменение спринта ещё выполняется.', 409);
     const result: JiraSprintMembershipResult = { added: [], removed: [], failed: [] };
     if (!add.length && !remove.length) return result;
 
-    this.applyingSprintMembership = true;
-    try {
+    return this.withSprintChange(async () => {
       const sprint = await this.readBoardSprint(scope, 'active,future');
       requireWritableSprint(sprint);
-      const members = await this.agileIssues(`/sprint/${scope.sprintId}/issue`, ['summary'], MAX_SPRINT_ISSUES);
-      const actual = new Set(members.issues.map((issue) => issue.key));
-      if (!members.complete || expected.length !== actual.size || expected.some((key) => !actual.has(key))) {
-        throw new JiraError('Состав спринта изменился или загружен не полностью. Обнови план перед применением.', 409);
-      }
+      await this.verifySprintMembership(scope.sprintId, expected);
 
       for (const [operation, keys] of [['add', add], ['remove', remove]] as const) {
         for (let index = 0; index < keys.length; index += SPRINT_CHANGE_BATCH) {
@@ -595,10 +603,73 @@ export class JiraClient {
           await this.applySprintBatch(scope, operation, batch, result);
         }
       }
-    } finally {
-      this.applyingSprintMembership = false;
+      return result;
+    });
+  }
+
+  async startSprint(input: JiraStartSprintInput): Promise<JiraSprint> {
+    const scope = sprintScope(input);
+    const expected = membershipKeys(input.expectedIssueKeys, MAX_SPRINT_ISSUES);
+    const startDate = sprintDate(input.startDate);
+    const endDate = sprintDate(input.endDate);
+    const goal = input.goal;
+    if (Date.parse(startDate) >= Date.parse(endDate)) {
+      throw new JiraError('Дата окончания спринта должна быть позже даты начала.', 400);
     }
-    return result;
+    if (goal !== undefined && (typeof goal !== 'string' || goal.length > MAX_SPRINT_GOAL_LENGTH)) {
+      throw new JiraError(`Укажи цель спринта длиной до ${MAX_SPRINT_GOAL_LENGTH} символов.`, 400);
+    }
+    const path = `/sprint/${scope.sprintId}`;
+    const payload = { state: 'active', startDate, endDate, ...(goal !== undefined ? { goal } : {}) };
+
+    return this.withSprintChange(async () => {
+      requireFutureSprint(await this.readBoardSprint(scope));
+      await this.verifySprintMembership(scope.sprintId, expected);
+      requireFutureSprint(await this.readSprint(scope.sprintId));
+
+      let confirmed: JiraSprint | undefined;
+      try {
+        const updated = toSprint(await this.agileCall('POST', path, payload))[0]?.sprint;
+        if (updated?.id === scope.sprintId && sprintMatchesStart(updated, startDate, endDate, goal)) {
+          confirmed = updated;
+        }
+      } catch (error) {
+        if (error instanceof JiraError && error.status && error.status < 500 && error.status !== 408 && error.status !== 429) throw error;
+      }
+      confirmed ??= await this.readSprint(scope.sprintId).catch(() => undefined);
+      if (confirmed?.state !== 'active') {
+        throw new JiraError('Jira не подтвердила запуск спринта. Обнови его состояние перед повторной попыткой.', 409);
+      }
+      if (!sprintMatchesStart(confirmed, startDate, endDate, goal)) {
+        throw new JiraError('Спринт активен в Jira, но даты или цель отличаются. Обнови план.', 409);
+      }
+      this.knownSprints.set(confirmed.id, confirmed);
+      return confirmed;
+    });
+  }
+
+  private async withSprintChange<Result>(change: () => Promise<Result>): Promise<Result> {
+    if (this.changingSprint) throw new JiraError('Другое изменение спринта ещё выполняется.', 409);
+    this.changingSprint = true;
+    try {
+      return await change();
+    } finally {
+      this.changingSprint = false;
+    }
+  }
+
+  private async verifySprintMembership(sprintId: string, expected: string[]): Promise<void> {
+    const members = await this.agileIssues(`/sprint/${sprintId}/issue`, ['summary'], MAX_SPRINT_ISSUES);
+    const actual = new Set(members.issues.map((issue) => issue.key));
+    if (!members.complete || expected.length !== actual.size || expected.some((key) => !actual.has(key))) {
+      throw new JiraError('Состав спринта изменился или загружен не полностью. Обнови план перед изменением.', 409);
+    }
+  }
+
+  private async readSprint(sprintId: string): Promise<JiraSprint> {
+    const sprint = toSprint(await this.agileCall('GET', `/sprint/${sprintId}`))[0]?.sprint;
+    if (sprint?.id !== sprintId || !sprint.state) throw new JiraError('Jira не подтвердила состояние выбранного спринта.');
+    return sprint;
   }
 
   private async applySprintBatch(
@@ -609,9 +680,7 @@ export class JiraClient {
     const verified: string[] = [];
     try {
       const { sprintId, boardId } = scope;
-      const { sprint } = toSprint(await this.agileCall('GET', `/sprint/${sprintId}`))[0] ?? {};
-      if (!sprint || sprint.id !== sprintId) throw new JiraError('Jira не подтвердила состояние выбранного спринта.');
-      requireWritableSprint(sprint);
+      requireWritableSprint(await this.readSprint(sprintId));
       const eligible = adding
         ? await this.agileIssues(`/board/${boardId}/backlog`, ['summary'], batch.length, issueKeysJql(batch))
         : undefined;
@@ -853,9 +922,12 @@ export class JiraClient {
         issues.set(issue.key, issue);
       }
       startAt += page.issues.length;
-      total = integer(page.total) ?? startAt;
+      const reportedTotal = integer(page.total);
+      total = reportedTotal ?? startAt;
       nextPageToken = string(page.nextPageToken);
-      const more = cloud ? Boolean(nextPageToken) : startAt < total || page.isLast === false;
+      const more = Boolean(nextPageToken) || page.isLast === false || (reportedTotal !== undefined && startAt < total);
+      if (cloud && more && !nextPageToken) break;
+      if (!cloud && reportedTotal === undefined && typeof page.isLast !== 'boolean' && page.issues.length) break;
       if (!more) return { issues: [...issues.values()], complete: true, total };
       if (issues.size === limit || !page.issues.length) break;
       if (nextPageToken) {
@@ -866,9 +938,9 @@ export class JiraClient {
     return { issues: [...issues.values()], complete: false, total: Math.max(total, issues.size + 1) };
   }
 
-  private agileCall(method: string, path: string, body?: unknown, enhanced = false): Promise<unknown> {
+  private agileCall(method: string, path: string, body?: unknown, enhanced = false, signal?: AbortSignal): Promise<unknown> {
     const base = enhanced ? this.softwareBase : this.agileBase;
-    return request(new URL(`${base}${path}`), method, this.authorization, this.token, body);
+    return request(new URL(`${base}${path}`), method, this.authorization, this.token, body, signal);
   }
 
   private async getProjectSprints(project: string): Promise<{ values: JiraSprint[]; incomplete: boolean }> {
@@ -1228,7 +1300,8 @@ export class JiraClient {
   }
 
   private hierarchyLinks(fields: JsonObject): { parent?: IssueRef; epic?: IssueRef } {
-    const directEpic = [...this.knownEpicFields].flatMap((field) => toHierarchyRef(fields[field]))[0];
+    const directEpic = [...this.knownEpicFields].flatMap((field) => toHierarchyRef(fields[field]))[0]
+      ?? toHierarchyRef(fields.epic)[0];
     const parent = toHierarchyRef(fields.parent)[0] ??
       [...this.knownHierarchyFields].filter((field) => !this.knownEpicFields.has(field))
         .flatMap((field) => toHierarchyRef(fields[field]))[0] ?? directEpic;
@@ -1240,7 +1313,7 @@ export class JiraClient {
     issues: ReadonlyMap<string, IssueRef>, hydrated: ReadonlySet<string>, hierarchyFields: string[], warnings: Set<string>,
   ): Promise<Map<string, IssueRef>> {
     const warning = 'Названия части родительских задач недоступны.';
-    const fields = ['summary', 'issuetype', 'parent', ...hierarchyFields];
+    const fields = ['summary', 'issuetype', 'parent', ...hierarchyFields, ...this.knownEpicColorFields];
     const refs = new Map(issues);
     const searched = new Set(hydrated);
     const scanned = new Set<string>();
@@ -1258,7 +1331,9 @@ export class JiraClient {
           if (!searched.has(ref.key)) {
             const merged = { key: ref.key, fields: { ...ref.fields, ...current?.fields } };
             refs.set(ref.key, merged);
-            if (!string(merged.fields.summary) || (!epic && !isEpicType(merged.fields.issuetype))) missing.add(ref.key);
+            const knownEpic = ref.key === epic?.key || isEpicType(merged.fields.issuetype);
+            if (!string(merged.fields.summary) || (!epic && !knownEpic) ||
+                (knownEpic && this.knownEpicColorFields.size > 0 && !this.issueEpicColor(merged.fields))) missing.add(ref.key);
           }
           next.add(ref.key);
         }
@@ -1276,6 +1351,44 @@ export class JiraClient {
       frontier = [...next].filter((key) => !scanned.has(key));
     }
     return refs;
+  }
+
+  private issueEpicColor(fields: JsonObject): string | undefined {
+    for (const field of ['issueColor', ...this.knownEpicColorFields, 'color']) {
+      const color = readEpicColor(fields[field]);
+      if (color) return color;
+    }
+  }
+
+  private async addEpicColors(issues: JiraIssue[], outsideHierarchy: JiraIssue[], refs: ReadonlyMap<string, IssueRef>): Promise<void> {
+    const colors = new Map<string, string>();
+    for (const issue of [...issues, ...outsideHierarchy]) {
+      const key = issue.epicKey;
+      if (!key) continue;
+      const color = this.issueEpicColor(refs.get(key)?.fields ?? {}) ?? issue.epicColor;
+      if (color && (issue.key === key || !colors.has(key))) colors.set(key, color);
+    }
+
+    const missing = [...new Set(issues.flatMap(({ epicKey }) => epicKey && !colors.has(epicKey) ? [epicKey] : []))]
+      .slice(0, MAX_EPIC_COLOR_LOOKUPS);
+    if (missing.length) {
+      const signal = AbortSignal.timeout(EPIC_COLOR_TIMEOUT_MS);
+      for (let index = 0; index < missing.length && !signal.aborted; index += EPIC_COLOR_BATCH) {
+        await Promise.all(missing.slice(index, index + EPIC_COLOR_BATCH).map(async (key) => {
+          try {
+            const epic = record(await this.agileCall('GET', `/epic/${encodeURIComponent(key)}`, undefined, false, signal));
+            const color = readEpicColor(epic.color);
+            if (string(epic.key)?.toUpperCase() === key.toUpperCase() && color) colors.set(key, color);
+          } catch {
+            // Epic metadata is optional, including when Jira Software or epic access is unavailable.
+          }
+        }));
+      }
+    }
+    for (const issue of issues) {
+      const color = issue.epicKey && colors.get(issue.epicKey);
+      if (color) issue.epicColor = color;
+    }
   }
 
   private async metadata(path: string, cloudKey: string): Promise<unknown[]> {
@@ -1327,7 +1440,8 @@ export class JiraClient {
     try {
       const storyFields = [...this.knownStoryFields];
       const qaFields = [...this.knownQaFields];
-      const fields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...this.knownHierarchyFields, ...this.knownSprintFields])];
+      const fields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...this.knownHierarchyFields,
+        ...this.knownEpicColorFields, ...this.knownSprintFields])];
       return this.toIssue(await this.readIssue(key, fields), storyFields, false, false, qaFields);
     } catch {
       return fallback;
@@ -1349,6 +1463,10 @@ export class JiraClient {
     }
     const epic = isEpicType(issueType);
     const { parent, epic: directEpic } = this.hierarchyLinks(fields);
+    const embeddedEpic = record(fields.epic);
+    const epicColor = epic ? this.issueEpicColor(fields) : directEpic && (
+      this.issueEpicColor(directEpic.fields ?? {}) ?? (embeddedEpic.key === directEpic.key ? readEpicColor(embeddedEpic.color) : undefined)
+    );
     const sprintValues = [...new Set([...this.knownSprintFields, 'sprint', 'closedSprints'])].flatMap((field) => {
       const value = fields[field];
       return (Array.isArray(value) ? value : [value]).flatMap(toSprint);
@@ -1383,6 +1501,7 @@ export class JiraClient {
       ...(string(parent?.fields?.summary) ? { parentSummary: string(parent?.fields?.summary) } : {}),
       epicKey: epic ? issue.key : directEpic?.key,
       ...(string(directEpic?.fields?.summary) ? { epicSummary: string(directEpic?.fields?.summary) } : {}),
+      ...(epicColor ? { epicColor } : {}),
       isEpic: epic,
       isSubtask: issueType.subtask === true || issueType.hierarchyLevel === -1,
       priority: string(record(fields.priority).name),
@@ -1453,6 +1572,25 @@ function requireWritableSprint(sprint: JiraSprint): void {
   if (sprint.state !== 'active' && sprint.state !== 'future') {
     throw new JiraError('Состав закрытого спринта изменить нельзя.', 409);
   }
+}
+
+function requireFutureSprint(sprint: JiraSprint): void {
+  if (sprint.state !== 'future') throw new JiraError('Запустить можно только будущий спринт.', 409);
+}
+
+function sprintDate(value: string): string {
+  const day = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)$/i.exec(value)?.[1];
+  const timestamp = Date.parse(value);
+  const midnight = Date.parse(`${day}T00:00:00Z`);
+  if (!day || !Number.isFinite(timestamp) || !Number.isFinite(midnight) || new Date(midnight).toISOString().slice(0, 10) !== day) {
+    throw new JiraError('Укажи дату и время спринта с часовым поясом.', 400);
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function sprintMatchesStart(sprint: JiraSprint, startDate: string, endDate: string, goal: string | undefined): boolean {
+  return sprint.state === 'active' && Date.parse(sprint.startDate ?? '') === Date.parse(startDate) &&
+    Date.parse(sprint.endDate ?? '') === Date.parse(endDate) && (goal === undefined || (sprint.goal ?? '').trim() === goal.trim());
 }
 
 function jiraFailure(error: unknown, fallback: string): string {
@@ -1664,6 +1802,24 @@ function isEpicLinkField(field: JsonObject): boolean {
   const name = string(field.name)?.trim().toLowerCase();
   const schema = record(field.schema);
   return schema.custom === 'com.pyxis.greenhopper.jira:gh-epic-link' || name === 'epic link';
+}
+
+function isEpicColorField(field: JsonObject): boolean {
+  const schema = string(record(field.schema).custom) ?? '';
+  return schema.endsWith(':gh-epic-color') || isIssueColorField(field) || [field.untranslatedName, field.name]
+    .some((name) => ['epic color', 'epic colour', 'цвет эпика'].includes(string(name)?.trim().toLowerCase() ?? ''));
+}
+
+function isIssueColorField(field: JsonObject): boolean {
+  const schema = string(record(field.schema).custom) ?? '';
+  return schema.endsWith(':gh-issue-color') || [field.untranslatedName, field.name]
+    .some((name) => ['issue color', 'issue colour', 'цвет задачи'].includes(string(name)?.trim().toLowerCase() ?? ''));
+}
+
+function readEpicColor(value: unknown): string | undefined {
+  const color = record(value);
+  return epicColorHex(value) ?? epicColorHex(color.hex) ?? epicColorHex(color.hexCode) ??
+    epicColorHex(color.value) ?? epicColorHex(color.key) ?? epicColorHex(color.name);
 }
 
 function isSprintField(field: JsonObject): boolean {
@@ -2019,7 +2175,8 @@ function hasAvatarSignature(image: Buffer, mime: string): boolean {
   }
 }
 
-async function request(url: URL, method: string, authorization?: string, token?: string, body?: unknown): Promise<unknown> {
+async function request(url: URL, method: string, authorization?: string, token?: string, body?: unknown,
+  signal = AbortSignal.timeout(TIMEOUT_MS)): Promise<unknown> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (authorization) headers.Authorization = authorization;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -2027,7 +2184,7 @@ async function request(url: URL, method: string, authorization?: string, token?:
   let text: string;
   try {
     response = await fetch(url, {
-      method, headers, redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS),
+      method, headers, redirect: 'error', signal,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     text = await response.text();

@@ -1,5 +1,7 @@
 import type { ApiRequest, ApiResponse, JiraCredentials, JiraEdition, RestoredJiraConnection } from '../shared/contracts.js';
-import { connectJira, JiraError, MAX_AVATAR_BATCH, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, type JiraClient } from './jira.js';
+import {
+  connectJira, JiraError, MAX_AVATAR_BATCH, MAX_GRAPH_ISSUES, MAX_NOTE_LENGTH, MAX_SPRINT_GOAL_LENGTH, MAX_SPRINT_ISSUES, type JiraClient,
+} from './jira.js';
 
 type ValidateSite = (url: URL, edition: JiraEdition) => void;
 
@@ -179,6 +181,13 @@ function parseRequest(value: unknown): ApiRequest {
         expectedIssueKeys, addIssueKeys, removeIssueKeys,
       } };
     }
+    case 'startSprint':
+      return { method, input: {
+        boardId: agileId(input.boardId, 'board ID'), sprintId: agileId(input.sprintId, 'sprint ID'),
+        expectedIssueKeys: issueKeys(input.expectedIssueKeys, 'expected sprint membership', MAX_SPRINT_ISSUES),
+        startDate: text(input.startDate, 'Start date', 64), endDate: text(input.endDate, 'End date', 64),
+        goal: optionalText(input.goal, 'Sprint goal', MAX_SPRINT_GOAL_LENGTH),
+      } };
     case 'getCreateOptions':
       return { method, input: {
         projectKey: identifier(input.projectKey, 'Project'),
@@ -279,6 +288,7 @@ async function execute(client: JiraClient, request: JiraOperation): Promise<unkn
     case 'loadSprintPlan': return client.loadSprintPlan(request.input);
     case 'loadSprintVelocity': return client.loadSprintVelocity(request.input);
     case 'applySprintMembership': return client.applySprintMembership(request.input);
+    case 'startSprint': return client.startSprint(request.input);
     case 'getCreateOptions': return client.getCreateOptions(request.input.projectKey, request.input.issueTypeId);
     case 'createIssue': return client.createIssue(request.input);
     case 'updateIssue': return client.updateIssue(request.input);

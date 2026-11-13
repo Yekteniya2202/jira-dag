@@ -1,0 +1,38 @@
+.epic-color-label[style*='--jira-epic-color'] {
+  background: var(--jira-epic-color);
+  border-color: color-mix(in srgb, var(--jira-epic-color) 80%, var(--heading));
+  color: var(--jira-epic-ink);
+}
+
+button.epic-color-label[style*='--jira-epic-color']:hover {
+  background: var(--jira-epic-color);
+  text-decoration: underline;
+}
+
+.epic-color-swatch[style*='--jira-epic-color'] {
+  display: inline-block;
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 1px solid color-mix(in srgb, var(--jira-epic-color) 75%, var(--heading));
+  border-radius: 2px;
+  background: var(--jira-epic-color);
+}
+
+.facet-epic-label .epic-color-swatch { margin-inline-end: 5px; vertical-align: baseline; }
+.inspector-epic-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  margin-top: 8px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface-deep);
+  color: var(--muted);
+  font-size: 11px;
+  text-align: start;
+}
+.inspector-epic-label svg { flex: none; }
+.inspector-epic-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
+import type { JiraStartSprintInput } from '../shared/contracts.js';
 import { JiraClient, JiraError } from './jira.js';
+import { createApiSession } from './session.js';
 
 const cloud = 'cloud';
 const dc = 'data-center';
@@ -37,6 +39,113 @@ const client = (edition: 'cloud' | 'data-center' = cloud) => {
 function mockFetch(t: TestContext, handler: (url: URL, init: RequestInit) => Response) {
   t.mock.method(globalThis, 'fetch', async (url: URL, init: RequestInit) => handler(url, init));
 }
+
+const startInput: JiraStartSprintInput = {
+  boardId: '1', sprintId: '7', expectedIssueKeys: ['APP-1'],
+  startDate: '2026-11-16T09:00:00+04:00', endDate: '2026-11-30T18:00:00+04:00',
+};
+const normalizedDates = { startDate: '2026-11-16T05:00:00.000Z', endDate: '2026-11-30T14:00:00.000Z' };
+
+test('Cloud starts a future sprint through the RPC and preserves fields outside the partial update', async (t) => {
+  const requests: string[] = [];
+  mockFetch(t, (url, init) => {
+    requests.push(`${init.method} ${url.pathname}`);
+    switch (url.pathname) {
+      case '/rest/api/3/myself': return json({ displayName: 'Tester', accountId: 'abc' });
+      case '/rest/agile/1.0/board/1/sprint': return collection([future]);
+      case '/rest/software/1.0/sprint/7/issue':
+        return sprintMembership([rawIssue('APP-1')]);
+      case '/rest/agile/1.0/sprint/7':
+        if (init.method === 'GET') return json(future);
+        assert.equal(init.method, 'POST');
+        assert.deepEqual(JSON.parse(String(init.body)), { state: 'active', ...normalizedDates });
+        return json({ ...future, ...normalizedDates, state: 'active' });
+      default: assert.fail(url.href);
+    }
+  });
+  const session = createApiSession(() => undefined);
+  const connection = await session.invoke({ method: 'connect', input: {
+    edition: 'cloud', url: 'https://jira.example.test', username: 'Tester', email: 'user@example.test', token: 'fixture',
+  } });
+  assert.equal(connection.ok, true);
+  assert.deepEqual(await session.invoke({ method: 'startSprint', input: startInput }), {
+    ok: true, data: { id: '7', name: 'Next', state: 'active', goal: future.goal, originBoardId: '1', ...normalizedDates },
+  });
+  assert.deepEqual(requests, [
+    'GET /rest/api/3/myself', 'GET /rest/agile/1.0/board/1/sprint', 'GET /rest/software/1.0/sprint/7/issue',
+    'GET /rest/agile/1.0/sprint/7', 'POST /rest/agile/1.0/sprint/7',
+  ]);
+});
+
+test('Data Center confirms an ambiguous sprint start once, with explicit goal clearing and offset paging', async (t) => {
+  let writes = 0;
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/rest/agile/1.0/board/1/sprint': return collection([future]);
+      case '/rest/agile/1.0/sprint/7/issue':
+        return url.searchParams.get('startAt') === '0'
+          ? json({ startAt: 0, total: 2, issues: [rawIssue('APP-2')] })
+          : json({ startAt: 1, total: 2, issues: [rawIssue('APP-1')] });
+      case '/rest/agile/1.0/sprint/7':
+        if (init.method === 'GET') {
+          return json(writes ? { ...future, state: 'active', goal: '', startDate: startInput.startDate, endDate: startInput.endDate } : future);
+        }
+        assert.equal(init.method, 'POST');
+        writes += 1;
+        assert.deepEqual(JSON.parse(String(init.body)), { state: 'active', ...normalizedDates, goal: '' });
+        return json({ message: 'Gateway timeout' }, 504);
+      default: assert.fail(url.href);
+    }
+  });
+  const result = await client(dc).startSprint({ ...startInput, expectedIssueKeys: ['APP-1', 'APP-2'], goal: '' });
+  assert.equal(result.state, 'active');
+  assert.equal(result.goal, undefined);
+  assert.equal(writes, 1);
+});
+
+test('sprint start blocks malformed dates, stale or incomplete membership, and a concurrent state change', async (t) => {
+  let stage = 'validate';
+  mockFetch(t, (url, init) => {
+    assert.notEqual(stage, 'validate', 'Local validation must not read Jira');
+    assert.equal(init.method, 'GET');
+    switch (url.pathname) {
+      case '/rest/agile/1.0/board/1/sprint': return collection([future]);
+      case '/rest/software/1.0/sprint/7/issue':
+        if (stage === 'incomplete') return json({ issues: [rawIssue('APP-1')], isLast: false });
+        return sprintMembership([rawIssue(stage === 'stale' ? 'APP-9' : 'APP-1')]);
+      case '/rest/agile/1.0/sprint/7': return json({ ...future, state: 'active' });
+      default: assert.fail(url.href);
+    }
+  });
+  const jira = client();
+  const status = (code: number) => (error: unknown) => error instanceof JiraError && error.status === code;
+  for (const startDate of ['2026-11-16T09:00', '2026-02-29T09:00:00Z', startInput.endDate]) {
+    await assert.rejects(() => jira.startSprint({ ...startInput, startDate }), status(400));
+  }
+  for (const scenario of ['stale', 'incomplete', 'state change']) {
+    stage = scenario;
+    await assert.rejects(() => jira.startSprint(startInput), status(409));
+  }
+});
+
+test('sprint start does not retry a write when Jira cannot confirm that the sprint is active', async (t) => {
+  let writes = 0;
+  let confirmations = 0;
+  mockFetch(t, (url, init) => {
+    switch (url.pathname) {
+      case '/rest/agile/1.0/board/1/sprint': return collection([future]);
+      case '/rest/software/1.0/sprint/7/issue': return sprintMembership([rawIssue('APP-1')]);
+      case '/rest/agile/1.0/sprint/7':
+        if (init.method === 'POST') { writes += 1; return noContent(); }
+        if (writes) confirmations += 1;
+        return json(future);
+      default: assert.fail(url.href);
+    }
+  });
+  await assert.rejects(() => client().startSprint(startInput), /Jira не подтвердила запуск/);
+  assert.equal(writes, 1);
+  assert.equal(confirmations, 1);
+});
 
 test('Cloud lists only Scrum boards, all sprint states and a token-paginated plan with independent QA points', async (t) => {
   mockFetch(t, (url, init) => {

@@ -11,6 +11,7 @@ import { makeDemoGraph } from './demo';
 import { ConnectionDialog, CreateDialog, Dialog, LinkDialog } from './dialogs';
 import { appendJqlClauses, emptyGraphFilters, filterGraph, graphFacets, highlightedIssueKeys, jiraFacetClause, scopeJql, selectedSprintIds, type GraphFilters } from './filter-model';
 import { GraphFilterPanel, GraphProjectFilters } from './filters';
+import { epicColorStyle } from './epic-color';
 import { GraphCanvas, type CardFields } from './graph-canvas';
 import { exportGraph, type GraphExportFormat } from './graph-export';
 import { cyclicBlockingEdges, type GroupMode } from './graph-layout';
@@ -950,6 +951,7 @@ function GraphWorkspace({
         {(selected || edge) && !rightHidden && <PanelSplitter side="right" width={rightWidth} onWidthChange={setRightWidth} />}
         {selected && <IssueInspector key={selected.key} issue={selected} graph={graph} connected={Boolean(connection)} active={active && !rightHidden}
           avatarSrc={avatars[selected.key]}
+          onOpenEpic={onOpenEpic}
           hidden={rightHidden} busy={busy} noteFocus={noteFocus?.key === selected.key ? noteFocus.mode : undefined} onNotes={updateNotes}
           onClose={() => selectIssue()} onSelect={selectIssue} onAdd={() => addTask(selected)} onEdit={() => editIssue(selected)}
           onDescription={() => setModal({ kind: 'description', issue: selected })}
@@ -1020,11 +1022,12 @@ function GraphWorkspace({
   );
 }
 
-function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarSrc, noteFocus, onNotes, onClose, onSelect, onAdd, onEdit, onDescription, onOpen, onHide }: {
+function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarSrc, noteFocus, onNotes, onClose, onSelect, onAdd, onEdit, onDescription, onOpen, onHide, onOpenEpic }: {
   issue: JiraIssue; graph: JiraGraph; connected: boolean; active: boolean; hidden: boolean; busy: boolean;
   avatarSrc?: string;
   noteFocus?: NoteFocus; onNotes(key: string, notes: readonly JiraGraphNote[]): void;
   onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onDescription(): void; onOpen(): void; onHide(): void;
+  onOpenEpic(key: string, summary?: string): void;
 }) {
   const { t } = usePreferences();
   const { assignee, key } = issue;
@@ -1040,6 +1043,9 @@ function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarS
   const avatarUrl = avatarSrc ?? (avatar?.name === assignee ? avatar?.url : undefined);
   const blockers = blockersFor(graph, issue.key);
   const linked = graph.edges.filter(({ source, target }) => source === issue.key || target === issue.key);
+  const epicKey = issue.isEpic ? issue.key : issue.epicKey;
+  const epic = epicKey && graph.issues.find(({ key }) => key === epicKey);
+  const epicTitle = issue.epicSummary ?? (epic ? epic.summary : undefined);
   return <aside className="inspector" hidden={hidden} aria-label={t('Сведения о задаче', 'Issue details')}>
     <div className="inspector-heading"><h2><Layers3 size={16} /> {t('Задача', 'Issue')}</h2>
       <button className="icon-button" aria-label={t('Закрыть сведения о задаче', 'Close issue details')} onClick={onClose}><X size={17} /></button>
@@ -1053,6 +1059,11 @@ function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarS
         {issue.qaPoints !== undefined && <span className="points qa-points"
           title={t('Оценка тестирования', 'QA estimate')}>{issue.qaPoints} QA</span>}
       </div>
+      {epicKey && <button type="button" className="inspector-epic-label epic-color-label"
+        style={epicColorStyle(issue.epicColor ?? (epic ? epic.epicColor : undefined))}
+        title={epicTitle ? `${epicKey} · ${epicTitle}` : epicKey}
+        aria-label={t(`Открыть граф эпика ${epicKey}`, `Open epic graph ${epicKey}`)}
+        onClick={() => onOpenEpic(epicKey, epicTitle)}><Layers3 size={13} aria-hidden="true" /><span>{epicTitle ?? epicKey}</span></button>}
       {assignee && <div className="inspector-assignee" aria-label={t(`Исполнитель: ${assignee}`, `Assignee: ${assignee}`)}>
         {avatarUrl ? <img src={avatarUrl} alt="" /> : <span aria-hidden="true">{assigneeInitials(assignee)}</span>}
         <div><small>{t('Исполнитель', 'Assignee')}</small>{assignee}</div>

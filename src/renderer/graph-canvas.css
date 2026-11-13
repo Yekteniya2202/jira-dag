@@ -33,14 +33,20 @@
 }
 .issue-card-epic {
   display: flex; align-items: center; gap: 4px; align-self: flex-start; min-width: 0; max-width: 100%;
-  padding: 2px 5px; border: 1px solid var(--accent-border); border-radius: 4px; background: var(--accent-surface);
-  color: var(--accent-ink); cursor: pointer; font-size: 10px; line-height: 1.2;
+  padding: 2px 5px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--surface-deep);
+  color: var(--muted); cursor: pointer; font-size: 10px; line-height: 1.2;
 }
 .issue-card-epic:hover { background: var(--surface-hover); }
 .issue-card-epic svg { flex: none; }
 .issue-card-epic span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .issue-card-assignee .person-avatar { width: 16px; height: 16px; font-size: 8px; }
 .graph-zone-title[title] { pointer-events: auto; }
+.graph-zone.epic[style*='--jira-epic-color'] {
+  background: color-mix(in srgb, var(--jira-epic-color) 19%, var(--surface-deep));
+  border-color: var(--jira-epic-color);
+}
+.graph-zone.epic.is-selected[style*='--jira-epic-color'] { outline: 1px solid var(--accent); outline-offset: 2px; }
+.issue-card[style*='--jira-epic-color'] { border-inline-start: 3px solid var(--jira-epic-color); }
 
 .canvas .react-flow__edgelabel-renderer { z-index: 1100; }
 .edge-label {

@@ -129,8 +129,11 @@ test('an in-flight login cannot reconnect a disconnected session', async t => {
   assert.deepEqual(await session.invoke(connectionRequest), { ok: true, data: null });
 });
 
-test('web sprint RPC applies only an explicit reviewed diff and refreshes the Jira membership', async (t) => {
-  const sprint = { id: 7, name: 'Sprint 7', state: 'future', originBoardId: 2 };
+test('web sprint RPC applies a reviewed diff and starts the sprint only after a separate validated request', async (t) => {
+  const sprint = {
+    id: 7, name: 'Sprint 7', state: 'future', originBoardId: 2, goal: 'Preserve scope',
+    startDate: undefined as string | undefined, endDate: undefined as string | undefined,
+  };
   const membership = new Set(['APP-1']);
   const issue = (key: string) => ({ key, fields: {
     summary: key, issuetype: { id: '1', name: 'Task', subtask: false },
@@ -138,6 +141,7 @@ test('web sprint RPC applies only an explicit reviewed diff and refreshes the Ji
     customfield_10100: 3, customfield_10200: 2, sprint: membership.has(key) ? sprint : null,
   } });
   const writes: Array<{ path: string; keys: string[] }> = [];
+  const starts: unknown[] = [];
   const jira = await listen(t, createServer(async (request, response) => {
     assert.equal(request.headers.authorization, 'Bearer fixture');
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
@@ -147,7 +151,17 @@ test('web sprint RPC applies only an explicit reviewed diff and refreshes the Ji
     if (request.method === 'POST') {
       let body = '';
       for await (const chunk of request) body += chunk;
-      const { issues: keys } = JSON.parse(body) as { issues: string[] };
+      const payload = JSON.parse(body) as { issues: string[]; state: string; startDate: string; endDate: string; goal?: string };
+      if (path === '/rest/agile/1.0/sprint/7') {
+        starts.push(payload);
+        sprint.state = payload.state;
+        sprint.startDate = payload.startDate;
+        sprint.endDate = payload.endDate;
+        if (payload.goal !== undefined) sprint.goal = payload.goal;
+        response.end(JSON.stringify(sprint));
+        return;
+      }
+      const keys = payload.issues;
       writes.push({ path, keys });
       assert.ok(path === '/rest/agile/1.0/sprint/7/issue' || path === '/rest/agile/1.0/backlog/issue');
       for (const key of keys) {
@@ -206,6 +220,27 @@ test('web sprint RPC applies only an explicit reviewed diff and refreshes the Ji
   assert.deepEqual(fresh.data.sprintIssueKeys, ['APP-2']);
   assert.deepEqual(fresh.data.backlogIssueKeys, ['APP-1']);
   assert.equal((await rpc(web, apply, cookie)).status, 409);
+  assert.equal(writes.length, 2);
+
+  const start: ApiRequest = { method: 'startSprint', input: {
+    ...scope, expectedIssueKeys: fresh.data.sprintIssueKeys,
+    startDate: '2026-11-16T09:00:00+04:00', endDate: '2026-11-30T18:00:00+04:00', goal: '',
+  } };
+  assert.equal((await rpc(web, start)).status, 401);
+  assert.equal((await rpc(web, start, cookie, 'https://other.example')).status, 403);
+  assert.equal((await rpc(web, { ...start, input: { ...start.input, expectedIssueKeys: baseline.data.sprintIssueKeys } }, cookie)).status, 409);
+  assert.equal((await rpc(web, { ...start, input: { ...start.input, endDate: start.input.startDate } }, cookie)).status, 400);
+  assert.deepEqual(starts, []);
+
+  const started = await rpc(web, start, cookie);
+  assert.equal(started.status, 200);
+  const dates = { startDate: '2026-11-16T05:00:00.000Z', endDate: '2026-11-30T14:00:00.000Z' };
+  assert.deepEqual(starts, [{ state: 'active', ...dates, goal: '' }]);
+  assert.deepEqual(await started.json(), { ok: true, data: {
+    id: '7', name: 'Sprint 7', state: 'active', originBoardId: '2', ...dates,
+  } });
+  assert.equal((await rpc(web, start, cookie)).status, 409);
+  assert.equal(starts.length, 1);
   assert.equal(writes.length, 2);
 });
 

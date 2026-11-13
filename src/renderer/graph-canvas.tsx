@@ -9,6 +9,7 @@ import {
   FolderKanban, GitBranch, Layers3, Link2, ListTree, MessageSquarePlus, Package, Plus, StickyNote, UserRound,
 } from 'lucide-react';
 import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
+import { epicColors, epicColorStyle } from './epic-color';
 import { routeEdges, type RoutedEdge, type RouteObstacle } from './edge-routing';
 import { downstreamPoints, fitMovedZones, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
 import { blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
@@ -35,7 +36,7 @@ type Card = Node<{
   fields: CardFields;
   noteCount?: number;
   avatar?: string;
-  epic?: { key: string; summary?: string };
+  epic?: { key: string; summary?: string; color?: string };
   onOpen?: (issue: JiraIssue) => void;
   onOpenEpic?: (key: string, summary?: string) => void;
   onNote?: (key: string, focusInput: boolean) => void;
@@ -44,6 +45,7 @@ type Card = Node<{
 type Zone = Node<{
   zone: GraphZone;
   epic?: JiraIssue;
+  epicColor?: string;
   onSelect?: (key: string) => void;
   onOpen?: (issue: JiraIssue) => void;
   onOpenEpic?: (key: string, summary?: string) => void;
@@ -104,7 +106,7 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
   ].filter(Boolean).join(' · ');
   return (
     <div className={`issue-card tone-${statusTone(issue)} ${selected ? 'is-selected' : ''} ${muted ? 'is-muted' : ''} ${issue.external ? 'is-external' : ''}`}
-      data-filter-match={highlighted} data-analysis-match={analysisMatch}>
+      data-filter-match={highlighted} data-analysis-match={analysisMatch} style={issue.isEpic ? epicColorStyle(issue.epicColor) : undefined}>
       <Handle type="target" position={across ? Position.Left : Position.Top} aria-label={t('Входящая зависимость', 'Incoming dependency')} />
       <div className="issue-card-key">
         <CheckSquare2 size={14} /><span>{issue.key}</span>
@@ -119,7 +121,7 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
         {onCreateRelated && <RelatedIssueButton issue={issue} onCreate={onCreateRelated} />}
       </div>
       <div className="issue-card-title" title={issue.summary}>{issue.summary}</div>
-      {epic && onOpenEpic && <button type="button" className="issue-card-epic nodrag nopan"
+      {epic && onOpenEpic && <button type="button" className="issue-card-epic epic-color-label nodrag nopan" style={epicColorStyle(epic.color)}
         aria-label={t(`Открыть граф эпика ${epic.key}`, `Open epic graph ${epic.key}`)}
         title={epic.summary ? `${epic.key} · ${epic.summary}` : epic.key}
         onClick={(event) => { event.stopPropagation(); onOpenEpic(epic.key, epic.summary); }}>
@@ -152,13 +154,16 @@ const groupIcons = {
   level: ListTree, 'open-level': ListTree, 'sprint-unscheduled': CalendarX2, 'sprint-external': Link2,
 };
 
-function GroupZone({ data: { zone, epic, onSelect, onOpen, onOpenEpic, onCreateRelated, selected, analysisMatch } }: NodeProps<Zone>) {
+function GroupZone({ data: { zone, epic, epicColor, onSelect, onOpen, onOpenEpic, onCreateRelated, selected, analysisMatch } }: NodeProps<Zone>) {
   const { t } = usePreferences();
   const GroupIcon = zone.appearance ? groupIcons[zone.appearance.variant] : zone.kind === 'nested' ? ClipboardList : Layers3;
-  const title = <><GroupIcon size={15} aria-hidden="true" /><span>{zone.title}</span></>;
+  const colorStyle = epicColorStyle(epicColor);
+  const title = <>{colorStyle ? <span className="epic-color-swatch" style={colorStyle} aria-hidden="true" />
+    : <GroupIcon size={15} aria-hidden="true" />}<span>{zone.title}</span></>;
   const key = zone.epicKey;
   const openEpic = key && onOpenEpic ? () => onOpenEpic(key, epic?.summary ?? (zone.title.slice(key.length + 3) || undefined)) : undefined;
   return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`} data-export-zone={zone.id}
+    style={colorStyle}
     data-export-members={JSON.stringify(zone.members)}
     data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color} data-analysis-match={analysisMatch}>
     <div className="graph-zone-heading">
@@ -322,6 +327,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
   const highlightedEdges = useMemo(() => analysisKeys && new Set(blockingEdges(graph)
     .filter(({ source, target }) => analysisKeys.has(source) && analysisKeys.has(target)).map(({ id }) => id)), [analysisKeys, graph]);
   const basisIssues = useMemo(() => new Map(basis.issues.map((issue) => [issue.key, issue])), [basis.issues]);
+  const colorsByEpic = useMemo(() => epicColors(basis.issues), [basis.issues]);
   const lanes = useMemo(() => {
     const groups = new Map<string, string[]>();
     const offsets = new Map<string, number>();
@@ -395,7 +401,8 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     const position = cardPositions.get(issue.key);
     if (!position) return [];
     const epic = showEpicBadges && issue.epicKey && issue.epicKey !== issue.key
-      ? { key: issue.epicKey, summary: issue.epicSummary ?? basisIssues.get(issue.epicKey)?.summary } : undefined;
+      ? { key: issue.epicKey, summary: issue.epicSummary ?? basisIssues.get(issue.epicKey)?.summary,
+        color: colorsByEpic.get(issue.epicKey) } : undefined;
     return [{
       id: issue.key, type: 'issue',
       position,
@@ -416,6 +423,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     id: zone.id, type: 'zone', position: { x: zone.x, y: zone.y },
     data: {
       zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
+      epicColor: zone.epicKey ? colorsByEpic.get(zone.epicKey) : undefined,
       selected: Boolean(zone.epicKey && zone.epicKey === selectedKey), onSelect: onSelectIssue,
       onOpenEpic,
       analysisMatch: zone.epicKey ? analysisKeys?.has(zone.epicKey) : undefined,
