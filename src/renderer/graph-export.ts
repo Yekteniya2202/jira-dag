@@ -7,12 +7,6 @@ function intersects(left: DOMRect, right: DOMRect): boolean {
   return left.left < right.right && left.right > right.left && left.top < right.bottom && left.bottom > right.top;
 }
 
-function covers(outer: DOMRect, inner: DOMRect): boolean {
-  const tolerance = 1;
-  return outer.left <= inner.left + tolerance && outer.top <= inner.top + tolerance &&
-    outer.right >= inner.right - tolerance && outer.bottom >= inner.bottom - tolerance;
-}
-
 function caption(value: string): string {
   return `"${value.replace(/\s+/g, ' ').trim().replace(/["#<>&|[\]`]/g, (character) => `#${character.charCodeAt(0)};`)}"`;
 }
@@ -22,7 +16,9 @@ function mermaid(canvas: HTMLElement, direction: Direction, edges: readonly Jira
   const zones = Array.from(canvas.querySelectorAll<HTMLElement>('[data-export-zone]')).flatMap((element, index) => {
     const rect = element.getBoundingClientRect();
     const label = element.querySelector('.graph-zone-title')?.textContent?.trim();
-    return label && intersects(rect, viewport) ? [{ id: `g${index + 1}`, label, rect }] : [];
+    const layoutId = element.dataset.exportZone;
+    const members = new Set<string>(JSON.parse(element.dataset.exportMembers ?? '[]'));
+    return label && layoutId && intersects(rect, viewport) ? [{ id: `g${index + 1}`, layoutId, label, rect, members }] : [];
   }).sort((left, right) => left.rect.width * left.rect.height - right.rect.width * right.rect.height);
   const keys = new Map<string, string>();
   const nodes = Array.from(canvas.querySelectorAll<HTMLElement>('.react-flow__node-issue[data-id]')).flatMap((element, index) => {
@@ -32,12 +28,15 @@ function mermaid(canvas: HTMLElement, direction: Direction, edges: readonly Jira
     const title = element.querySelector('.issue-card-title')?.textContent?.trim();
     const id = `n${index + 1}`;
     keys.set(key, id);
-    return [{ id, label: title ? `${key} · ${title}` : key, rect }];
+    return [{ id, key, label: title ? `${key} · ${title}` : key }];
   });
   const lines: string[] = [`flowchart ${direction}`];
   const zoneParents = new Map<string, string | undefined>();
-  zones.forEach((zone, index) => zoneParents.set(zone.id, zones.slice(index + 1).find(({ rect }) => covers(rect, zone.rect))?.id));
-  const nodeParents = new Map(nodes.map((node) => [node.id, zones.find(({ rect }) => covers(rect, node.rect))?.id]));
+  const byDepth = [...zones].sort((left, right) => right.layoutId.length - left.layoutId.length);
+  for (const zone of zones) {
+    zoneParents.set(zone.id, byDepth.find(({ layoutId }) => zone.layoutId.startsWith(`${layoutId}/`))?.id);
+  }
+  const nodeParents = new Map(nodes.map((node) => [node.id, byDepth.find(({ members }) => members.has(node.key))?.id]));
 
   function renderItems(parent: string | undefined, indent: string) {
     for (const zone of zones) {

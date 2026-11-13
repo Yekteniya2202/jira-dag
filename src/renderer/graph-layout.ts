@@ -29,6 +29,7 @@ export interface GraphZone extends GraphPosition, Dimensions {
   issues: number;
   done: number;
   points?: number;
+  members: readonly string[];
 }
 
 interface GroupName { key: string; title: string; epicKey?: string; appearance?: GroupAppearance; sprint?: JiraSprint }
@@ -254,7 +255,31 @@ function moveBox(target: LayoutBox, box: LayoutBox, x: number, y: number) {
 
 function zone(box: LayoutBox, id: string, title: string, kind: GraphZone['kind']): GraphZone {
   return { id, title, kind, x: 0, y: 0, width: box.width, height: box.height,
-    issues: box.issues, done: box.done, points: box.points };
+    issues: box.issues, done: box.done, points: box.points, members: [...box.positions.keys()] };
+}
+
+export function fitMovedZones(
+  zones: readonly GraphZone[], moved: Readonly<Record<string, GraphPosition>>, cardHeight: number,
+  direction: Direction, notes: ReadonlySet<string>,
+): readonly GraphZone[] {
+  if (!Object.keys(moved).length) return zones;
+  return zones.map((zone) => {
+    let left = zone.x;
+    let top = zone.y;
+    let right = left + zone.width;
+    let bottom = top + zone.height;
+    for (const key of zone.members) {
+      const position = moved[key];
+      if (!position) continue;
+      const width = CARD_WIDTH + (notes.has(key) && direction === 'TB' ? NOTE_WIDTH + noteGap : 0);
+      const height = cardHeight + (notes.has(key) && direction === 'LR' ? NOTE_HEIGHT + noteGap : 0);
+      left = Math.min(left, position.x - 16);
+      top = Math.min(top, position.y - 42);
+      right = Math.max(right, position.x + width + 16);
+      bottom = Math.max(bottom, position.y + height + 16);
+    }
+    return { ...zone, x: left, y: top, width: right - left, height: bottom - top };
+  });
 }
 
 function layoutSprintRow(tree: GroupTree, items: Map<string, LayoutBox>): LayoutBox {

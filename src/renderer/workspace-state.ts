@@ -7,6 +7,11 @@ import type { Direction, GraphPosition } from './graph-model.js';
 export const refreshIntervals = [1, 5, 10, 15] as const;
 export type RefreshMinutes = typeof refreshIntervals[number];
 export type StoredViewport = GraphPosition & { zoom: number };
+export interface GraphArrangement {
+  positions: Record<string, GraphPosition>;
+  viewport?: StoredViewport;
+  hiddenIssueKeys?: string[];
+}
 
 export interface QueryDraft {
   baseJql: string;
@@ -14,12 +19,14 @@ export interface QueryDraft {
   facets: GraphFilters['facets'];
   depth: number;
   storyField: string;
+  qaField?: string;
 }
 
 export interface AppliedQuery {
   jql: string;
   depth: number;
   storyField: string;
+  qaField?: string;
   sprintIds: string[];
   epicKey?: string;
 }
@@ -30,7 +37,7 @@ export interface TabSnapshot {
   includedKeys: string[];
   filters: GraphFilters;
   groupMode: GroupMode;
-  fields: Record<'points' | 'assignee' | 'priority' | 'labels' | 'dueDate' | 'estimate', boolean>;
+  fields: Record<'points' | 'assignee' | 'priority' | 'labels' | 'dueDate' | 'estimate', boolean> & { qaPoints?: boolean };
   showEdgePoints: boolean;
   focusMode: 'all' | 'connected' | 'upstream' | 'downstream';
   direction: Direction;
@@ -42,6 +49,8 @@ export interface TabSnapshot {
   rightHidden: boolean;
   viewport?: StoredViewport;
   manualPositions: Record<string, GraphPosition>;
+  arrangements?: Record<string, GraphArrangement>;
+  hiddenIssueKeys?: string[];
   autoRefresh: boolean;
   refreshMinutes: RefreshMinutes;
   analysis?: AnalysisSettings;
@@ -50,6 +59,7 @@ export interface TabSnapshot {
 
 export type WorkspaceTab = {
   id: number;
+  label?: string;
   query?: string;
   project?: string;
   pinned?: boolean;
@@ -125,6 +135,7 @@ function queryDraft(value: unknown): QueryDraft | undefined {
   return {
     baseJql, projectKey: text(data.projectKey, 128) ?? '', facets: facets(data.facets),
     depth: integer(data.depth, 0, 3) ?? 0, storyField: text(data.storyField, 128) ?? '',
+    ...(text(data.qaField, 128) ? { qaField: text(data.qaField, 128) } : {}),
   };
 }
 
@@ -135,6 +146,7 @@ function appliedQuery(value: unknown): AppliedQuery | undefined {
   const epicKey = text(data.epicKey, 128);
   return {
     jql, depth: integer(data.depth, 0, 3) ?? 0, storyField: text(data.storyField, 128) ?? '',
+    ...(text(data.qaField, 128) ? { qaField: text(data.qaField, 128) } : {}),
     sprintIds: texts(data.sprintIds).filter((id) => /^\d+$/.test(id)),
     ...(epicKey && issueKey.test(epicKey) ? { epicKey } : {}),
   };
@@ -149,6 +161,19 @@ function position(value: unknown): GraphPosition | undefined {
   const x = coordinate(data.x);
   const y = coordinate(data.y);
   return x !== undefined && y !== undefined ? { x, y } : undefined;
+}
+
+function savedPositions(value: unknown): Record<string, GraphPosition> {
+  return Object.fromEntries(Object.entries(record(value)).slice(0, 1500).flatMap(([key, raw]) => {
+    const coordinates = position(raw);
+    return issueKey.test(key) && coordinates ? [[key, coordinates]] : [];
+  }));
+}
+
+function savedViewport(value: unknown): StoredViewport | undefined {
+  const point = position(value);
+  const zoom = coordinate(record(value).zoom);
+  return point && zoom !== undefined && zoom >= 0.07 && zoom <= 2 ? { ...point, zoom } : undefined;
 }
 
 function analysisSettings(value: unknown): AnalysisSettings | undefined {
@@ -174,8 +199,6 @@ function tabSnapshot(value: unknown): Partial<TabSnapshot> | undefined {
   if (!draft) return undefined;
   const filters = record(data.filters);
   const fields = record(data.fields);
-  const viewport = position(data.viewport);
-  const zoom = coordinate(record(data.viewport).zoom);
   const analysis = analysisSettings(data.analysis);
   return {
     draft, applied: appliedQuery(data.applied), includedKeys: texts(data.includedKeys).filter((key) => issueKey.test(key)),
@@ -186,18 +209,27 @@ function tabSnapshot(value: unknown): Partial<TabSnapshot> | undefined {
       crossProject: filters.crossProject === true, crossEpic: filters.crossEpic === true,
     },
     groupMode: oneOf(groupModes, data.groupMode),
-    fields: Object.fromEntries(fieldNames.map((field) => [field, fields[field] === true])) as TabSnapshot['fields'],
+    fields: {
+      ...Object.fromEntries(fieldNames.map((field) => [field, fields[field] === true])) as TabSnapshot['fields'],
+      ...(typeof fields.qaPoints === 'boolean' ? { qaPoints: fields.qaPoints } : {}),
+    },
     showEdgePoints: data.showEdgePoints === true,
     focusMode: oneOf(['all', 'connected', 'upstream', 'downstream'] as const, data.focusMode),
     direction: oneOf(['LR', 'TB'] as const, data.direction),
     selectedKey: text(data.selectedKey, 128), selectedEdge: text(data.selectedEdge, 256),
     leftWidth: integer(data.leftWidth, 170, 560), rightWidth: integer(data.rightWidth, 170, 560),
     leftHidden: data.leftHidden === true, rightHidden: data.rightHidden === true,
-    viewport: viewport && zoom !== undefined && zoom >= 0.07 && zoom <= 2 ? { ...viewport, zoom } : undefined,
-    manualPositions: Object.fromEntries(Object.entries(record(data.manualPositions)).slice(0, 1500).flatMap(([key, raw]) => {
-      const coordinates = position(raw);
-      return issueKey.test(key) && coordinates ? [[key, coordinates]] : [];
-    })),
+    viewport: savedViewport(data.viewport),
+    manualPositions: savedPositions(data.manualPositions),
+    ...(data.arrangements ? { arrangements: Object.fromEntries(
+      Object.entries(record(data.arrangements)).slice(-12).flatMap(([key, value]) =>
+        key.startsWith('[') && key.length <= 9_000 ? [[key, {
+          positions: savedPositions(record(value).positions), viewport: savedViewport(record(value).viewport),
+          ...(Array.isArray(record(value).hiddenIssueKeys)
+            ? { hiddenIssueKeys: texts(record(value).hiddenIssueKeys).filter((key) => issueKey.test(key)) } : {}),
+        }]] : []),
+    ) } : {}),
+    ...(Array.isArray(data.hiddenIssueKeys) ? { hiddenIssueKeys: texts(data.hiddenIssueKeys).filter((key) => issueKey.test(key)) } : {}),
     autoRefresh: data.autoRefresh === true,
     refreshMinutes: oneOf(refreshIntervals, data.refreshMinutes),
     ...(analysis ? { analysis } : {}),
@@ -226,6 +258,7 @@ export function readWorkspace(store: LocalStore, scope: string): StoredWorkspace
     const epicKey = text(tab.epicKey, 128);
     return [{
       id, query: text(tab.query), project: text(tab.project, 128), state: tabSnapshot(tab.state),
+      ...(text(tab.label, 120) ? { label: text(tab.label, 120) } : {}),
       ...(tab.pinned === true ? { pinned: true } : {}),
       ...(epicKey && issueKey.test(epicKey) ? { epicKey, epicTitle: text(tab.epicTitle, 255) } : {}),
     }];

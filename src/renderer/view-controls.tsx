@@ -12,6 +12,7 @@ export type FocusMode = 'all' | 'connected' | 'upstream' | 'downstream';
 
 export const defaultCardFields: CardFields = {
   points: true,
+  qaPoints: true,
   assignee: true,
   priority: false,
   labels: false,
@@ -70,6 +71,7 @@ export function GraphViewControls({
   const { t } = usePreferences();
   const fieldOptions: Record<keyof CardFields, string> = {
     points: 'Story Points',
+    qaPoints: t('Оценка QA', 'QA estimate'),
     assignee: t('Исполнитель', 'Assignee'),
     priority: t('Приоритет', 'Priority'),
     labels: t('Метки', 'Labels'),
@@ -103,7 +105,7 @@ export function GraphViewControls({
       <div>
         {(Object.entries(fieldOptions) as Array<[keyof CardFields, string]>).map(([field, label]) =>
           <label className="view-switch" key={field}>
-            <input type="checkbox" checked={fields[field]}
+            <input type="checkbox" checked={fields[field] ?? defaultCardFields[field]}
               onChange={(event) => onFields({ ...fields, [field]: event.target.checked })} />
             {label}
           </label>)}

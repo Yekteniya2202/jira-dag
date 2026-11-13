@@ -62,8 +62,8 @@ export function WorkspaceTabs({ tabs, activeId, disabled, canClose, onSelect, on
         if (!(next instanceof Node) || !event.currentTarget.contains(next)) setDrop(undefined);
       }}>
       {tabs.map((tab, index) => {
-        const label = tab.epicKey ? t(`Эпик ${tab.epicKey}`, `Epic ${tab.epicKey}`) : t(`Граф ${tab.id}`, `Graph ${tab.id}`);
-        const suffix = tab.epicKey ? (tab.epicTitle === tab.epicKey ? undefined : tab.epicTitle) : tab.project;
+        const label = tab.label ?? (tab.epicKey ? t(`Эпик ${tab.epicKey}`, `Epic ${tab.epicKey}`) : t(`Граф ${tab.id}`, `Graph ${tab.id}`));
+        const suffix = tab.epicKey ? (tab.epicTitle === tab.epicKey ? undefined : tab.epicTitle) : tab.label ? undefined : tab.project;
         return <button key={tab.id} type="button" id={graphTabId(tab.id)}
           role="tab" aria-selected={activeId === tab.id} aria-controls={graphPanelId(tab.id)}
           aria-description={tab.pinned ? t('Закреплена', 'Pinned') : undefined}

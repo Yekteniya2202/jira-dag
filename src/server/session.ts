@@ -43,6 +43,28 @@ function optionalIdentifier(value: unknown, name: string): string | undefined {
   return value === undefined ? undefined : identifier(value, name);
 }
 
+function agileId(value: unknown, name: string): string {
+  const id = text(value, name, 16);
+  if (!/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id))) throw new RequestError(`Invalid ${name}.`);
+  return id;
+}
+
+function issueKeys(value: unknown, name: string, limit: number): string[] {
+  if (!Array.isArray(value) || value.length > limit) throw new RequestError(`Invalid ${name}.`);
+  return [...new Set(value.map((value) => {
+    const key = text(value, 'Issue key', 128).toUpperCase();
+    if (!/^[A-Z][A-Z0-9_]*-\d+$/.test(key)) throw new RequestError('Invalid issue key.');
+    return key;
+  }))];
+}
+
+function estimateFields(input: Record<string, unknown>) {
+  return {
+    storyPointsField: optionalIdentifier(input.storyPointsField, 'Story points field'),
+    qaPointsField: optionalIdentifier(input.qaPointsField, 'QA points field'),
+  };
+}
+
 function validateJson(value: unknown, budget: { remaining: number }, depth: number): void {
   if (--budget.remaining < 0 || depth > 8) throw new RequestError('Too many field values.');
   if (value === null || typeof value === 'boolean') return;
@@ -128,10 +150,34 @@ function parseRequest(value: unknown): ApiRequest {
         input: {
           jql: text(input.jql, 'JQL', 8_192).trim(),
           depth,
-          storyPointsField: optionalIdentifier(input.storyPointsField, 'Story points field'),
+          ...estimateFields(input),
           ...(epicKey ? { epicKey: epicKey.toUpperCase() } : {}),
         },
       };
+    }
+    case 'listScrumBoards':
+      return { method, input: { project: identifier(input.project, 'Project') } };
+    case 'listBoardSprints':
+      return { method, input: { boardId: agileId(input.boardId, 'board ID') } };
+    case 'loadSprintPlan':
+      return { method, input: {
+        boardId: agileId(input.boardId, 'board ID'), sprintId: agileId(input.sprintId, 'sprint ID'),
+        ...estimateFields(input), backlogJql: optionalText(input.backlogJql, 'Backlog JQL', 8192)?.trim(),
+      } };
+    case 'loadSprintVelocity':
+      return { method, input: { boardId: agileId(input.boardId, 'board ID'), ...estimateFields(input) } };
+    case 'applySprintMembership': {
+      const expectedIssueKeys = issueKeys(input.expectedIssueKeys, 'expected sprint membership', MAX_GRAPH_ISSUES);
+      const addIssueKeys = issueKeys(input.addIssueKeys, 'sprint additions', MAX_GRAPH_ISSUES);
+      const removeIssueKeys = issueKeys(input.removeIssueKeys, 'sprint removals', MAX_GRAPH_ISSUES);
+      const expected = new Set(expectedIssueKeys);
+      if (addIssueKeys.some((key) => expected.has(key)) || removeIssueKeys.some((key) => !expected.has(key))) {
+        throw new RequestError('The change does not match the expected sprint membership.');
+      }
+      return { method, input: {
+        boardId: agileId(input.boardId, 'board ID'), sprintId: agileId(input.sprintId, 'sprint ID'),
+        expectedIssueKeys, addIssueKeys, removeIssueKeys,
+      } };
     }
     case 'getCreateOptions':
       return { method, input: {
@@ -228,6 +274,11 @@ type JiraOperation = Exclude<ApiRequest, { method: 'connect' | 'disconnect' | 'g
 async function execute(client: JiraClient, request: JiraOperation): Promise<unknown> {
   switch (request.method) {
     case 'loadGraph': return client.loadGraph(request.input);
+    case 'listScrumBoards': return client.listScrumBoards(request.input);
+    case 'listBoardSprints': return client.listBoardSprints(request.input);
+    case 'loadSprintPlan': return client.loadSprintPlan(request.input);
+    case 'loadSprintVelocity': return client.loadSprintVelocity(request.input);
+    case 'applySprintMembership': return client.applySprintMembership(request.input);
     case 'getCreateOptions': return client.getCreateOptions(request.input.projectKey, request.input.issueTypeId);
     case 'createIssue': return client.createIssue(request.input);
     case 'updateIssue': return client.updateIssue(request.input);

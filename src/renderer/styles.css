@@ -179,6 +179,11 @@ button svg { flex: none; }
   color: var(--accent-ink); background: var(--accent-surface); border-color: var(--accent-border);
 }
 .workspace-deck { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+.workspace-deck[hidden] { display: none; }
+.sprint-workspace { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.sprint-loading, .sprint-storage-warning { display: flex; align-items: center; gap: 8px; padding: 12px 20px; margin: 0; }
+.sprint-storage-warning { color: var(--danger-text); background: var(--danger-surface); }
+.sprint-draft-trigger { flex: none; }
 .workspace[hidden] { display: none; }
 .applied-jql { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 11px; }
 .applied-jql code { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -395,6 +400,8 @@ select { padding-right: 6px; }
 .status.done { background: var(--badge-done); color: var(--status-done); }
 .status.active { background: var(--badge-active); color: var(--status-active); }
 .points { background: var(--accent-surface); color: var(--accent-ink); }
+.points.qa-points { background: var(--badge-done); color: var(--status-done); }
+.issue-card-meta > .points { flex: none; }
 
 .inspector { width: var(--right-panel-width, 259px); max-width: 42%; border-left: 1px solid var(--border); }
 .inspector-heading {
@@ -558,8 +565,13 @@ select { padding-right: 6px; }
   .brand { font-size: 18px; gap: 7px; }
   .brand-icon { width: 30px; height: 30px; }
   .topbar-actions > .button { padding-inline: 7px; }
+  .topbar-actions .sprint-draft-trigger > span { display: none; }
   .connection-state { max-width: 105px; }
   .refresh-menu > summary span { display: none; }
+}
+@media (max-width: 390px) {
+  .topbar-actions .settings-trigger > span { display: none; }
+  .topbar-actions { gap: 4px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .spin { animation-duration: 1600ms; }

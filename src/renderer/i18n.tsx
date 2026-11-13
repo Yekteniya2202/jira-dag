@@ -86,6 +86,27 @@ const applicationMessages: [ru: string, en: string][] = [
   ['Слишком много активных подключений.', 'Too many active connections.'],
   ['Описание содержит форматирование. Отредактируй его в Jira, чтобы сохранить разметку и вложения.', 'The description contains formatting. Edit it in Jira to preserve formatting and attachments.'],
   ['Укажи ключ проекта Jira.', 'Enter the Jira project key.'],
+  ['Укажи корректную доску и спринт Jira.', 'Choose a valid Jira board and sprint.'],
+  ['Спринт недоступен на выбранной доске Jira.', 'The sprint is unavailable on the selected Jira board.'],
+  ['Сократи JQL для бэклога до 4000 символов.', 'Shorten backlog JQL to 4000 characters.'],
+  ['Изменения не совпадают с исходным составом спринта или превышают допустимый размер.', 'The changes do not match the original sprint membership or exceed the allowed size.'],
+  ['Другое изменение спринта ещё выполняется.', 'Another sprint change is still in progress.'],
+  ['Состав спринта изменился или загружен не полностью. Обнови план перед применением.', 'Sprint membership changed or was only partially loaded. Refresh the draft before applying.'],
+  ['Состав закрытого спринта изменить нельзя.', 'Membership of a closed sprint cannot be changed.'],
+  ['Задача больше не входит в бэклог выбранной доски.', 'The issue is no longer in the selected board’s backlog.'],
+  ['Открытый спринт задачи изменился. Обнови план.', 'The issue’s open sprint changed. Refresh the draft.'],
+  ['Подзадача наследует спринт родителя. Измени состав через родительскую задачу.', 'A subtask inherits its parent’s sprint. Move the parent issue instead.'],
+  ['Jira ещё не подтвердила новый состав. Обнови план.', 'Jira has not confirmed the new membership. Refresh the draft.'],
+  ['Не удалось проверить спринт задачи.', 'The issue sprint could not be verified.'],
+  ['Не удалось проверить состав спринта.', 'Sprint membership could not be verified.'],
+  ['Jira не подтвердила изменение.', 'Jira did not confirm the change.'],
+  ['Jira не подтвердила состояние выбранного спринта.', 'Jira did not confirm the state of the selected sprint.'],
+  ['Настройки доски Jira недоступны.', 'Jira board configuration is unavailable.'],
+  ['Выбери отдельное числовое поле QA Points.', 'Select a separate numeric QA Points field.'],
+  ['Часть внешних блокеров недоступна. Их состояние не подтверждено.', 'Some external blockers are unavailable. Their status could not be confirmed.'],
+  ['Для истории выбери конкретное поле Story Points.', 'Select a Story Points field for the sprint history.'],
+  ['В Jira не найдена завершающая колонка с сопоставленными статусами.', 'The Jira board has no final column with mapped statuses.'],
+  ['История использует текущий фильтр доски, текущую колонку Done и задачи, доступные этой учётной записи.', 'History uses the current board filter and Done column, and issues visible to this account.'],
   ['Выбери корректное поле Story Points.', 'Select a valid story points field.'],
   ['Введи JQL и выбери глубину связей от 0 до 3.', 'Enter JQL and choose a link depth from 0 to 3.'],
   ['Укажи название, ключ проекта и тип задачи.', 'Enter the summary, project key and issue type.'],
@@ -112,6 +133,12 @@ const russianMessages = new Map(applicationMessages.map(([ru, en]) => [en, ru]))
 export function localizeMessage(message: string, language: Language): string {
   if (language === 'ru') return russianMessages.get(message) ?? message;
   return englishMessages.get(message) ?? message
+    .replace(/^Состав спринта неполный\. Предел выборки — (\d+) задач\.$/u, 'Sprint membership is incomplete. The result is limited to $1 issues.')
+    .replace(/^Бэклог ограничен (\d+) задачами\. Уточни запрос или найди задачу по ключу\.$/u, 'The backlog is limited to $1 issues. Refine the query or find an issue by key.')
+    .replace(/^Догрузка внешних блокеров ограничена (\d+) задачами\.$/u, 'External blocker expansion is limited to $1 issues.')
+    .replace(/^История спринта «(.+)» неполная\. Недоступные статусы и оценки исключены из итогов\.$/u, 'Sprint “$1” has incomplete history. Unavailable statuses and estimates are omitted.')
+    .replace(/^Не удалось прочитать историю спринта «(.+)»\.$/u, 'Could not load history for sprint “$1”.')
+    .replace(/^У закрытого спринта «(.+)» нет фактической даты завершения\.$/u, 'Closed sprint “$1” has no actual completion date.')
     .replace(/^Показаны первые (\d+) задач\. Уточни JQL для полной выборки\.$/u, 'Showing the first $1 issues. Refine the JQL to load the complete results.')
     .replace(/^Граф ограничен (\d+) задачами\.$/u, 'The graph is limited to $1 issues.')
     .replace(/^Догрузка ограничена (\d+) связанными задачами\.$/u, 'Expansion is limited to $1 linked issues.')

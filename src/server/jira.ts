@@ -21,7 +21,16 @@ import type {
   JiraProjectFilterOptions,
   JiraProjectTeam,
   JiraSavedFilter,
+  JiraScrumBoard,
   JiraSprint,
+  JiraSprintEstimateFields,
+  JiraSprintMembershipInput,
+  JiraSprintMembershipResult,
+  JiraSprintPlan,
+  JiraSprintPlanQuery,
+  JiraSprintScope,
+  JiraSprintVelocity,
+  JiraSprintVelocitySample,
   JiraTeamMember,
 } from '../shared/contracts.js';
 import { isBlockingType } from '../shared/jira-links.js';
@@ -40,6 +49,14 @@ export const MAX_GRAPH_ISSUES = 1_500;
 const MAX_SEARCH_ISSUES = 1_000;
 const MAX_NEIGHBORS = 400;
 const MAX_HIERARCHY_LEVELS = 8;
+const MAX_SPRINT_ISSUES = 500;
+const MAX_BACKLOG_ISSUES = 400;
+const MAX_SPRINT_BLOCKERS = 200;
+const MAX_SPRINT_CHANGES = 100;
+const SPRINT_CHANGE_BATCH = 25;
+const VELOCITY_SPRINT_COUNT = 3;
+const VELOCITY_ISSUES_PER_SPRINT = 100;
+const VELOCITY_HISTORY_LIMIT = 300;
 const TIMEOUT_MS = 15_000;
 const MAX_AVATAR_BYTES = 128 * 1024;
 export const MAX_AVATAR_BATCH = 40;
@@ -121,7 +138,9 @@ async function scopedCloudSite(site: URL): Promise<URL> {
 export class JiraClient {
   private readonly apiBase: string;
   private readonly agileBase: string;
+  private readonly softwareBase: string;
   private readonly knownStoryFields = new Set<string>();
+  private readonly knownQaFields = new Set<string>();
   private readonly knownHierarchyFields = new Set<string>();
   private readonly knownEpicFields = new Set<string>();
   private readonly knownSprintFields = new Set<string>();
@@ -134,6 +153,7 @@ export class JiraClient {
   private readonly issueAvatarSources = new Map<string, string>();
   private readonly projectAvatarSources = new Map<string, Map<string, string>>();
   private readonly pendingAvatars = new Map<string, Promise<string | null>>();
+  private applyingSprintMembership = false;
 
   constructor(
     private readonly site: URL,
@@ -144,6 +164,7 @@ export class JiraClient {
   ) {
     this.apiBase = `${apiSite.href.replace(/\/$/, '')}/rest/api/${edition === 'cloud' ? 3 : 2}`;
     this.agileBase = `${apiSite.href.replace(/\/$/, '')}/rest/agile/1.0`;
+    this.softwareBase = `${apiSite.href.replace(/\/$/, '')}/rest/software/1.0`;
   }
 
   async profile(): Promise<JsonObject> {
@@ -176,18 +197,22 @@ export class JiraClient {
     }
 
     const warnings = new Set<string>();
+    const settings = await this.graphSettings(query, warnings);
+    const initial = await this.searchGraphRoots(jql, settings.requestedFields, query.epicKey, settings.epicFields[0]);
+    if (query.epicKey) await this.expandEpicSubtasks(initial, settings.requestedFields, warnings);
+    if (initial.truncated) warnings.add(`Показаны первые ${MAX_SEARCH_ISSUES} задач. Уточни JQL для полной выборки.`);
+    return this.buildGraph(initial.issues, query.depth, settings, warnings);
+  }
+
+  private async graphSettings(query: JiraSprintEstimateFields, warnings: Set<string>, board?: JsonObject) {
     const [fieldCatalog, configuredLinkTypes] = await Promise.all([
       this.optional('GET', '/field', 'Настройки полей Jira недоступны.', warnings),
       this.optional('GET', '/issueLinkType', 'Настройки типов связей Jira недоступны.', warnings),
     ]);
     const fields = list(fieldCatalog).map(record);
-    const storyPointsFields = fields.filter(isStoryPointsField).flatMap(fieldOption);
-    const selectedStoryPoints = query.storyPointsField?.trim();
-    if (selectedStoryPoints && !/^customfield_\d+$/.test(selectedStoryPoints)) {
-      throw new JiraError('Выбери корректное поле Story Points.', 400);
-    }
-    const storyFields = selectedStoryPoints ? [selectedStoryPoints] : storyPointsFields.map((field) => field.id);
+    const { storyFields, qaFields, storyPointsFields, qaPointsFields } = estimateFields(fields, boardEstimateFields(query, board, fields));
     for (const field of storyFields) this.knownStoryFields.add(field);
+    for (const field of qaFields) this.knownQaFields.add(field);
     const hierarchyFields = Array.isArray(fieldCatalog)
       ? fields.filter(isHierarchyField).flatMap(fieldOption).map((field) => field.id)
       : [...this.knownHierarchyFields];
@@ -198,29 +223,31 @@ export class JiraClient {
     for (const field of hierarchyFields) this.knownHierarchyFields.add(field);
     for (const field of epicFields) this.knownEpicFields.add(field);
     for (const field of sprintFields) this.knownSprintFields.add(field);
-    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...hierarchyFields, ...sprintFields])];
-    const initial = await this.searchGraphRoots(jql, requestedFields, query.epicKey, epicFields[0]);
-    if (query.epicKey) await this.expandEpicSubtasks(initial, requestedFields, warnings);
-    if (initial.truncated) warnings.add(`Показаны первые ${MAX_SEARCH_ISSUES} задач. Уточни JQL для полной выборки.`);
+    const requestedFields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...hierarchyFields, ...sprintFields])];
+    const configuredTypes = list(record(configuredLinkTypes).issueLinkTypes).flatMap(toLinkType);
+    return { requestedFields, epicFields, hierarchyFields, storyFields, qaFields, storyPointsFields, qaPointsFields, configuredTypes };
+  }
 
-    const roots = new Set(initial.issues.map((issue) => issue.key));
-    const visited = new Set(roots);
-    const hydrated = new Set(roots);
-    const issues = new Map(initial.issues.map((issue) => [issue.key, issue]));
+  private async buildGraph(
+    initial: IssueRef[], depthLimit: number, settings: Awaited<ReturnType<JiraClient['graphSettings']>>, warnings: Set<string>,
+    externalBlockers: IssueRef[] = [],
+  ): Promise<JiraGraph> {
+    const { requestedFields, hierarchyFields, storyFields, qaFields, storyPointsFields, qaPointsFields, configuredTypes } = settings;
+    const roots = new Set(initial.map((issue) => issue.key));
+    const issues = new Map([...initial, ...externalBlockers].map((issue) => [issue.key, issue]));
+    const visited = new Set(issues.keys());
+    const hydrated = new Set(issues.keys());
     const edges = new Map<string, JiraEdge>();
-    const linkTypes = new Map<string, JiraLinkType>();
+    const linkTypes = new Map(configuredTypes.map((type) => [type.id, type]));
     const unloadedBlockers = new Map<string, Set<string>>();
-    for (const type of list(record(configuredLinkTypes).issueLinkTypes).flatMap(toLinkType)) {
-      linkTypes.set(type.id, type);
-    }
 
-    let frontier = initial.issues;
+    let frontier = initial;
     let remainingNeighbors = MAX_NEIGHBORS;
-    for (let depth = 0; depth <= query.depth; depth += 1) {
+    for (let depth = 0; depth <= depthLimit; depth += 1) {
       const neighbors = new Set<string>();
       const remember = (ref: IssueRef) => {
         if (!issues.has(ref.key)) {
-          if (depth === query.depth) return false;
+          if (depth === depthLimit) return false;
           if (issues.size >= MAX_GRAPH_ISSUES) {
             warnings.add(`Граф ограничен ${MAX_GRAPH_ISSUES} задачами.`);
             return false;
@@ -255,7 +282,7 @@ export class JiraClient {
         }
       }
 
-      if (depth === query.depth || !neighbors.size) break;
+      if (depth === depthLimit || !neighbors.size) break;
       const keys = [...neighbors].slice(0, remainingNeighbors);
       if (keys.length < neighbors.size) warnings.add(`Догрузка ограничена ${MAX_NEIGHBORS} связанными задачами.`);
       if (!keys.length) break;
@@ -282,7 +309,7 @@ export class JiraClient {
     const hierarchy = await this.loadHierarchyRefs(issues, hydrated, hierarchyFields, warnings);
     const graphEdges = [...edges.values()];
     const graphIssues = [...issues.values()].map((issue) => {
-      const data = this.toIssue(hierarchy.get(issue.key) ?? issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key));
+      const data = this.toIssue(hierarchy.get(issue.key) ?? issue, storyFields, !roots.has(issue.key), !hydrated.has(issue.key), qaFields);
       const keys = unloadedBlockers.get(issue.key);
       return keys ? { ...data, unloadedBlockerKeys: [...keys] } : data;
     });
@@ -293,6 +320,7 @@ export class JiraClient {
       edges: graphEdges,
       linkTypes: [...linkTypes.values()],
       storyPointsFields,
+      qaPointsFields,
       warnings: [...warnings],
     };
   }
@@ -461,6 +489,386 @@ export class JiraClient {
       sprints: sprints.status === 'fulfilled' ? sprints.value.values : [],
       ...(unavailable.length ? { unavailable } : {}),
     };
+  }
+
+  async listScrumBoards({ project }: { project: string }): Promise<JiraScrumBoard[]> {
+    const projectKeyOrId = project.trim().toUpperCase();
+    if (!/^(?:[A-Z][A-Z\d_]{0,127}|\d{1,20})$/.test(projectKeyOrId)) {
+      throw new JiraError('Укажи ключ проекта Jira.', 400);
+    }
+    const boards = await this.agileCollection('/board', { projectKeyOrId, type: 'scrum' });
+    return uniqueProjectOptions(boards.filter((board) => record(board).type === 'scrum'));
+  }
+
+  async listBoardSprints({ boardId }: { boardId: string }): Promise<JiraSprint[]> {
+    const id = requireAgileId(boardId);
+    return this.boardSprints(id, 'active,future,closed');
+  }
+
+  private async boardSprints(boardId: string, state: string): Promise<JiraSprint[]> {
+    const rows = await this.agileCollection(`/board/${boardId}/sprint`, { state });
+    const sprints = new Map<string, JiraSprint>();
+    for (const { sprint } of rows.flatMap(toSprint)) {
+      if (!sprint?.state) continue;
+      this.knownSprints.set(sprint.id, mergeSprint(sprint, this.knownSprints.get(sprint.id)));
+      sprints.set(sprint.id, sprint);
+    }
+    return [...sprints.values()];
+  }
+
+  private async readBoardSprint({ boardId, sprintId }: JiraSprintScope, state = 'active,future,closed'): Promise<JiraSprint> {
+    const visible = (await this.boardSprints(boardId, state)).find((sprint) => sprint.id === sprintId);
+    if (!visible) throw new JiraError('Спринт недоступен на выбранной доске Jira.', 404);
+    return visible;
+  }
+
+  async loadSprintPlan(query: JiraSprintPlanQuery): Promise<JiraSprintPlan> {
+    const scope = sprintScope(query);
+    const backlogJql = query.backlogJql?.trim();
+    if (backlogJql && backlogJql.length > 4_000) throw new JiraError('Сократи JQL для бэклога до 4000 символов.', 400);
+    const warnings = new Set<string>();
+    const [sprint, board] = await Promise.all([this.readBoardSprint(scope), this.boardConfiguration(scope.boardId, warnings)]);
+    const settings = await this.graphSettings(query, warnings, board);
+    const fields = [...settings.requestedFields, 'sprint', 'closedSprints'];
+    const [members, backlog] = await Promise.all([
+      this.agileIssues(`/sprint/${scope.sprintId}/issue`, fields, MAX_SPRINT_ISSUES),
+      this.agileIssues(`/board/${scope.boardId}/backlog`, fields, MAX_BACKLOG_ISSUES, backlogJql),
+    ]);
+    if (!members.complete) warnings.add(`Состав спринта неполный. Предел выборки — ${MAX_SPRINT_ISSUES} задач.`);
+    if (!backlog.complete) warnings.add(`Бэклог ограничен ${MAX_BACKLOG_ISSUES} задачами. Уточни запрос или найди задачу по ключу.`);
+    const membersByKey = new Set(members.issues.map((issue) => issue.key));
+    const candidates = backlog.issues.filter((issue) => !membersByKey.has(issue.key));
+    const roots = [...members.issues, ...candidates];
+    const blockers = await this.loadSprintBlockers(roots, settings.requestedFields, warnings);
+    const graph = await this.buildGraph(roots, 0, settings, warnings, blockers);
+    return {
+      sprint, graph,
+      sprintIssueKeys: [...membersByKey], backlogIssueKeys: candidates.map((issue) => issue.key),
+      membershipComplete: members.complete, backlogComplete: backlog.complete,
+      ...(settings.storyFields.length === 1 ? { storyPointsField: settings.storyFields[0] } : {}),
+      ...(settings.qaFields.length === 1 ? { qaPointsField: settings.qaFields[0] } : {}),
+    };
+  }
+
+  private async loadSprintBlockers(roots: IssueRef[], fields: string[], warnings: Set<string>): Promise<IssueRef[]> {
+    const rootKeys = new Set(roots.map((issue) => issue.key));
+    const blockerKeys = new Set<string>();
+    for (const issue of roots) {
+      for (const link of list(issue.fields?.issuelinks).flatMap(toRawLink)) {
+        const blocker = link.inwardIssue;
+        const status = record(record(blocker?.fields?.status).statusCategory).key;
+        if (blocker && !rootKeys.has(blocker.key) && isBlockingType(link.type) && status !== 'done') blockerKeys.add(blocker.key);
+      }
+    }
+    const keys = [...blockerKeys].slice(0, MAX_SPRINT_BLOCKERS);
+    if (keys.length < blockerKeys.size) warnings.add(`Догрузка внешних блокеров ограничена ${MAX_SPRINT_BLOCKERS} задачами.`);
+    const warning = 'Часть внешних блокеров недоступна. Их состояние не подтверждено.';
+    return this.searchIssueBatches(keys, fields, warning, warnings);
+  }
+
+  async applySprintMembership(input: JiraSprintMembershipInput): Promise<JiraSprintMembershipResult> {
+    const scope = sprintScope(input);
+    const expected = membershipKeys(input.expectedIssueKeys, MAX_SPRINT_ISSUES);
+    const add = membershipKeys(input.addIssueKeys, MAX_SPRINT_CHANGES);
+    const remove = membershipKeys(input.removeIssueKeys, MAX_SPRINT_CHANGES);
+    if (add.length + remove.length > MAX_SPRINT_CHANGES || add.some((key) => expected.includes(key)) ||
+      remove.some((key) => !expected.includes(key))) {
+      throw new JiraError('Изменения не совпадают с исходным составом спринта или превышают допустимый размер.', 400);
+    }
+    if (this.applyingSprintMembership) throw new JiraError('Другое изменение спринта ещё выполняется.', 409);
+    const result: JiraSprintMembershipResult = { added: [], removed: [], failed: [] };
+    if (!add.length && !remove.length) return result;
+
+    this.applyingSprintMembership = true;
+    try {
+      const sprint = await this.readBoardSprint(scope, 'active,future');
+      requireWritableSprint(sprint);
+      const members = await this.agileIssues(`/sprint/${scope.sprintId}/issue`, ['summary'], MAX_SPRINT_ISSUES);
+      const actual = new Set(members.issues.map((issue) => issue.key));
+      if (!members.complete || expected.length !== actual.size || expected.some((key) => !actual.has(key))) {
+        throw new JiraError('Состав спринта изменился или загружен не полностью. Обнови план перед применением.', 409);
+      }
+
+      for (const [operation, keys] of [['add', add], ['remove', remove]] as const) {
+        for (let index = 0; index < keys.length; index += SPRINT_CHANGE_BATCH) {
+          const batch = keys.slice(index, index + SPRINT_CHANGE_BATCH);
+          await this.applySprintBatch(scope, operation, batch, result);
+        }
+      }
+    } finally {
+      this.applyingSprintMembership = false;
+    }
+    return result;
+  }
+
+  private async applySprintBatch(
+    scope: JiraSprintScope, operation: 'add' | 'remove', batch: string[], result: JiraSprintMembershipResult,
+  ): Promise<void> {
+    const fail = (key: string, reason: string) => result.failed.push({ key, operation, reason });
+    const adding = operation === 'add';
+    const verified: string[] = [];
+    try {
+      const { sprintId, boardId } = scope;
+      const { sprint } = toSprint(await this.agileCall('GET', `/sprint/${sprintId}`))[0] ?? {};
+      if (!sprint || sprint.id !== sprintId) throw new JiraError('Jira не подтвердила состояние выбранного спринта.');
+      requireWritableSprint(sprint);
+      const eligible = adding
+        ? await this.agileIssues(`/board/${boardId}/backlog`, ['summary'], batch.length, issueKeysJql(batch))
+        : undefined;
+      const eligibleKeys = eligible?.complete ? new Set(eligible.issues.map((issue) => issue.key)) : new Set<string>();
+      const checks = await Promise.all(batch.map(async (key) => {
+        if (adding && !eligibleKeys.has(key)) {
+          return 'Задача больше не входит в бэклог выбранной доски.';
+        }
+        try {
+          const openSprints = await this.issueOpenSprints(key);
+          if (adding ? openSprints.length !== 0 : openSprints.length !== 1 || openSprints[0] !== sprintId) {
+            return 'Открытый спринт задачи изменился. Обнови план.';
+          }
+          return undefined;
+        } catch (error) {
+          return jiraFailure(error, 'Не удалось проверить спринт задачи.');
+        }
+      }));
+      batch.forEach((key, index) => {
+        const reason = checks[index];
+        if (reason) fail(key, reason);
+        else verified.push(key);
+      });
+    } catch (error) {
+      for (const key of batch) fail(key, jiraFailure(error, 'Не удалось проверить состав спринта.'));
+      return;
+    }
+    if (!verified.length) return;
+
+    const path = adding ? `/sprint/${scope.sprintId}/issue` : '/backlog/issue';
+    let writeError: string | undefined;
+    try {
+      await this.agileCall('POST', path, { issues: verified });
+    } catch (error) {
+      writeError = jiraFailure(error, 'Jira не подтвердила изменение.');
+    }
+
+    const outcomes = await Promise.all(verified.map(async (key) => {
+      try {
+        const openSprints = await this.issueOpenSprints(key);
+        const matches = adding ? openSprints.length === 1 && openSprints[0] === scope.sprintId : openSprints.length === 0;
+        return matches ? undefined : writeError ?? 'Jira ещё не подтвердила новый состав. Обнови план.';
+      } catch (error) {
+        return writeError ?? jiraFailure(error, 'Jira не подтвердила новый состав. Обнови план.');
+      }
+    }));
+    verified.forEach((key, index) => {
+      const reason = outcomes[index];
+      if (reason) fail(key, reason);
+      else (adding ? result.added : result.removed).push(key);
+    });
+  }
+
+  private async issueOpenSprints(key: string): Promise<string[]> {
+    const fields = new URLSearchParams({ fields: ['sprint', 'closedSprints', 'issuetype', ...this.knownSprintFields].join(',') });
+    const response = await this.agileCall('GET', `/issue/${key}?${fields}`);
+    const issue = toRef(response)[0];
+    if (!issue || issue.key !== key || !issue.fields) throw new JiraError('Jira не подтвердила данные задачи.');
+    const type = record(issue.fields.issuetype);
+    if (!type.id && !type.name) throw new JiraError('Jira не подтвердила тип задачи.');
+    if (isSubtaskType(type)) throw new JiraError('Подзадача наследует спринт родителя. Измени состав через родительскую задачу.', 409);
+    const sprintFields = [...new Set(['sprint', ...this.knownSprintFields])].filter((field) => Object.hasOwn(issue.fields!, field));
+    if (!sprintFields.length) throw new JiraError('Jira не подтвердила значение поля Sprint.');
+    const open = new Set<string>();
+    for (const field of sprintFields) {
+      const value = issue.fields[field];
+      if (value == null) continue;
+      for (const row of Array.isArray(value) ? value : [value]) {
+        const { sprint } = toSprint(row)[0] ?? {};
+        if (!sprint?.state) throw new JiraError('Jira не подтвердила состояние одного из спринтов задачи.');
+        if (sprint.state !== 'closed') open.add(sprint.id);
+      }
+    }
+    return [...open];
+  }
+
+  async loadSprintVelocity(query: { boardId: string } & JiraSprintEstimateFields): Promise<JiraSprintVelocity> {
+    const boardId = requireAgileId(query.boardId);
+    const warnings = new Set<string>();
+    const [sprints, catalog, configuration] = await Promise.all([
+      this.boardSprints(boardId, 'closed'),
+      this.optional('GET', '/field', 'Настройки полей Jira недоступны.', warnings),
+      this.boardConfiguration(boardId, warnings),
+    ]);
+    const fields = list(catalog).map(record);
+    const board = record(configuration);
+    const columns = list(record(board.columnConfig).columns).map((column) => list(record(column).statuses)
+      .map((status) => numericId(record(status).id)).filter(isPresent)).filter((statuses) => statuses.length > 0);
+    const done = new Set(columns.at(-1));
+    const mapped = new Set(columns.flat());
+    const estimates = estimateFields(fields, boardEstimateFields(query, board, fields));
+    const story = estimates.storyFields.length === 1 ? estimates.storyFields[0] : undefined;
+    const qa = estimates.qaFields[0];
+    if (!story) warnings.add('Для истории выбери конкретное поле Story Points.');
+    if (!done.size) warnings.add('В Jira не найдена завершающая колонка с сопоставленными статусами.');
+    const sprintOrder = (sprint: JiraSprint) => Date.parse(sprint.completeDate ?? sprint.endDate ?? sprint.startDate ?? '') || 0;
+    const recent = [...sprints].reverse().sort((a, b) => sprintOrder(b) - sprintOrder(a)).slice(0, VELOCITY_SPRINT_COUNT);
+    if (recent.length) warnings.add('История использует текущий фильтр доски, текущую колонку Done и задачи, доступные этой учётной записи.');
+    const samples: JiraSprintVelocitySample[] = [];
+    for (const sprint of recent) {
+      if (!sprint.completeDate) {
+        warnings.add(`У закрытого спринта «${sprint.name}» нет фактической даты завершения.`);
+        samples.push(unavailableVelocitySample(sprint));
+        continue;
+      }
+      try {
+        const snapshot = await this.agileIssues(`/board/${boardId}/sprint/${sprint.id}/issue`,
+          ['status', 'assignee', 'issuetype', 'created', 'updated', ...[story, qa].filter(isPresent)], VELOCITY_ISSUES_PER_SPRINT);
+        const issues = snapshot.issues.filter((issue) => !isSubtaskType(record(issue.fields?.issuetype)));
+        const sample = await this.velocitySample(sprint, issues, snapshot.complete, snapshot.total - (snapshot.issues.length - issues.length),
+          mapped, done, story, qa, fields);
+        if (!sample.complete || sample.storyPointsComplete === false || sample.qaPointsComplete === false || sample.peopleComplete === false) {
+          warnings.add(`История спринта «${sprint.name}» неполная. Итоги учитывают только подтверждённые данные.`);
+        }
+        samples.push(sample);
+      } catch (error) {
+        if (error instanceof JiraError && error.status === 401) throw error;
+        warnings.add(`Не удалось прочитать историю спринта «${sprint.name}».`);
+        samples.push(unavailableVelocitySample(sprint));
+      }
+    }
+    return { samples, warnings: [...warnings] };
+  }
+
+  private async boardConfiguration(boardId: string, warnings: Set<string>): Promise<JsonObject | undefined> {
+    try {
+      return record(await this.agileCall('GET', `/board/${boardId}/configuration`));
+    } catch (error) {
+      if (error instanceof JiraError && error.status === 401) throw error;
+      warnings.add('Настройки доски Jira недоступны.');
+      return undefined;
+    }
+  }
+
+  private async velocitySample(
+    sprint: JiraSprint, issues: IssueRef[], membershipComplete: boolean, totalIssues: number,
+    mapped: Set<string>, done: Set<string>, story: string | undefined, qa: string | undefined, fields: JsonObject[],
+  ): Promise<JiraSprintVelocitySample> {
+    const cutoff = Date.parse(sprint.completeDate!);
+    const people = new Map<string, NonNullable<JiraSprintVelocitySample['people']>[number]>();
+    let completedStoryPoints = 0;
+    let completedQaPoints = 0;
+    let completedIssues = 0;
+    let evaluatedIssues = 0;
+    let storyCoverage = true;
+    let qaCoverage = true;
+    let personCoverage = true;
+    for (let index = 0; index < issues.length && done.size > 0; index += 5) {
+      const states = await Promise.all(issues.slice(index, index + 5).map(async (issue) => {
+        const current = issue.fields ?? {};
+        const created = Date.parse(string(current.created) ?? '');
+        if (!Number.isFinite(created) || created > cutoff || !record(current.issuetype).id) return undefined;
+        const updated = Date.parse(string(current.updated) ?? '');
+        const histories = updated <= cutoff ? [] : await this.issueHistory(issue.key);
+        if (!histories) return undefined;
+        return historicalIssue(current, histories, cutoff, story, qa, fields, this.edition);
+      }));
+      for (const state of states) {
+        if (!state?.status || !mapped.has(state.status)) continue;
+        evaluatedIssues += 1;
+        if (!done.has(state.status)) continue;
+        completedIssues += 1;
+        if (state.story === undefined) storyCoverage = false;
+        if (state.qa === undefined) qaCoverage = false;
+        completedStoryPoints += state.story ?? 0;
+        completedQaPoints += state.qa ?? 0;
+        if (!state.person) {
+          if (state.person === undefined) personCoverage = false;
+          continue;
+        }
+        if (state.story === undefined) continue;
+        const person = people.get(state.person.id) ?? { ...state.person, storyPoints: 0, completedIssues: 0 };
+        person.completedIssues += 1;
+        person.storyPoints += state.story;
+        people.set(person.id, person);
+      }
+    }
+    const hasEvidence = evaluatedIssues > 0 || (membershipComplete && issues.length === 0 && done.size > 0);
+    const complete = membershipComplete && done.size > 0 && evaluatedIssues === totalIssues;
+    return {
+      sprint, completedIssues, evaluatedIssues, totalIssues,
+      ...(story && hasEvidence ? { completedStoryPoints } : {}),
+      ...(qa && hasEvidence ? { completedQaPoints } : {}),
+      ...(people.size ? { people: [...people.values()] } : {}),
+      complete,
+      ...(story ? { storyPointsComplete: complete && storyCoverage, peopleComplete: complete && storyCoverage && personCoverage } : {}),
+      ...(qa ? { qaPointsComplete: complete && qaCoverage } : {}),
+    };
+  }
+
+  private async issueHistory(key: string): Promise<unknown[] | undefined> {
+    const path = `/issue/${encodeURIComponent(key)}`;
+    try {
+      if (this.edition === 'data-center') {
+        const payload = record(await this.call('GET', `${path}?fields=status&expand=changelog`));
+        const changelog = record(payload.changelog);
+        return Array.isArray(changelog.histories) && changelog.startAt === 0 &&
+          changelog.total === changelog.histories.length && changelog.histories.length <= VELOCITY_HISTORY_LIMIT
+          ? changelog.histories : undefined;
+      }
+      const histories: unknown[] = [];
+      for (let pageIndex = 0; pageIndex < 20 && histories.length < VELOCITY_HISTORY_LIMIT; pageIndex += 1) {
+        const query = new URLSearchParams({ startAt: String(histories.length), maxResults: '100' });
+        const page = record(await this.call('GET', `${path}/changelog?${query}`));
+        if (page.startAt !== histories.length || !Array.isArray(page.values)) return undefined;
+        histories.push(...page.values);
+        const total = integer(page.total);
+        if (histories.length > VELOCITY_HISTORY_LIMIT) return undefined;
+        if (total !== undefined && histories.length === total && page.isLast !== false) return histories;
+        if (!page.values.length || page.isLast === true) return undefined;
+      }
+      return undefined;
+    } catch (error) {
+      if (error instanceof JiraError && error.status === 401) throw error;
+      return undefined;
+    }
+  }
+
+  private async agileIssues(path: string, fields: string[], limit: number, jql?: string) {
+    const cloud = this.edition === 'cloud';
+    const issues = new Map<string, IssueRef>();
+    const tokens = new Set<string>();
+    let startAt = 0;
+    let total = 0;
+    let nextPageToken: string | undefined;
+    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+      const query = new URLSearchParams({ fields: fields.join(','), maxResults: String(Math.min(50, limit - issues.size)) });
+      if (jql) query.set('jql', jql);
+      if (nextPageToken) query.set('nextPageToken', nextPageToken);
+      if (!cloud) query.set('startAt', String(startAt));
+      const page = record(await this.agileCall('GET', `${path}?${query}`, undefined, cloud));
+      if (!Array.isArray(page.issues) || (!cloud && page.startAt !== undefined && page.startAt !== startAt)) {
+        throw new JiraError('Jira вернула некорректную страницу задач спринта или бэклога.');
+      }
+      for (const row of page.issues) {
+        const issue = toRef(row)[0];
+        if (!issue || issues.has(issue.key)) throw new JiraError('Состав выборки Jira изменился во время чтения. Обнови план.', 409);
+        if (issues.size === limit) return { issues: [...issues.values()], complete: false, total: Math.max(total, limit + 1) };
+        issues.set(issue.key, issue);
+      }
+      startAt += page.issues.length;
+      total = integer(page.total) ?? startAt;
+      nextPageToken = string(page.nextPageToken);
+      const more = cloud ? Boolean(nextPageToken) : startAt < total || page.isLast === false;
+      if (!more) return { issues: [...issues.values()], complete: true, total };
+      if (issues.size === limit || !page.issues.length) break;
+      if (nextPageToken) {
+        if (tokens.has(nextPageToken)) throw new JiraError('Jira вернула страницу задач повторно.');
+        tokens.add(nextPageToken);
+      }
+    }
+    return { issues: [...issues.values()], complete: false, total: Math.max(total, issues.size + 1) };
+  }
+
+  private agileCall(method: string, path: string, body?: unknown, enhanced = false): Promise<unknown> {
+    const base = enhanced ? this.softwareBase : this.agileBase;
+    return request(new URL(`${base}${path}`), method, this.authorization, this.token, body);
   }
 
   private async getProjectSprints(project: string): Promise<{ values: JiraSprint[]; incomplete: boolean }> {
@@ -918,14 +1326,15 @@ export class JiraClient {
   private async readIssueOrFallback(key: string, fallback: JiraIssue): Promise<JiraIssue> {
     try {
       const storyFields = [...this.knownStoryFields];
-      const fields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...this.knownHierarchyFields, ...this.knownSprintFields])];
-      return this.toIssue(await this.readIssue(key, fields), storyFields);
+      const qaFields = [...this.knownQaFields];
+      const fields = [...new Set([...ISSUE_FIELDS, ...storyFields, ...qaFields, ...this.knownHierarchyFields, ...this.knownSprintFields])];
+      return this.toIssue(await this.readIssue(key, fields), storyFields, false, false, qaFields);
     } catch {
       return fallback;
     }
   }
 
-  private toIssue(issue: IssueRef, storyFields: string[], external = false, stub = false): JiraIssue {
+  private toIssue(issue: IssueRef, storyFields: string[], external = false, stub = false, qaFields: string[] = []): JiraIssue {
     const fields = issue.fields ?? {};
     const status = record(fields.status);
     const issueType = record(fields.issuetype);
@@ -949,8 +1358,8 @@ export class JiraClient {
       if (!sprint) continue;
       sprintDetails.set(sprint.id, mergeSprint(sprint, sprintDetails.get(sprint.id) ?? this.knownSprints.get(sprint.id)));
     }
-    const storyPoints = storyFields.map((field) => fields[field]).find((value) =>
-      typeof value === 'number' && Number.isFinite(value));
+    const storyPoints = fieldNumber(fields, storyFields);
+    const qaPoints = fieldNumber(fields, qaFields);
     const description = fields.description;
     const richDescription = this.edition === 'cloud' && description != null && !isPlainAdf(description);
     return {
@@ -962,7 +1371,8 @@ export class JiraClient {
       assignee: string(assignee.displayName),
       ...(assigneeId ? { assigneeId } : {}),
       project: string(record(fields.project).key) ?? issue.key.replace(/-\d+$/, ''),
-      storyPoints: typeof storyPoints === 'number' ? storyPoints : undefined,
+      storyPoints,
+      ...(qaPoints !== undefined ? { qaPoints } : {}),
       description: typeof description === 'string' ? description : adfText(description),
       descriptionMarkdown: richDescription ? adfMarkdown(description) : undefined,
       descriptionReadOnly: richDescription ? true : undefined,
@@ -1015,6 +1425,38 @@ function toRef(value: unknown): IssueRef[] {
   const row = record(value);
   const key = string(row.key) ?? string(value);
   return key && ISSUE_KEY.test(key) ? [{ key, fields: record(row.fields) }] : [];
+}
+
+function unavailableVelocitySample(sprint: JiraSprint): JiraSprintVelocitySample {
+  return { sprint, completedIssues: 0, evaluatedIssues: 0, totalIssues: 0, complete: false };
+}
+
+function requireAgileId(value: string): string {
+  if (!/^[1-9]\d{0,19}$/.test(value)) throw new JiraError('Укажи корректную доску и спринт Jira.', 400);
+  return value;
+}
+
+function sprintScope(input: JiraSprintScope): JiraSprintScope {
+  return { boardId: requireAgileId(input.boardId), sprintId: requireAgileId(input.sprintId) };
+}
+
+function membershipKeys(values: string[], limit: number): string[] {
+  if (!Array.isArray(values) || values.length > limit || values.some((key) => typeof key !== 'string' || !ISSUE_KEY.test(key))) {
+    throw new JiraError('Некорректный список задач для изменения спринта.', 400);
+  }
+  const keys = values.map((key) => key.toUpperCase());
+  if (new Set(keys).size !== keys.length) throw new JiraError('Убери повторяющиеся ключи задач.', 400);
+  return keys;
+}
+
+function requireWritableSprint(sprint: JiraSprint): void {
+  if (sprint.state !== 'active' && sprint.state !== 'future') {
+    throw new JiraError('Состав закрытого спринта изменить нельзя.', 409);
+  }
+}
+
+function jiraFailure(error: unknown, fallback: string): string {
+  return error instanceof JiraError ? error.message : fallback;
 }
 
 function toHierarchyRef(value: unknown): IssueRef[] {
@@ -1107,11 +1549,110 @@ function isEpicType(value: unknown): boolean {
   return type.hierarchyLevel === 1 || ['epic', 'эпик'].includes(string(type.name)?.toLowerCase() ?? '');
 }
 
+function isSubtaskType(type: JsonObject): boolean {
+  return type.subtask === true || type.hierarchyLevel === -1;
+}
+
 function isStoryPointsField(field: JsonObject): boolean {
   const schema = record(field.schema);
   const name = string(field.name)?.trim().toLowerCase();
   return schema.custom === 'com.pyxis.greenhopper.jira:gh-story-points' ||
     ((schema.type === 'number' || schema.type === undefined) && (name === 'story points' || name === 'story point estimate'));
+}
+
+function isNumericField(field: JsonObject): boolean {
+  return record(field.schema).type === 'number' || isStoryPointsField(field);
+}
+
+function isNamedQaField(field: JiraOption): boolean {
+  return /\b(?:qa|testing)\b|тестирован/i.test(field.name) && /\b(?:points?|estimate)\b|оценк|балл/i.test(field.name);
+}
+
+function boardEstimateFields(query: JiraSprintEstimateFields, board: JsonObject | undefined, catalog: JsonObject[]): JiraSprintEstimateFields {
+  if (query.storyPointsField?.trim()) return query;
+  const boardField = string(record(record(board?.estimation).field).fieldId);
+  if (!boardField || boardField === query.qaPointsField || !catalog.some((field) => field.id === boardField && isNumericField(field))) {
+    return query;
+  }
+  return { ...query, storyPointsField: boardField };
+}
+
+function estimateFields(fields: JsonObject[], query: JiraSprintEstimateFields) {
+  const selectedStory = query.storyPointsField?.trim();
+  const selectedQa = query.qaPointsField?.trim();
+  const isCustomId = (id: string) => /^customfield_\d+$/.test(id);
+  if (selectedStory && !isCustomId(selectedStory)) throw new JiraError('Выбери корректное поле Story Points.', 400);
+  if (selectedQa && (!isCustomId(selectedQa) || selectedStory === selectedQa)) {
+    throw new JiraError('Выбери отдельное числовое поле QA Points.', 400);
+  }
+  const storyPointsFields = fields.filter((field) => isStoryPointsField(field) || (field.id === selectedStory && isNumericField(field)))
+    .flatMap(fieldOption);
+  const qaPointsFields = fields.filter((field) => isNumericField(field) && !isStoryPointsField(field) && field.id !== selectedStory)
+    .flatMap(fieldOption).sort((left, right) => Number(isNamedQaField(right)) - Number(isNamedQaField(left)) ||
+      left.name.localeCompare(right.name));
+  const qaCatalogEntry = fields.find((field) => field.id === selectedQa);
+  if (selectedQa && qaCatalogEntry && (!isNumericField(qaCatalogEntry) || isStoryPointsField(qaCatalogEntry))) {
+    throw new JiraError('Выбери отдельное числовое поле QA Points.', 400);
+  }
+  const storyFields = selectedStory ? [selectedStory] : storyPointsFields.map((field) => field.id);
+  const namedQaFields = qaPointsFields.filter(isNamedQaField);
+  const qaFields = selectedQa ? [selectedQa] : namedQaFields.length === 1 ? [namedQaFields[0]!.id] : [];
+  return { storyFields, qaFields, storyPointsFields, qaPointsFields };
+}
+
+function fieldNumber(fields: JsonObject, ids: string[]): number | undefined {
+  return ids.map((id) => fields[id]).find((value): value is number => typeof value === 'number' && Number.isFinite(value));
+}
+
+function historicalIssue(
+  fields: JsonObject, histories: unknown[], cutoff: number, story: string | undefined, qa: string | undefined,
+  catalog: JsonObject[], edition: JiraEdition,
+) {
+  const estimate = (field: string | undefined) => field && Object.hasOwn(fields, field)
+    ? fields[field] === null ? 0 : fieldNumber(fields, [field]) : undefined;
+  const hasName = (change: JsonObject, fieldId: string | undefined) => {
+    if (!fieldId) return false;
+    if (change.fieldId !== undefined) return change.fieldId === fieldId;
+    const name = string(change.field)?.toLowerCase();
+    if (!name) return false;
+    const matching = catalog.filter((field) => string(field.name)?.toLowerCase() === name);
+    return matching.length === 1 && matching[0]?.id === fieldId;
+  };
+  const previousNumber = (change: JsonObject) => {
+    const previous = change.fromString ?? change.from;
+    if (previous == null) return Object.hasOwn(change, 'from') || Object.hasOwn(change, 'fromString') ? 0 : undefined;
+    if ((typeof previous === 'number' || (typeof previous === 'string' && previous.trim())) && Number.isFinite(Number(previous))) {
+      return Number(previous);
+    }
+    return undefined;
+  };
+  const assignee = record(fields.assignee);
+  const id = userIdentity(assignee, edition);
+  const state = {
+    status: numericId(record(fields.status).id),
+    story: estimate(story),
+    qa: estimate(qa),
+    person: id ? { id, name: string(assignee.displayName) ?? id } : fields.assignee === null ? null : undefined,
+  };
+  const entries = histories.map(record).map((history) => ({
+    items: history.items, date: Date.parse(string(history.created) ?? ''), id: numericId(history.id),
+  }));
+  if (entries.some((entry) => !Number.isFinite(entry.date) || !Array.isArray(entry.items))) return undefined;
+  entries.sort((a, b) => b.date - a.date || (b.id ?? '').localeCompare(a.id ?? '', 'en', { numeric: true }));
+  for (const { date, items } of entries) {
+    if (date <= cutoff) break;
+    for (const change of list(items).map(record)) {
+      const field = string(change.field)?.toLowerCase();
+      if (change.fieldId === 'status' || (!change.fieldId && field === 'status')) state.status = numericId(change.from);
+      else if (change.fieldId === 'assignee' || (!change.fieldId && field === 'assignee')) {
+        const previousId = string(change.from);
+        state.person = previousId ? { id: previousId, name: string(change.fromString) ?? previousId }
+          : change.from === null && change.fromString == null ? null : undefined;
+      } else if (hasName(change, story)) state.story = previousNumber(change);
+      else if (hasName(change, qa)) state.qa = previousNumber(change);
+    }
+  }
+  return state;
 }
 
 function isHierarchyField(field: JsonObject): boolean {
@@ -1138,26 +1679,37 @@ function toSprint(value: unknown): Array<{ name: string; sprint?: JiraSprint }> 
   let name = string(row.name) ?? string(value);
   let state = string(row.state)?.toLowerCase();
   let startDate = string(row.startDate);
+  let endDate = string(row.endDate);
+  let completeDate = string(row.completeDate);
+  const originBoardId = numericId(row.originBoardId);
+  const goal = string(row.goal);
   if (typeof value === 'string' && /(?:^|\.)Sprint@[^[]+\[/.test(value)) {
     id = /(?:\[|,)id=(\d+)(?=,|\])/.exec(value)?.[1];
     name = /(?:\[|,)name=(.*?)(?=,(?:goal|startDate|endDate|completeDate|activatedDate|sequence|sprintVersion|autoStartStop|rapidViewId|state|id)=|\]$)/.exec(value)?.[1];
     state = /(?:\[|,)state=(\w+)(?=,|\])/.exec(value)?.[1]?.toLowerCase();
     startDate = /(?:\[|,)startDate=([^,\]]+)/.exec(value)?.[1];
+    endDate = /(?:\[|,)endDate=([^,\]]+)/.exec(value)?.[1];
+    completeDate = /(?:\[|,)completeDate=([^,\]]+)/.exec(value)?.[1];
   }
   const label = name?.trim() || id;
   if (!label) return [];
   const status = state === 'future' || state === 'active' || state === 'closed' ? state : undefined;
-  const dated = startDate && Number.isFinite(Date.parse(startDate)) ? { startDate } : {};
-  return [{ name: label, sprint: id ? { id, name: label, state: status, ...dated } : undefined }];
+  return [{ name: label, sprint: id ? {
+    id, name: label, state: status,
+    ...(startDate && Number.isFinite(Date.parse(startDate)) ? { startDate } : {}),
+    ...(endDate && Number.isFinite(Date.parse(endDate)) ? { endDate } : {}),
+    ...(completeDate && Number.isFinite(Date.parse(completeDate)) ? { completeDate } : {}),
+    ...(goal ? { goal } : {}),
+    ...(originBoardId ? { originBoardId } : {}),
+  } : undefined }];
 }
 
 function mergeSprint(sprint: JiraSprint, known?: JiraSprint): JiraSprint {
-  const startDate = sprint.startDate ?? known?.startDate;
   return {
-    id: sprint.id,
+    ...known,
+    ...sprint,
     name: known && sprint.name === sprint.id ? known.name : sprint.name,
     state: sprint.state ?? known?.state,
-    ...(startDate ? { startDate } : {}),
   };
 }
 

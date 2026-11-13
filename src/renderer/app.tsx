@@ -1,8 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
 import { ReactFlowProvider, useReactFlow } from '@xyflow/react';
 import {
-  ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronDown, CircleAlert, CircleDot, Crosshair, Download, FileText,
-  GitBranch, GitMerge, Layers3, LayoutGrid, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, Trash2, X,
+  ArrowDown, ArrowRight, ArrowUpRight, CalendarDays, Check, ChevronDown, CircleAlert, CircleDot, Crosshair, Download, FileText,
+  EyeOff, GitBranch, GitMerge, Layers3, LayoutGrid, Link2, LoaderCircle, LogOut, PanelLeft, PanelRight, Pencil, Plus, RefreshCw, RotateCcw, Trash2, X,
 } from 'lucide-react';
 import type { JiraConnection, JiraEdge, JiraEdition, JiraGraph, JiraGraphNote, JiraIssue, JiraIssueInput, JiraLinkInput, JiraLogin } from '../shared/contracts';
 import { defaultAnalysisSettings } from './analysis-settings';
@@ -20,11 +20,12 @@ import { localizeMessage, usePreferences } from './i18n';
 import { PanelSplitter } from './panel-splitter';
 import { PersonAvatar, ProjectTeam, useCurrentAvatar, useGraphAvatars, useProjectTeam } from './project-team';
 import { SettingsButton } from './settings';
+import { readSprintDraftState, saveSprintDraftState, type SprintDraftState } from './sprint-draft-state';
 import { defaultCardFields, GraphViewControls, type FocusMode } from './view-controls';
 import { RefreshMenu, SavedFilters } from './workspace-controls';
 import {
   clearWorkspace, moveWorkspaceTab, readSavedFilters, readWorkspace, saveFilters, saveWorkspace, setWorkspaceTabPinned, workspaceScope,
-  type AppliedQuery, type LocalStore, type QueryDraft, type RefreshMinutes, type SavedFilter, type StoredViewport,
+  type AppliedQuery, type GraphArrangement, type LocalStore, type QueryDraft, type RefreshMinutes, type SavedFilter, type StoredViewport,
   type TabSnapshot, type WorkspaceTab,
 } from './workspace-state';
 import { graphPanelId, graphTabId, WorkspaceTabs } from './workspace-tabs';
@@ -33,6 +34,7 @@ const emptyGraph: JiraGraph = { issues: [], edges: [], linkTypes: [], storyPoint
 const demoQuery = 'project in (MIG, OPS) ORDER BY key ASC';
 const DescriptionDialog = lazy(() => import('./description-dialog'));
 const AnalysisPanel = lazy(() => import('./analysis-panel').then(({ AnalysisPanel }) => ({ default: AnalysisPanel })));
+const SprintDraftPanel = lazy(() => import('./sprint-draft-panel').then(({ SprintDraftPanel }) => ({ default: SprintDraftPanel })));
 
 type Notice = { text: string; error?: boolean; retry?: JiraLinkInput; automatic?: boolean };
 type Modal = { kind: 'create'; source?: JiraIssue } |
@@ -68,6 +70,8 @@ function restrictGraph(graph: JiraGraph, keys: ReadonlySet<string>, retainOutsid
 
 const initialTabs: WorkspaceTab[] = [{ id: 1 }];
 const noSprintIds: string[] = [];
+const emptyPositions: Record<string, GraphPosition> = {};
+const emptyIssueKeys: string[] = [];
 const storage: LocalStore = {
   getItem: (key) => window.localStorage.getItem(key),
   setItem: (key, value) => window.localStorage.setItem(key, value),
@@ -90,6 +94,14 @@ export function App() {
   const [restoring, setRestoring] = useState(true);
   const [connectionDialog, setConnectionDialog] = useState(false);
   const [sessionNotice, setSessionNotice] = useState<Notice>();
+  const [sprintDraftOpen, setSprintDraftOpen] = useState(false);
+  const [sprintDraftBusy, setSprintDraftBusy] = useState(false);
+  const [draftStorageFailed, setDraftStorageFailed] = useState(false);
+  const [sprintDraft, setSprintDraft] = useState(() => readSprintDraftState(storage, 'demo'));
+  const [sprintRevision, setSprintRevision] = useState(0);
+  const activeWorkspace = tabs.find(({ id }) => id === activeTab);
+  const sprintProject = activeWorkspace?.state?.draft?.projectKey || activeWorkspace?.project;
+  const sprintDemoGraph = useMemo(() => makeDemoGraph(t), [t]);
 
   useEffect(() => {
     let mounted = true;
@@ -126,6 +138,8 @@ export function App() {
     setTabs(workspace.tabs);
     setActiveTab(workspace.activeTab);
     setSavedFilters(readSavedFilters(storage, nextScope));
+    setSprintDraft(readSprintDraftState(storage, nextScope));
+    setDraftStorageFailed(false);
     nextTabId.current = Math.max(...workspace.tabs.map(({ id }) => id)) + 1;
   }
 
@@ -165,6 +179,7 @@ export function App() {
     try {
       await request('disconnect', null);
       setConnection(undefined);
+      setSprintDraftOpen(false);
       openWorkspace('demo');
       setSessionNotice(undefined);
     } catch (cause) {
@@ -172,6 +187,11 @@ export function App() {
     } finally {
       setDisconnecting(false);
     }
+  }
+
+  function changeSprintDraft(next: SprintDraftState) {
+    setSprintDraft(next);
+    setDraftStorageFailed(!saveSprintDraftState(storage, scope, next));
   }
 
   function openTab() {
@@ -197,6 +217,25 @@ export function App() {
       setTabs((previous) => [...previous, tab]);
     }
     setActiveTab(id);
+    requestAnimationFrame(() => document.getElementById(graphTabId(id))?.focus());
+  }
+
+  function openDraftGraph(keys: readonly string[], title: string) {
+    const selected = [...new Set(keys.filter((key) => issueKey.test(key)))];
+    if (!selected.length || selected.length > 250 || restoring || disconnecting || sprintDraftBusy) return;
+    const jql = `key in (${selected.map((key) => `"${key}"`).join(', ')})`;
+    if (jql.length > 8_192) return;
+    const id = nextTabId.current++;
+    setTabs((previous) => [...previous, {
+      id, query: jql, label: title.slice(0, 120),
+      state: {
+        draft: { baseJql: jql, projectKey: '', depth: 0, facets: {}, storyField: '' },
+        applied: { jql, depth: 0, storyField: '', sprintIds: [] },
+        groupMode: 'none',
+      },
+    }]);
+    setActiveTab(id);
+    setSprintDraftOpen(false);
     requestAnimationFrame(() => document.getElementById(graphTabId(id))?.focus());
   }
 
@@ -230,7 +269,14 @@ export function App() {
         onPin={(id, pinned) => setTabs((previous) => setWorkspaceTabPinned(previous, id, pinned))}
         onMove={(id, target, side) => setTabs((previous) => moveWorkspaceTab(previous, id, target, side))} />
       <div className="topbar-actions">
-        <SettingsButton restartBlocked={restoring || disconnecting || busyTabs.length > 0} />
+        <button type="button" className={`button ${sprintDraftOpen ? 'primary' : 'secondary'} sprint-draft-trigger`}
+          aria-pressed={sprintDraftOpen} aria-label={t('Спринт', 'Sprint')} title={t('Планирование спринта', 'Sprint planning')}
+          disabled={restoring || disconnecting || sprintDraftBusy || busyTabs.length > 0}
+          onClick={() => setSprintDraftOpen((previous) => !previous)}>
+          <CalendarDays size={16} aria-hidden="true" />
+          <span>{t('Спринт', 'Sprint')}</span>
+        </button>
+        <SettingsButton restartBlocked={restoring || disconnecting || sprintDraftBusy || busyTabs.length > 0} />
         <details className="view-menu workspace-menu">
           <summary aria-label={t('Рабочая область', 'Workspace')} title={t('Рабочая область', 'Workspace')}><LayoutGrid size={16} /></summary>
           <div>
@@ -249,7 +295,7 @@ export function App() {
           <button className="icon-button" title={window.jiraDag
             ? t('Отключить Jira и удалить сохранённый вход', 'Disconnect Jira and clear saved sign-in')
             : t('Отключить Jira', 'Disconnect Jira')} aria-label={t('Отключить Jira', 'Disconnect Jira')}
-            disabled={disconnecting || busyTabs.length > 0} onClick={() => void disconnect()}><LogOut size={17} /></button>
+            disabled={disconnecting || sprintDraftBusy || busyTabs.length > 0} onClick={() => void disconnect()}><LogOut size={17} /></button>
         </> : <>
           <span className="demo-pill"><span /> {t('Демо', 'Demo')}</span>
           <button className="button secondary" disabled={restoring} onClick={() => setConnectionDialog(true)}>
@@ -259,10 +305,11 @@ export function App() {
         </>}
       </div>
     </header>
-    <main className="workspace-deck">
+    <main className="workspace-deck" hidden={sprintDraftOpen} inert={sprintDraftOpen}>
       {tabs.map((tab) => <ReactFlowProvider key={`${scope}:${workspaceEpoch}:${tab.id}`}>
-        <GraphWorkspace tabId={tab.id} active={activeTab === tab.id} connection={connection} edition={edition}
+        <GraphWorkspace tabId={tab.id} active={activeTab === tab.id && !sprintDraftOpen} connection={connection} edition={edition}
           epicKey={tab.epicKey} onOpenEpic={openEpic}
+          sprintRevision={sprintRevision}
           initialState={tab.state} onSave={saveTab} savedFilters={savedFilters} onSavedFilters={changeSavedFilters}
           sessionBusy={restoring || disconnecting} sessionNotice={sessionNotice}
           onRequestConnection={() => setConnectionDialog(true)} onDismissSessionNotice={() => setSessionNotice(undefined)}
@@ -272,13 +319,26 @@ export function App() {
               epicKey: epic, epicTitle: epic ? item.epicTitle : undefined } : item))} />
       </ReactFlowProvider>)}
     </main>
+    {sprintDraftOpen && <main className="sprint-workspace">
+      {draftStorageFailed && <p className="sprint-storage-warning" role="alert">{t(
+        'Черновик изменён, но сохранение на этом устройстве не удалось.',
+        'The draft changed, but it could not be saved on this device.',
+      )}</p>}
+      <Suspense fallback={<div className="sprint-loading" role="status"><LoaderCircle className="spin" size={19} />
+        {t('Загружается планирование спринта…', 'Loading sprint planning…')}</div>}>
+        <SprintDraftPanel key={scope} graph={sprintDemoGraph} connected={Boolean(connection)} active
+          projectKey={sprintProject} state={sprintDraft} onChange={changeSprintDraft}
+          onClose={() => setSprintDraftOpen(false)} onBusyChange={setSprintDraftBusy}
+          onApplied={() => setSprintRevision((previous) => previous + 1)} onOpenGraph={connection ? openDraftGraph : undefined} />
+      </Suspense>
+    </main>}
     {connectionDialog && <ConnectionDialog onConnect={connect} onClose={() => setConnectionDialog(false)} />}
   </div>;
 }
 
 function GraphWorkspace({
   tabId, active, connection, edition, initialState, onSave, savedFilters, onSavedFilters, sessionBusy, sessionNotice,
-  onRequestConnection, onDismissSessionNotice, onBusyChange, onLoad, epicKey, onOpenEpic,
+  onRequestConnection, onDismissSessionNotice, onBusyChange, onLoad, epicKey, onOpenEpic, sprintRevision,
 }: {
   tabId: number;
   active: boolean;
@@ -296,6 +356,7 @@ function GraphWorkspace({
   onDismissSessionNotice(): void;
   onBusyChange(value: boolean): void;
   onLoad(query: string, project?: string, epic?: string): void;
+  sprintRevision: number;
 }) {
   const { language, t } = usePreferences();
   const formId = useId();
@@ -318,6 +379,7 @@ function GraphWorkspace({
   const [includedKeys, setIncludedKeys] = useState(initialState?.includedKeys ?? []);
   const [depth, setDepth] = useState(initialState?.draft?.depth ?? 0);
   const [storyField, setStoryField] = useState(initialState?.draft?.storyField ?? '');
+  const [qaField, setQaField] = useState(initialState?.draft?.qaField ?? '');
   const [filters, setFilters] = useState(initialState?.filters ?? emptyGraphFilters);
   const [groupMode, setGroupMode] = useState<GroupMode>(initialState?.groupMode ?? 'hierarchy');
   const [fields, setFields] = useState<CardFields>(initialState?.fields ?? defaultCardFields);
@@ -327,8 +389,24 @@ function GraphWorkspace({
   const [selectedKey, setSelectedKey] = useState(initialState ? initialState.selectedKey : connection ? undefined : 'MIG-27');
   const [selectedEdge, setSelectedEdge] = useState(initialState?.selectedEdge);
   const [layoutGeneration, setLayoutGeneration] = useState(0);
-  const [manualPositions, setManualPositions] = useState<Record<string, GraphPosition>>(initialState?.manualPositions ?? {});
-  const [viewport, setViewport] = useState<StoredViewport | undefined>(initialState?.viewport);
+  const arrangementKey = JSON.stringify([applied?.jql ?? '', applied?.depth ?? 0, groupMode, direction]);
+  const [arrangements, setArrangements] = useState<Record<string, GraphArrangement>>(() => initialState?.arrangements ??
+    (initialState?.viewport || initialState?.hiddenIssueKeys?.length || Object.keys(initialState?.manualPositions ?? {}).length
+      ? { [arrangementKey]: { positions: initialState?.manualPositions ?? {}, viewport: initialState?.viewport,
+        hiddenIssueKeys: initialState?.hiddenIssueKeys } } : {}));
+  const manualPositions = arrangements[arrangementKey]?.positions ?? emptyPositions;
+  const viewport = arrangements[arrangementKey]?.viewport;
+  const hiddenIssueKeys = arrangements[arrangementKey]?.hiddenIssueKeys ?? emptyIssueKeys;
+  function updateArrangement(change: (current: GraphArrangement) => GraphArrangement) {
+    setArrangements((previous) => {
+      const current = previous[arrangementKey] ?? { positions: emptyPositions };
+      const next = change(current);
+      if (next === current) return previous;
+      return Object.fromEntries([
+        ...Object.entries(previous).filter(([key]) => key !== arrangementKey).slice(-11), [arrangementKey, next],
+      ]);
+    });
+  }
   const [autoRefresh, setAutoRefresh] = useState(initialState?.autoRefresh ?? false);
   const [refreshMinutes, setRefreshMinutes] = useState<RefreshMinutes>(initialState?.refreshMinutes ?? 5);
   const [analysis, setAnalysis] = useState(initialState?.analysis ?? defaultAnalysisSettings);
@@ -338,6 +416,7 @@ function GraphWorkspace({
   const finishAnalysisNavigation = useCallback((keys: readonly string[]) =>
     setAnalysisNavigation((current) => current === keys ? undefined : current), []);
   const needsRestore = useRef(Boolean(initialState?.applied || initialState?.includedKeys?.length));
+  const seenSprintRevision = useRef(sprintRevision);
   const loadingQuery = useRef(false);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const busy = sessionBusy || workspaceBusy;
@@ -366,13 +445,13 @@ function GraphWorkspace({
     id: connection.profileId ?? `name:${connection.displayName.trim()}`, name: connection.displayName,
   } : undefined;
   const visibleNotice = notice ?? sessionNotice;
-  const draft = useMemo<QueryDraft>(() => ({ baseJql, projectKey, facets: jiraFacets, depth, storyField }),
-    [baseJql, projectKey, jiraFacets, depth, storyField]);
+  const draft = useMemo<QueryDraft>(() => ({ baseJql, projectKey, facets: jiraFacets, depth, storyField, ...(qaField ? { qaField } : {}) }),
+    [baseJql, projectKey, jiraFacets, depth, storyField, qaField]);
   const snapshot = useMemo<TabSnapshot>(() => ({
     draft, applied, includedKeys, filters, groupMode, fields, showEdgePoints, focusMode, direction, selectedKey, selectedEdge,
-    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes, analysis, analysisHighlight,
+    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, arrangements, hiddenIssueKeys, autoRefresh, refreshMinutes, analysis, analysisHighlight,
   }), [draft, applied, includedKeys, filters, groupMode, fields, showEdgePoints, focusMode, direction, selectedKey, selectedEdge,
-    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, autoRefresh, refreshMinutes, analysis, analysisHighlight]);
+    leftWidth, rightWidth, leftHidden, rightHidden, viewport, manualPositions, arrangements, hiddenIssueKeys, autoRefresh, refreshMinutes, analysis, analysisHighlight]);
   useEffect(() => onSave(tabId, snapshot), [onSave, tabId, snapshot]);
 
   const filterStoryField = storyField || (graph.storyPointsFields.length === 1 ? graph.storyPointsFields[0].id : undefined);
@@ -394,7 +473,12 @@ function GraphWorkspace({
     if (!analysisReveal) return analysisKeys;
     return new Set([...(analysisKeys ?? []), analysisReveal]);
   }, [analysisKeys, analysisReveal]);
-  const filtered = useMemo(() => filterGraph(graph, visibility, alwaysVisible), [graph, visibility, alwaysVisible]);
+  const filtered = useMemo(() => {
+    const visible = filterGraph(graph, visibility, alwaysVisible);
+    if (!hiddenIssueKeys.length) return visible;
+    const hidden = new Set(hiddenIssueKeys);
+    return restrictGraph(visible, new Set(visible.issues.filter(({ key }) => !hidden.has(key) || alwaysVisible?.has(key)).map(({ key }) => key)));
+  }, [graph, visibility, alwaysVisible, hiddenIssueKeys]);
   const highlighted = useMemo(() => highlightedIssueKeys(graph, { search, facets }), [graph, search, facets]);
   const showLinks = edgeTypes?.length !== 0;
   const shown = useMemo(() => {
@@ -478,15 +562,14 @@ function GraphWorkspace({
     setJiraFacets(next.facets);
     setDepth(next.depth);
     setStoryField(next.storyField);
+    setQaField(next.qaField ?? '');
   }
   function resetLayout() {
-    setManualPositions({});
-    setViewport(undefined);
+    updateArrangement((current) => ({ ...current, positions: emptyPositions, viewport: undefined }));
     setLayoutGeneration((previous) => previous + 1);
   }
   function changeLayout() {
     setDirection((previous) => previous === 'LR' ? 'TB' : 'LR');
-    resetLayout();
   }
 
   function load(event?: FormEvent) {
@@ -495,10 +578,10 @@ function GraphWorkspace({
     if (!query) return;
     const next: AppliedQuery = {
       jql: issueKey.test(query) ? `key = "${query.toUpperCase()}"` : query,
-      depth, storyField: storyField.trim(), sprintIds: noSprintIds,
+      depth, storyField: storyField.trim(), sprintIds: noSprintIds, ...(qaField ? { qaField } : {}),
       ...(epicKey && query === epicJql(epicKey, edition) ? { epicKey } : {}),
     };
-    const replace = !applied || next.jql !== applied.jql || next.depth !== applied.depth || next.storyField !== applied.storyField;
+    const replace = !applied || next.jql !== applied.jql || next.depth !== applied.depth;
     return loadQuery(next, { replace, draft });
   }
 
@@ -513,7 +596,12 @@ function GraphWorkspace({
     }
     try {
       const queryDepth = query?.depth ?? depth;
-      const graphOptions = { depth: queryDepth, storyPointsField: (query?.storyField ?? storyField.trim()) || undefined };
+      const qaPointsField = query ? query.qaField : qaField;
+      const graphOptions = {
+        depth: queryDepth,
+        storyPointsField: (query ? query.storyField : storyField.trim()) || undefined,
+        ...(qaPointsField ? { qaPointsField } : {}),
+      };
       const additional = pins.length
         ? request('loadGraph', { ...graphOptions, depth: Math.max(1, queryDepth), jql: `key in (${pins.map((key) => `"${key}"`).join(', ')})` }).catch((cause: unknown) => {
           if (!query) throw cause;
@@ -541,7 +629,6 @@ function GraphWorkspace({
       if (options.replace) {
         clearAnalysisHighlight();
         setAnalysisReveal(undefined);
-        resetLayout();
       }
       if (selectedKey && !result.issues.some(({ key }) => key === selectedKey)) selectIssue();
       if (selectedEdge && !result.edges.some(({ id }) => id === selectedEdge)) setSelectedEdge(undefined);
@@ -555,10 +642,11 @@ function GraphWorkspace({
 
   const restoreGraph = useEffectEvent(() => void loadQuery(applied));
   useEffect(() => {
-    if (!active || !connection || busy || !needsRestore.current) return;
+    if (!active || !connection || busy || (!needsRestore.current && seenSprintRevision.current === sprintRevision)) return;
     needsRestore.current = false;
+    seenSprintRevision.current = sprintRevision;
     restoreGraph();
-  }, [active, connection, busy]);
+  }, [active, connection, busy, sprintRevision]);
 
   const refreshGraph = useEffectEvent(() => {
     if (document.visibilityState === 'visible') void loadQuery(applied, { automatic: true });
@@ -573,6 +661,9 @@ function GraphWorkspace({
     const key = raw.trim().toUpperCase();
     if (!connection || busy) return;
     if (!issueKey.test(key)) throw new Error(t('Введи ключ Jira, например PROJ-123.', 'Enter a Jira key such as PROJ-123.'));
+    updateArrangement((current) => current.hiddenIssueKeys?.includes(key) ? {
+      ...current, hiddenIssueKeys: current.hiddenIssueKeys.filter((item) => item !== key),
+    } : current);
     if (graph.issues.some((issue) => issue.key === key)) {
       selectIssue(key);
       setRightHidden(false);
@@ -584,7 +675,10 @@ function GraphWorkspace({
     }
     setBusy(true);
     try {
-      const result = await request('loadGraph', { jql: `key = "${key}"`, depth: Math.max(1, depth), storyPointsField: storyField || undefined });
+      const result = await request('loadGraph', {
+        jql: `key = "${key}"`, depth: Math.max(1, depth), storyPointsField: storyField || undefined,
+        ...(qaField ? { qaPointsField: qaField } : {}),
+      });
       if (!result.issues.some((issue) => issue.key === key)) throw new Error(t('Задача не найдена или недоступна.', 'The issue was not found or is unavailable.'));
       setGraph((previous) => mergeGraphs(previous, depth === 0 ? restrictGraph(result, new Set([...previous.issues.map((issue) => issue.key), key]), true) : result));
       setIncludedKeys((previous) => previous.includes(key) ? previous : [...previous, key]);
@@ -721,6 +815,12 @@ function GraphWorkspace({
                   {graph.storyPointsFields.map(({ id, name }) => <option value={id} key={id}>{name} ({id})</option>)}
                 </select>
               </label>}
+              {Boolean(graph.qaPointsFields?.length) && <label>{t('Поле оценки QA', 'QA estimation field')}
+                <select value={qaField} onChange={(event) => setQaField(event.target.value)}>
+                  <option value="">{t('Автоматически', 'Automatic')}</option>
+                  {graph.qaPointsFields?.map(({ id, name }) => <option value={id} key={id}>{name}</option>)}
+                </select>
+              </label>}
               <button type={connection ? 'submit' : 'button'} className="button primary full" disabled={busy || (Boolean(connection) && !jql.trim())}
                 onClick={connection ? undefined : onRequestConnection}>
                 {busy ? <LoaderCircle size={15} className="spin" /> : <GitBranch size={15} />}
@@ -749,6 +849,14 @@ function GraphWorkspace({
               </div>
             </div>
             <div className="graph-actions">
+              <button className="icon-button outline" type="button"
+                title={t('Сбросить позиции карточек', 'Reset card positions')}
+                aria-label={t('Сбросить позиции карточек', 'Reset card positions')}
+                disabled={!Object.keys(manualPositions).length} onClick={resetLayout}><RotateCcw size={16} /></button>
+              {hiddenIssueKeys.length > 0 && <button type="button" className="button secondary"
+                onClick={() => updateArrangement((current) => ({ ...current, hiddenIssueKeys: [] }))}>
+                {t(`Вернуть скрытые (${hiddenIssueKeys.length})`, `Show hidden (${hiddenIssueKeys.length})`)}
+              </button>}
               <button className="icon-button outline" title={direction === 'LR'
                 ? t('Раскладка сверху вниз', 'Top-to-bottom layout') : t('Раскладка слева направо', 'Left-to-right layout')}
                 aria-label={t('Изменить направление раскладки', 'Change layout direction')} onClick={changeLayout}>
@@ -777,10 +885,8 @@ function GraphWorkspace({
                 aria-expanded={!rightHidden} onClick={() => setRightHidden(!rightHidden)}><PanelRight size={17} /></button>}
             </div>
           </div>
-          <GraphViewControls groupMode={groupMode} onGroupMode={(mode) => {
-            setGroupMode(mode);
-            resetLayout();
-          }} fields={fields} onFields={setFields} showEdgePoints={showEdgePoints} onShowEdgePoints={setShowEdgePoints}
+          <GraphViewControls groupMode={groupMode} onGroupMode={setGroupMode}
+            fields={fields} onFields={setFields} showEdgePoints={showEdgePoints} onShowEdgePoints={setShowEdgePoints}
           graph={graph} showLinks={showLinks} linkTypes={edgeTypes}
           onLinkTypes={(value) => {
             setFilters((previous) => ({ ...previous, edgeTypes: value }));
@@ -814,11 +920,12 @@ function GraphWorkspace({
               )}</span>}
             </details>}
           </div>
-          {active && <GraphCanvas key={layoutGeneration} flowId={`graph-canvas-${tabId}`} graph={shown} layoutGraph={layoutGraph} basis={graph} cycleIds={cycleIds}
+          {active && <GraphCanvas key={`${arrangementKey}:${layoutGeneration}`} flowId={`graph-canvas-${tabId}`} graph={shown} layoutGraph={layoutGraph} basis={graph} cycleIds={cycleIds}
             direction={direction} groupMode={groupMode}
             fields={fields} showLinks={showLinks} showEdgePoints={showEdgePoints} connected={Boolean(connection)} notesByIssue={notesByIssue}
             manualPositions={manualPositions} viewport={viewport}
-            onManualPositionsChange={setManualPositions} onViewportChange={setViewport}
+            onManualPositionsChange={(positions) => updateArrangement((current) => ({ ...current, positions }))}
+            onViewportChange={(viewport) => updateArrangement((current) => ({ ...current, viewport }))}
             preferredSprintIds={loadedSprintIds} highlightedKeys={highlighted}
             analysisKeys={analysisKeys} analysisNavigation={analysisNavigation} onAnalysisNavigationEnd={finishAnalysisNavigation}
             selectedKey={selected?.key} selectedEdge={edge?.id} editable={Boolean(connection && !busy && graph.linkTypes.length)}
@@ -846,6 +953,14 @@ function GraphWorkspace({
           hidden={rightHidden} busy={busy} noteFocus={noteFocus?.key === selected.key ? noteFocus.mode : undefined} onNotes={updateNotes}
           onClose={() => selectIssue()} onSelect={selectIssue} onAdd={() => addTask(selected)} onEdit={() => editIssue(selected)}
           onDescription={() => setModal({ kind: 'description', issue: selected })}
+          onHide={() => {
+            updateArrangement((current) => current.hiddenIssueKeys?.includes(selected.key) ? current : {
+              ...current, hiddenIssueKeys: [...(current.hiddenIssueKeys ?? []), selected.key],
+            });
+            clearAnalysisHighlight();
+            setAnalysisReveal(undefined);
+            selectIssue();
+          }}
           onOpen={() => launchIssue(selected)} />}
         {edge && <aside className="inspector" hidden={rightHidden} aria-label={t('Связь', 'Link')}>
           <div className="inspector-heading"><h2><GitBranch size={16} /> {t('Связь', 'Link')}</h2>
@@ -905,11 +1020,11 @@ function GraphWorkspace({
   );
 }
 
-function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarSrc, noteFocus, onNotes, onClose, onSelect, onAdd, onEdit, onDescription, onOpen }: {
+function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarSrc, noteFocus, onNotes, onClose, onSelect, onAdd, onEdit, onDescription, onOpen, onHide }: {
   issue: JiraIssue; graph: JiraGraph; connected: boolean; active: boolean; hidden: boolean; busy: boolean;
   avatarSrc?: string;
   noteFocus?: NoteFocus; onNotes(key: string, notes: readonly JiraGraphNote[]): void;
-  onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onDescription(): void; onOpen(): void;
+  onClose(): void; onSelect(key: string): void; onAdd(): void; onEdit(): void; onDescription(): void; onOpen(): void; onHide(): void;
 }) {
   const { t } = usePreferences();
   const { assignee, key } = issue;
@@ -935,12 +1050,17 @@ function IssueInspector({ issue, graph, connected, active, hidden, busy, avatarS
       <div className="inspector-metadata">
         <span className={`status ${statusTone(issue)}`}><CircleDot size={11} /> {issue.status}</span>
         {issue.storyPoints !== undefined && <span className="points">{issue.storyPoints} SP</span>}
+        {issue.qaPoints !== undefined && <span className="points qa-points"
+          title={t('Оценка тестирования', 'QA estimate')}>{issue.qaPoints} QA</span>}
       </div>
       {assignee && <div className="inspector-assignee" aria-label={t(`Исполнитель: ${assignee}`, `Assignee: ${assignee}`)}>
         {avatarUrl ? <img src={avatarUrl} alt="" /> : <span aria-hidden="true">{assigneeInitials(assignee)}</span>}
         <div><small>{t('Исполнитель', 'Assignee')}</small>{assignee}</div>
       </div>}
       {!!issue.labels?.length && <p className="assignee">{issue.labels.map((label) => `#${label}`).join(' ')}</p>}
+      <button type="button" className="button secondary full issue-description-button" onClick={onHide}>
+        <EyeOff size={15} /> {t('Скрыть на графе', 'Hide from graph')}
+      </button>
       {(issue.descriptionMarkdown || issue.description) && <button type="button" className="button secondary full issue-description-button"
         onClick={onDescription}><FileText size={15} /> {t('Открыть описание', 'View description')}</button>}
       <section className="inspector-block">

@@ -84,6 +84,8 @@ export function mergeGraphs(current: JiraGraph, incoming: JiraGraph): JiraGraph 
     edges: [...new Map([...retained, ...incoming.edges].map((edge) => [edge.id, edge])).values()],
     linkTypes: [...new Map([...current.linkTypes, ...incoming.linkTypes].map((type) => [type.id, type])).values()],
     storyPointsFields: [...new Map([...current.storyPointsFields, ...incoming.storyPointsFields].map((field) => [field.id, field])).values()],
+    qaPointsFields: [...new Map([...(current.qaPointsFields ?? []), ...(incoming.qaPointsFields ?? [])]
+      .map((field) => [field.id, field])).values()],
     warnings: [...new Set([...current.warnings, ...incoming.warnings])],
   };
 }

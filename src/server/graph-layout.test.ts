@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { JiraEdge, JiraGraph, JiraIssue } from '../shared/contracts.js';
 import {
-  connectedParts, cyclicBlockingEdges, downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition,
+  connectedParts, cyclicBlockingEdges, downstreamPoints, fitMovedZones, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition,
   type GraphZone, type LayoutLabels,
 } from '../renderer/graph-layout.js';
 import { CARD_HEIGHT, CARD_WIDTH, type GraphPosition } from '../renderer/graph-model.js';
@@ -105,6 +105,27 @@ test('a parent and its subtasks stay inside a nested zone within the epic and sh
   const ungrouped = layoutWorkspace(data, 'LR', 'none', labels, CARD_HEIGHT);
   position(ungrouped, 'APP-1');
   assert.deepEqual(ungrouped.visibleEdges, data.edges);
+});
+
+test('moving a grouped card keeps its own nested zones and note around it', () => {
+  const data = graph([
+    issue('APP-1', { isEpic: true }),
+    issue('APP-2', { epicKey: 'APP-1' }),
+    issue('APP-3', { parentKey: 'APP-2', epicKey: 'APP-1', isSubtask: true }),
+    issue('OTHER-1', { isEpic: true }),
+    issue('OTHER-2', { epicKey: 'OTHER-1' }),
+  ], [parent('APP-2', 'APP-3')]);
+  const layout = layoutWorkspace(data, 'LR', 'hierarchy', labels, CARD_HEIGHT);
+  const moved = { x: -160, y: -220 };
+  const note = notePosition({ ...moved, width: CARD_WIDTH, height: CARD_HEIGHT }, 'LR');
+  const expanded = fitMovedZones(layout.zones, { 'APP-3': moved }, CARD_HEIGHT, 'LR', new Set(['APP-3']));
+  const containing = expanded.filter(({ members }) => members.includes('APP-3'));
+  assert.equal(containing.length, 2);
+  for (const zone of containing) {
+    assert.ok(contains(zone, moved, CARD_WIDTH, CARD_HEIGHT));
+    assert.ok(contains(zone, note, NOTE_WIDTH, NOTE_HEIGHT));
+  }
+  assert.deepEqual(expanded.find(({ epicKey }) => epicKey === 'OTHER-1'), layout.zones.find(({ epicKey }) => epicKey === 'OTHER-1'));
 });
 
 test('an isolated epic has a selectable zone with finite dimensions', () => {

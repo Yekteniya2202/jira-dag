@@ -27,6 +27,7 @@ export interface GraphQuery {
   jql: string;
   depth: number;
   storyPointsField?: string;
+  qaPointsField?: string;
   epicKey?: string;
 }
 
@@ -35,6 +36,71 @@ export interface JiraSprint {
   name: string;
   state?: 'future' | 'active' | 'closed';
   startDate?: string;
+  endDate?: string;
+  completeDate?: string;
+  goal?: string;
+  originBoardId?: string;
+}
+
+export interface JiraScrumBoard {
+  id: string;
+  name: string;
+}
+
+export interface JiraSprintScope {
+  boardId: string;
+  sprintId: string;
+}
+
+export interface JiraSprintEstimateFields {
+  storyPointsField?: string;
+  qaPointsField?: string;
+}
+
+export interface JiraSprintPlanQuery extends JiraSprintScope, JiraSprintEstimateFields {
+  backlogJql?: string;
+}
+
+export interface JiraSprintPlan {
+  sprint: JiraSprint;
+  graph: JiraGraph;
+  sprintIssueKeys: string[];
+  backlogIssueKeys: string[];
+  membershipComplete: boolean;
+  backlogComplete: boolean;
+  storyPointsField?: string;
+  qaPointsField?: string;
+}
+
+export interface JiraSprintVelocitySample {
+  sprint: JiraSprint;
+  completedStoryPoints?: number;
+  completedQaPoints?: number;
+  completedIssues: number;
+  evaluatedIssues: number;
+  totalIssues: number;
+  complete: boolean;
+  storyPointsComplete?: boolean;
+  qaPointsComplete?: boolean;
+  peopleComplete?: boolean;
+  people?: { id: string; name: string; storyPoints: number; qaPoints?: number; completedIssues: number }[];
+}
+
+export interface JiraSprintVelocity {
+  samples: JiraSprintVelocitySample[];
+  warnings: string[];
+}
+
+export interface JiraSprintMembershipInput extends JiraSprintScope {
+  expectedIssueKeys: string[];
+  addIssueKeys: string[];
+  removeIssueKeys: string[];
+}
+
+export interface JiraSprintMembershipResult {
+  added: string[];
+  removed: string[];
+  failed: { key: string; operation: 'add' | 'remove'; reason: string }[];
 }
 
 export interface JiraIssue {
@@ -47,6 +113,7 @@ export interface JiraIssue {
   assigneeId?: string;
   project?: string;
   storyPoints?: number;
+  qaPoints?: number;
   description?: string;
   descriptionMarkdown?: string;
   descriptionReadOnly?: true;
@@ -150,6 +217,7 @@ export interface JiraGraph {
   edges: JiraEdge[];
   linkTypes: JiraLinkType[];
   storyPointsFields: JiraOption[];
+  qaPointsFields?: JiraOption[];
   warnings: string[];
 }
 
@@ -186,6 +254,11 @@ export interface ApiMethods {
   getConnection: { input: null; output: RestoredJiraConnection | null };
   disconnect: { input: null; output: null };
   loadGraph: { input: GraphQuery; output: JiraGraph };
+  listScrumBoards: { input: { project: string }; output: JiraScrumBoard[] };
+  listBoardSprints: { input: { boardId: string }; output: JiraSprint[] };
+  loadSprintPlan: { input: JiraSprintPlanQuery; output: JiraSprintPlan };
+  loadSprintVelocity: { input: { boardId: string } & JiraSprintEstimateFields; output: JiraSprintVelocity };
+  applySprintMembership: { input: JiraSprintMembershipInput; output: JiraSprintMembershipResult };
   getCreateOptions: { input: { projectKey: string; issueTypeId?: string }; output: JiraCreateOptions };
   createIssue: { input: JiraIssueInput; output: JiraIssue };
   updateIssue: {

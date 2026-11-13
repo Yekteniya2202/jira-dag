@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { emptySprintDraftEntry, readSprintDraftState, saveSprintDraftState } from '../renderer/sprint-draft-state.js';
 import {
   clearWorkspace, moveWorkspaceTab, readSavedFilters, readWorkspace, saveFilters, saveWorkspace, setWorkspaceTabPinned, workspaceScope,
   type LocalStore, type QueryDraft, type TabSnapshot, type WorkspaceTab,
@@ -63,6 +64,28 @@ test('invalid local storage falls back to an empty workspace', () => {
   assert.ok(saveWorkspace(store, 'demo', { activeTab: 2, tabs: [{ id: 2 }] }));
   for (const key of values.keys()) store.setItem(key, '{');
   assert.deepEqual(readWorkspace(store, 'demo'), { activeTab: 1, tabs: [{ id: 1 }] });
+});
+
+test('a sprint draft and team survive restart only in their Jira profile', () => {
+  const { store } = memoryStore();
+  const scope = workspaceScope(connection, 'cloud');
+  assert.ok(saveSprintDraftState(store, scope, {
+    projectKey: 'APP', boardId: '8', sprintId: '12',
+    teams: { '8': [{ id: 'dev', name: 'Developer', roles: ['BE', 'SA'], capacity: 0 }] },
+    drafts: { '8:12': {
+      ...emptySprintDraftEntry, added: ['APP-7'], removed: ['APP-9'], epicPriorities: ['APP-6'],
+      goal: 'Release the migration', availability: { dev: 50 }, qaCapacity: 0,
+      overrides: { 'APP-7': { role: 'BE', qaRequired: false, qaEstimate: 0, qaAssigneeId: 'tester' } },
+    } },
+  }));
+  const restored = readSprintDraftState(store, scope);
+  assert.deepEqual(restored.teams['8'][0].roles, ['BE', 'SA']);
+  assert.equal(restored.teams['8'][0].capacity, 0);
+  assert.deepEqual(restored.drafts['8:12'].added, ['APP-7']);
+  assert.equal(restored.drafts['8:12'].overrides['APP-7'].qaRequired, false);
+  assert.equal(restored.drafts['8:12'].qaCapacity, 0);
+  assert.equal(restored.drafts['8:12'].availability.dev, 50);
+  assert.deepEqual(readSprintDraftState(store, 'demo').drafts, {});
 });
 
 test('pinning and moving tabs keeps the pinned group first and preserves snapshots', () => {

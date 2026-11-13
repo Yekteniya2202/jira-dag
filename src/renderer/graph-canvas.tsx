@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import type { JiraGraph, JiraGraphNote, JiraIssue } from '../shared/contracts';
 import { routeEdges, type RoutedEdge, type RouteObstacle } from './edge-routing';
-import { downstreamPoints, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
+import { downstreamPoints, fitMovedZones, layoutWorkspace, NOTE_HEIGHT, NOTE_WIDTH, notePosition, type GraphZone, type GroupMode } from './graph-layout';
 import { blockingEdges, CARD_HEIGHT, CARD_WIDTH, statusTone, tracePath, type Direction, type GraphPosition } from './graph-model';
 import { usePreferences } from './i18n';
 import { PersonAvatar } from './project-team';
@@ -18,6 +18,7 @@ import './graph-canvas.css';
 
 export interface CardFields {
   points: boolean;
+  qaPoints?: boolean;
   assignee: boolean;
   priority: boolean;
   labels: boolean;
@@ -127,6 +128,8 @@ function IssueCard({ data, selected }: NodeProps<Card>) {
       <div className="issue-card-meta">
         <span className={`status ${statusTone(issue)}`} title={issue.status}><CircleDot size={11} /> {issue.status}</span>
         {fields.points && issue.storyPoints !== undefined && <span className="points" title="Story points">{issue.storyPoints} SP</span>}
+        {fields.qaPoints !== false && issue.qaPoints !== undefined && <span className="points qa-points"
+          title={t('Оценка тестирования', 'QA estimate')}>{issue.qaPoints} QA</span>}
       </div>
       {assignee && <div className="issue-card-assignee" title={`${t('Исполнитель', 'Assignee')}: ${assignee}`}>
         <PersonAvatar name={assignee} src={avatar} /><span>{assignee}</span>
@@ -156,6 +159,7 @@ function GroupZone({ data: { zone, epic, onSelect, onOpen, onOpenEpic, onCreateR
   const key = zone.epicKey;
   const openEpic = key && onOpenEpic ? () => onOpenEpic(key, epic?.summary ?? (zone.title.slice(key.length + 3) || undefined)) : undefined;
   return <div className={`graph-zone ${zone.kind}${selected ? ' is-selected' : ''}`} data-export-zone={zone.id}
+    data-export-members={JSON.stringify(zone.members)}
     data-group-variant={zone.appearance?.variant} data-group-color={zone.appearance?.color} data-analysis-match={analysisMatch}>
     <div className="graph-zone-heading">
       {epic && onSelect
@@ -336,16 +340,17 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     upstream: tracePath(graph.edges, selectedKey, 'up'),
     downstream: tracePath(graph.edges, selectedKey, 'down'),
   } : undefined, [graph.edges, selectedKey]);
-  const cardPositions = useMemo(() => {
-    if (groupMode !== 'none') return layout.positions;
-    return new Map([...layout.positions].map(([key, position]) => [key, dragPositions[key] ?? manualPositions[key] ?? position]));
-  }, [dragPositions, groupMode, layout.positions, manualPositions]);
+  const moved = useMemo(() => ({ ...manualPositions, ...dragPositions }), [dragPositions, manualPositions]);
+  const cardPositions = useMemo(() => new Map([...layout.positions].map(([key, position]) => [key, moved[key] ?? position])),
+    [layout.positions, moved]);
+  const arrangedZones = useMemo(() => fitMovedZones(layout.zones, moved, cardHeight, direction, noteKeys),
+    [layout.zones, moved, cardHeight, direction, noteKeys]);
   const notePlacements = useMemo(() => [
     ...[...cardPositions].flatMap(([key, position]) => noteKeys.has(key)
       ? [{ key, position: notePosition({ ...position, width: CARD_WIDTH, height: cardHeight }, direction), direction }] : []),
-    ...layout.zones.flatMap((zone) => zone.epicKey && noteKeys.has(zone.epicKey)
+    ...arrangedZones.flatMap((zone) => zone.epicKey && noteKeys.has(zone.epicKey)
       ? [{ key: zone.epicKey, position: notePosition(zone, 'TB'), direction: 'TB' as const }] : []),
-  ], [cardHeight, cardPositions, direction, layout.zones, noteKeys]);
+  ], [cardHeight, cardPositions, direction, arrangedZones, noteKeys]);
   const edgeLabels = useMemo(() => {
     const measure = showLinks && displayedEdges.length ? document.createElement('canvas').getContext('2d') : null;
     return new Map(displayedEdges.map((edge) => {
@@ -371,7 +376,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     const obstacles: RouteObstacle[] = [
       ...[...cardPositions].map(([id, position]) => ({ id, ...position, width: CARD_WIDTH, height: cardHeight })),
       ...notePlacements.map(({ key, position }) => ({ id: `note:${key}`, ...position, width: NOTE_WIDTH, height: NOTE_HEIGHT })),
-      ...layout.zones.map(({ id, x, y, width }) => ({ id: `heading:${id}`, x, y, width, height: 36, labelOnly: true })),
+      ...arrangedZones.map(({ id, x, y, width }) => ({ id: `heading:${id}`, x, y, width, height: 36, labelOnly: true })),
     ];
     return routeEdges(direction, obstacles, displayedEdges.flatMap(({ id, source, target }) => {
       const from = cardPositions.get(source);
@@ -385,7 +390,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
         labelWidth: label?.width ?? maximumLabelWidth, labelHeight: label?.height ?? labelHeight,
       }];
     }));
-  }, [across, cardHeight, cardPositions, direction, displayedEdges, edgeLabels, lanes, layout.zones, notePlacements, showLinks]);
+  }, [across, cardHeight, cardPositions, direction, displayedEdges, edgeLabels, lanes, arrangedZones, notePlacements, showLinks]);
   const cards: Card[] = graph.issues.flatMap((issue) => {
     const position = cardPositions.get(issue.key);
     if (!position) return [];
@@ -407,7 +412,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
       },
     }];
   });
-  const zones: Zone[] = layout.zones.map((zone) => ({
+  const zones: Zone[] = arrangedZones.map((zone) => ({
     id: zone.id, type: 'zone', position: { x: zone.x, y: zone.y },
     data: {
       zone, epic: zone.epicKey ? basisIssues.get(zone.epicKey) : undefined,
@@ -478,7 +483,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
     const selection = changes.find((change) => change.type === 'select' && change.selected);
     if (selection?.type === 'select' && visibleKeys.has(selection.id)) onSelectIssue(selection.id);
     const moved = changes.filter((change) => change.type === 'position').filter(({ id, position }) => position && visibleKeys.has(id));
-    if (moved.length && groupMode === 'none') {
+    if (moved.length) {
       const next = Object.fromEntries(moved.flatMap(({ id, position }) => position ? [[id, position]] : []));
       if (moved.some(({ dragging }) => dragging)) {
         Object.assign(pendingDrag.current, next);
@@ -520,7 +525,7 @@ export function GraphCanvas({ flowId, graph, layoutGraph = graph, basis, cycleId
           const selection = changes.find((change) => change.type === 'select' && change.selected);
           if (selection?.type === 'select') onSelectEdge(selection.id);
         }}
-        nodesDraggable={groupMode === 'none'} nodesConnectable={editable && showLinks} onConnect={onConnect}
+        nodesDraggable nodesConnectable={editable && showLinks} onConnect={onConnect}
         onNodeClick={(_, node) => { if (node.type === 'issue') onSelectIssue(node.id); }}
         onEdgeClick={(_, edge) => onSelectEdge(edge.id)}
         onMoveEnd={(event, next) => {
